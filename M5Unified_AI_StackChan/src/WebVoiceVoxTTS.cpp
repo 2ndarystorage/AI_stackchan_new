@@ -78,7 +78,7 @@ String https_post_json(const char* url, const char* json_string, const char* roo
         // start connection and send HTTP header
         //https.setTimeout( 10000 ); 
         https.addHeader("Content-Type", "application/json");
-        https.addHeader("Authorization", "Bearer REDACTED_OPENAI_KEY");
+        https.addHeader("Authorization", "Bearer YOUR_OPENAI_API_KEY");
         //int httpCode = https.GET();
         int httpCode = https.POST((uint8_t *)json_string, strlen(json_string));
   

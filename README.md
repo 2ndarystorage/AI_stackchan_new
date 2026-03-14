@@ -44,3 +44,19 @@ Google Cloud STTは、”MhageGH”さんの [esp32_CloudSpeech](https://github.
 <br>
 <br>
 <br>
+
+---
+
+## Program Summary
+* M5Stack-based “AI Stack-chan” that records audio, runs speech-to-text (Google Cloud STT or OpenAI Whisper), sends chat to OpenAI, and speaks responses via VOICEVOX TTS.
+* Includes on-device avatar/face animation, optional servo movement, wake-word handling, and a small HTTP server for settings (API keys, role, speech/face controls).
+* Stores configuration in NVS/SPIFFS and can load Wi-Fi/API keys from SD card files.
+
+## How to Use
+Not verified.
+* Build and flash with PlatformIO using `M5Unified_AI_StackChan/platformio.ini` (e.g., `m5stack-core2` or `esp32-s3-devkitc-1` environments).
+* Provide Wi‑Fi and API keys either via SD card files (`/wifi.txt`, `/apikey.txt`) or through the device’s web UI endpoints (e.g., `/apikey`, `/role`).
+* On device: use touch/buttons for STT, wake-word toggle, monologue mode, and battery report (see `src/main.cpp` for mappings).
+
+## Completion Status
+Usable: core features (STT, chat, TTS, avatar, wake word, settings server) are implemented, but it is hardware- and API‑key dependent and lacks documented, verified setup steps here.

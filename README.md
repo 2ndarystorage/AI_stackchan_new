@@ -60,3 +60,19 @@ Not verified.
 
 ## Completion Status
 Usable: core features (STT, chat, TTS, avatar, wake word, settings server) are implemented, but it is hardware- and API‑key dependent and lacks documented, verified setup steps here.
+
+---
+
+## Program Summary
+* Firmware project for M5Stack Core2 / ESP32-S3 that runs a Stack-chan avatar with speech, wake-word handling, and optional servo motion.
+* Records audio and performs STT via Google Cloud STT or OpenAI Whisper, sends chat to the OpenAI Chat Completions API, and plays responses through the VOICEVOX Web API.
+* Hosts an HTTP server for chat/face/speech endpoints and for setting API keys and role; stores settings in NVS and can load config from SPIFFS/SD.
+
+## How to Use
+Not verified.
+* Build and flash with PlatformIO using `M5Unified_AI_StackChan/platformio.ini` (`m5stack-core2` default, `esp32-s3-devkitc-1` also defined).
+* Provide Wi‑Fi and API keys via SD card (`/wifi.txt` with SSID + password lines; `/apikey.txt` with OpenAI/VOICEVOX/STT keys) or via the device HTTP endpoints (`/apikey`, `/role`).
+* If using servos, set the GPIO pins in `M5Unified_AI_StackChan/src/main.cpp`.
+
+## Completion Status
+Usable: core runtime (STT, chat, TTS, avatar, wake word, HTTP settings) is implemented, but setup/usage relies on external docs and hardware/API-key availability.

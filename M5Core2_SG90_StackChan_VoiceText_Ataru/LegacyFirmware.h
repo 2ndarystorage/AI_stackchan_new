@@ -16,7 +16,7 @@
 #endif
 
 #include <Avatar.h> // https://github.com/meganetaaan/m5stack-avatar
-#include <ServoEasing.hpp> // https://github.com/ArminJo/ServoEasing       
+#include <ServoEasing.hpp> // https://github.com/ArminJo/ServoEasing
 #include "AtaruFace.h"
 #include "RamFace.h"
 
@@ -95,7 +95,7 @@ void behavior(void *args)
     float open = (float)level/10000.0;
     avatar->setMouthOpenRatio(open);
 #endif
- 
+
     vTaskDelay(1/portTICK_PERIOD_MS);
 //    delay(50);
   }
@@ -131,7 +131,7 @@ void setup() {
 #endif
   cfg.internal_spk = true;
   M5.begin(cfg);
-  
+
   restoreSpeakerConfig();
   //M5.Speaker.begin();
 
@@ -167,7 +167,7 @@ void setup() {
   delay(500);
   M5.Speaker.tone(1000, 500);
   delay(1000);
-  
+
   audioLogger = &Serial;
   out = new AudioOutputI2SLipSync(0, 0);
   out->SetPinout(12, 0, 2);           // ピン配列を指定（BCK, LRCK, DATA)BashCopy

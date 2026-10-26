@@ -1,3 +1,4 @@
+#if defined(STACKCHAN_LEGACY_AUDIO)
 /*
   AudioFileSourceVoiceTextStream
   Streaming VoiceText TTS source
@@ -201,5 +202,7 @@ uint32_t AudioFileSourceVoiceTextStream::getPos()
 {
   return pos;
 }
+
+#endif
 
 #endif

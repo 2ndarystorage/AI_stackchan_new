@@ -1,3 +1,4 @@
+#if defined(STACKCHAN_LEGACY_AUDIO)
 /*
   AudioOutputI2SLipSync
   Base class for I2S interface port
@@ -329,3 +330,5 @@ bool AudioOutputI2SLipSync::stop()
   i2sOn = false;
   return true;
 }
+
+#endif

@@ -15,7 +15,7 @@ M5Stack Core2 + SG90 ×2 のスタックチャンで、ChatGPTとClaudeに日本
 - Wi-Fi、PC接続先、AI、共有トークン、音量をWebから設定し、本体に保存します。クラウドのAPIキーはPC側だけに置きます。
 - Realtimeモードには、音声から本体タイマーの開始・確認・取消とPCの時刻取得を行う機能があります。通常のChatGPT／Claudeモードにはツール実行をまだ接続していません。
 - 自動テスト: サーバー12件とC++タイマーテストが成功。クラウドAPIはモックで代替しています。
-- Core2向けビルド: **成功**（PlatformIO、ESP32 Arduino 2.0.17）。USB接続されたCore2は検出されていません。書き込み・マイク・スピーカー・サーボ・有料APIを通した会話は未検証です。
+- Core2向けビルド: **成功**（PlatformIO、ESP32 Arduino 2.0.17）。[GitHub Actionsでもサーバー・タイマー・ファームの全チェックが成功](https://github.com/2ndarystorage/AI_stackchan_new/actions/runs/40350552490)。USB接続されたCore2は検出されていません。書き込み・マイク・スピーカー・サーボ・有料APIを通した会話は未検証です。
 
 「コードがあること」「テスト成功」「実機確認」を分けて記録します。[検証環境と結果](docs/VALIDATION.md)も参照してください。
 

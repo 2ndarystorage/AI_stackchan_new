@@ -23,7 +23,7 @@ APIプロバイダーはテスト中にモックへ置き換えています。AP
 - ServoEasing 3.4.0、ESP32Servo 1.1.1
 - ArduinoJson 6.21.5、WebSockets 2.6.1、ESP8266Audio 1.9.7
 
-ファームのバージョンは `platformio.ini` に固定しています。サーバー依存は `server/requirements.txt` の範囲指定で、上記は今回実際にインストールされたバージョンです。GitHub ActionsはPython 3.12で別途確認します。
+ファームのバージョンは `platformio.ini` に固定しています。サーバー依存は `server/requirements.txt` の範囲指定で、上記は今回実際にインストールされたバージョンです。GitHub ActionsでもPython 3.12でサーバー・タイマーのテストとCore2ビルドが成功しました。対象コードは `2ec59ad`。[実行結果](https://github.com/2ndarystorage/AI_stackchan_new/actions/runs/40350552490)。
 
 ## 実行コマンド
 

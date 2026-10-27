@@ -1,8 +1,43 @@
 # AI_StackChan2
+
 AIｽﾀｯｸﾁｬﾝ2です。
 <br><br>
 
 ![画像1](images/image1.png)<br><br>
+
+## ✅ 実動作確認済み（2026-10-27）
+
+このリポジトリのコードは、M5Stack Core2 実機での動作確認済みです。
+
+| 項目 | 内容 |
+|---|---|
+| 確認日 | 2026-10-27 |
+| 対象コード | commit `d0dc6e126e9ad5ac90a7d90efe59440c0d36af4e`（このREADME更新時点の main） |
+| 対象機種 | M5Stack Core2（本体のみ。サーボ未接続でも起動・動作します） |
+| ビルド | PlatformIO / env `m5stack-core2`（espressif32@6.3.2、M5Unified 0.1.16）<br>コマンド: `pio run -e m5stack-core2`（`M5Unified_AI_StackChan/` フォルダで実行） |
+| 成果物 | firmware.bin 2,237,888 バイト<br>SHA-256: `a27bcbd761ac48069f0e67b28dcb1499c84102035fc3e1a6a3b6cbc609c4e596` |
+| 書き込み方法 | Mac の Chrome（Web Serial）から書き込みページで書き込み。<br>ページ一式は private リポジトリ `2ndarystorage/stackchan-core2` の `ai_stackchan_flasher/` フォルダにあります（bootloader 0x1000 / partitions 0x8000 / boot_app0 0xe000 / firmware 0x10000、NVS・SPIFFS初期化付き） |
+| 確認内容 | 書き込み完了→自動再起動→顔表示→正常動作を所有者が実機で確認 |
+
+※ この確認ステータスは上記コミットのコードに対するものです。以後の変更は別途確認が必要です。
+
+### 起動後の設定（WiFi / APIキー）
+
+- microSD カードのルートに置く方法が確実です。
+- `wifi.txt`：1行目に SSID、2行目にパスワード
+- `apikey.txt`：1行目に OpenAI キー、2行目に VOICEVOX キー、3行目に STT キー（Whisper を使う場合は OpenAI キーと同じもの）
+- カードを本体に入れて電源を入れ直すと接続され、画面に IP アドレスが表示されます
+- WiFi 未設定のまま起動すると「Waiting for SmartConfig」を表示して再起動を繰り返します（故障ではありません）。スマホアプリ（EspTouch 等）で SmartConfig 送信も可能です
+- 接続後はブラウザで `http://stack-chan.local`（または表示された IP）を開き、`/apikey`（APIキー設定）、`/role`（ロール設定）等のページが使えます
+
+### 顔と表情について
+
+- 顔は M5Stack-Avatar ライブラリが描画しています（画像ファイルではありません）
+- 表情（Expression）ごとに右上等にエフェクトが出ます：Happy=ハート、Angry=怒りマーク、Doubt=汗、Sad=チルマーク、Sleepy=鼻ちょうちん
+- ハートは主に「発話中」「会話開始時（『御用でしょうか？』）」に表示されます
+- ブラウザから `http://stack-chan.local/face?expression=0〜5` で表情を切り替えられます（0:Neutral 1:Happy 2:Sleepy 3:Doubt 4:Sad 5:Angry）
+
+---
 
 AIｽﾀｯｸﾁｬﾝ2の特徴<br>
 
@@ -16,31 +51,30 @@ Google Cloud STTは、”MhageGH”さんの [esp32_CloudSpeech](https://github.
 
 ---
 
-
 ### M5GoBottom版ｽﾀｯｸﾁｬﾝ本体を作るのに必要な物、及び作り方 ###
 こちらを参照してください。<br>
-* [ｽﾀｯｸﾁｬﾝ M5GoBottom版組み立てキット](https://raspberrypi.mongonta.com/about-products-stackchan-m5gobottom-version/ "Title")<br>
+* [ｽﾀｯｸﾁｬﾝ M5GoBottom版組み立てキット](https://raspberrypi.mongonta.com/about-products-stackchan-m5gobottom-version/ "Title")
 
 ### プログラムをビルドするのに必要な物 ###
-* [M5Stack Core2](http://www.m5stack.com/ "Title")<br>
-* VSCode<br>
-* PlatformIO<br>
+* [M5Stack Core2](http://www.m5stack.com/)
+* VSCode
+* PlatformIO
 
-使用しているライブラリ等は"platformio.ini"を参照してください。<br>
+使用しているライブラリ等は"platformio.ini"を参照してください。
 
-~~【5/31の時点ではM5Unifiedの不具合の為、CoreS3では動きません。】~~<br>
+~~~~
 
 ---
 
 ### サーボモーターを使用するGPIO番号の設定 ###
 * main.cppの46行目付近、サーボモーターを使用するGPIO番号を設定してください。
-
+* 現在のビルドでは Core2 PORT A（X: GPIO33 / Y: GPIO32）が有効です。
 
 ### 使い方 ###
 
-こちらを参照してください。<br>
+こちらを参照してください。
 
-* [AI_StackChan2_README](https://github.com/robo8080/AI_StackChan2_README/ "Title")<br>
+* [AI_StackChan2_README](https://github.com/robo8080/AI_StackChan2_README/ "Title")
 <br>
 <br>
 <br>
@@ -52,44 +86,5 @@ Google Cloud STTは、”MhageGH”さんの [esp32_CloudSpeech](https://github.
 * Includes on-device avatar/face animation, optional servo movement, wake-word handling, and a small HTTP server for settings (API keys, role, speech/face controls).
 * Stores configuration in NVS/SPIFFS and can load Wi-Fi/API keys from SD card files.
 
-## How to Use
-Not verified.
-* Build and flash with PlatformIO using `M5Unified_AI_StackChan/platformio.ini` (e.g., `m5stack-core2` or `esp32-s3-devkitc-1` environments).
-* Provide Wi‑Fi and API keys either via SD card files (`/wifi.txt`, `/apikey.txt`) or through the device’s web UI endpoints (e.g., `/apikey`, `/role`).
-* On device: use touch/buttons for STT, wake-word toggle, monologue mode, and battery report (see `src/main.cpp` for mappings).
-
 ## Completion Status
-Usable: core features (STT, chat, TTS, avatar, wake word, settings server) are implemented, but it is hardware- and API‑key dependent and lacks documented, verified setup steps here.
-
----
-
-## Program Summary
-* Firmware project for M5Stack Core2 / ESP32-S3 that runs a Stack-chan avatar with speech, wake-word handling, and optional servo motion.
-* Records audio and performs STT via Google Cloud STT or OpenAI Whisper, sends chat to the OpenAI Chat Completions API, and plays responses through the VOICEVOX Web API.
-* Hosts an HTTP server for chat/face/speech endpoints and for setting API keys and role; stores settings in NVS and can load config from SPIFFS/SD.
-
-## How to Use
-Not verified.
-* Build and flash with PlatformIO using `M5Unified_AI_StackChan/platformio.ini` (`m5stack-core2` default, `esp32-s3-devkitc-1` also defined).
-* Provide Wi‑Fi and API keys via SD card (`/wifi.txt` with SSID + password lines; `/apikey.txt` with OpenAI/VOICEVOX/STT keys) or via the device HTTP endpoints (`/apikey`, `/role`).
-* If using servos, set the GPIO pins in `M5Unified_AI_StackChan/src/main.cpp`.
-
-## Completion Status
-Usable: core runtime (STT, chat, TTS, avatar, wake word, HTTP settings) is implemented, but setup/usage relies on external docs and hardware/API-key availability.
-
----
-
-## Program Summary
-* Arduino/PlatformIO firmware for M5Stack Core2 / ESP32-S3 that runs a Stack-chan avatar using M5Unified + M5Stack-Avatar.
-* Performs speech-to-text via Google Cloud STT or OpenAI Whisper and text-to-speech via VOICEVOX Web API, then plays audio on the device.
-* Hosts an on-device HTTP server with endpoints like `/chat`, `/speech`, `/face`, plus `/apikey` and `/role` pages; stores settings in NVS and role data in SPIFFS.
-* Optional wake-word support (SimpleVox) and servo control via ServoEasing.
-
-## How to Use
-Not verified.
-* Build and flash with PlatformIO using `M5Unified_AI_StackChan/platformio.ini` (`m5stack-core2` is default; `esp32-s3-devkitc-1` is also defined).
-* Provide Wi‑Fi and API keys via SD card: `/wifi.txt` (SSID on line 1, password on line 2) and `/apikey.txt` (OpenAI, VOICEVOX, STT keys on separate lines), or use the device web UI to set API keys/role.
-* After boot, open the device IP or `stack-chan.local` to access the web UI endpoints.
-
-## Completion Status
-Partial: core runtime pieces (STT, TTS, avatar, web server, settings storage) are present, but setup is hardware/service dependent and usage steps are only partially documented in this repo.
+Verified on real hardware (M5Stack Core2) on 2026-10-27 — see the verification section at the top of this README. Core features (STT, chat, TTS, avatar, wake word, settings server) are implemented; full conversation use requires Wi-Fi and API keys.

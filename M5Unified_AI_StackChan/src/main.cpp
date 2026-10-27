@@ -5,6 +5,7 @@
 #include <M5Unified.h>
 #include <nvs.h>
 #include <Avatar.h>
+#include "PenguinFace.h"  // ペンギン顔（カスタムFace）
 
 #include <AudioOutput.h>
 #include <AudioFileSourceBuffer.h>
@@ -18,6 +19,7 @@
 #include <WiFiClientSecure.h>
 #include "rootCACertificate.h"
 #include "rootCAgoogle.h"
+#include "rootCANHK.h"
 #include <ArduinoJson.h>
 #include <ESP32WebServer.h>
 #define ENABLE_MDNS
@@ -92,6 +94,13 @@ String STT_API_KEY = "";
 String TTS_SPEAKER_NO = "3";
 String TTS_SPEAKER = "&speaker=";
 String TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
+// 話速: 再生側の速度倍率（AudioOutputM5Speaker が playRaw のサンプルレートに乗算する）。
+// 既定は1.2倍。/voice ページで変更でき、NVS "setting"/"speed_x100" に保存される
+float TTS_SPEED_RATE = 1.2f;
+// 応答高速化: /model ページで選んだモデル（NVS "setting"/"model"）。空ならロール側の指定を使う
+String CHAT_MODEL = "";
+// 応答高速化: 回答の最大トークン数（ロール側に指定が無い場合のみ適用）
+const int CHAT_MAX_TOKENS = 150;
 //---------------------------------------------
 bool wakeword_is_enable = false;
 //---------------------------------------------
@@ -247,6 +256,7 @@ void handleNotFound(){
 void handle_speech() {
   String message = server.arg("say");
   String speaker = server.arg("voice");
+  String savedParms = TTS_PARMS;  // voice指定はこの発話だけに使う（設定中の声は変えない）
   if(speaker != "") {
     TTS_PARMS = TTS_SPEAKER + speaker;
   }
@@ -256,6 +266,7 @@ void handle_speech() {
   ////////////////////////////////////////
   avatar.setExpression(Expression::Happy);
   Voicevox_tts((char*)message.c_str(), (char*)TTS_PARMS.c_str());
+  TTS_PARMS = savedParms;
   server.send(200, "text/plain", String("OK"));
 }
 
@@ -344,6 +355,12 @@ String chatGpt(String json_string) {
 
 String InitBuffer = "";
 
+// 応答高速化の設定を chat_doc に反映する（モデル上書き＋max_tokens補完）
+void applyChatSpeedSettings() {
+  if (CHAT_MODEL != "") chat_doc["model"] = CHAT_MODEL;
+  if (chat_doc["max_tokens"].isNull()) chat_doc["max_tokens"] = CHAT_MAX_TOKENS;
+}
+
 void handle_chat() {
   static String response = "";
   // tts_parms_no = 1;
@@ -354,6 +371,7 @@ void handle_chat() {
   }
   Serial.println(InitBuffer);
   init_chat_doc(InitBuffer.c_str());
+  applyChatSpeedSettings();
   // 質問をチャット履歴に追加
   chatHistory.push_back(text);
    // チャット履歴が最大数を超えた場合、古い質問と回答を削除
@@ -404,6 +422,7 @@ void exec_chatGPT(String text) {
   static String response = "";
   Serial.println(InitBuffer);
   init_chat_doc(InitBuffer.c_str());
+  applyChatSpeedSettings();
   // 質問をチャット履歴に追加
   chatHistory.push_back(text);
    // チャット履歴が最大数を超えた場合、古い質問と回答を削除
@@ -630,6 +649,222 @@ void handle_setting() {
   M5.Speaker.setVolume(volume);
   M5.Speaker.setChannelVolume(m5spk_virtual_channel, volume);
   server.send(200, "text/plain", String("OK"));
+}
+
+// ==== VOICEVOX 話者切り替え（/voice ページ） ====
+// tts.quest（Web版VOICEVOX）で使える主な話者。IDは60以下に限定
+// （既存の /setting・起動時読み込みが 0〜60 を前提にしているため）。
+struct VoiceEntry { uint8_t id; const char* name; };
+static const VoiceEntry VOICE_LIST[] = {
+  {3,  "ずんだもん（ノーマル）"},
+  {1,  "ずんだもん（あまあま）"},
+  {7,  "ずんだもん（ツンツン）"},
+  {2,  "四国めたん（ノーマル）"},
+  {0,  "四国めたん（あまあま）"},
+  {8,  "春日部つむぎ"},
+  {10, "雨晴はう"},
+  {9,  "波音リツ"},
+  {14, "冥鳴ひまり"},
+  {16, "九州そら"},
+  {20, "もち子さん"},
+  {11, "玄野武宏"},
+  {13, "青山龍星"},
+  {21, "剣崎雌雄"},
+};
+static const size_t VOICE_LIST_SIZE = sizeof(VOICE_LIST) / sizeof(VOICE_LIST[0]);
+
+static const char* voiceName(int id) {
+  for (size_t i = 0; i < VOICE_LIST_SIZE; i++) {
+    if (VOICE_LIST[i].id == id) return VOICE_LIST[i].name;
+  }
+  return "カスタム（リスト外）";
+}
+
+// ==== ニュース読み上げ（NHK RSS・見出し方式） ====
+// xml 内で startPos 以降の最初の <tag>...</tag> の中身を返す。見つからなければ空文字
+static String xmlExtract(const String& xml, const char* tag, int startPos) {
+  String openTag = String("<") + tag + ">";
+  String closeTag = String("</") + tag + ">";
+  int s = xml.indexOf(openTag, startPos);
+  if (s < 0) return "";
+  s += openTag.length();
+  int e = xml.indexOf(closeTag, s);
+  if (e < 0) return "";
+  String v = xml.substring(s, e);
+  v.trim();
+  if (v.startsWith("<![CDATA[") && v.endsWith("]]>")) {
+    v = v.substring(9, v.length() - 3);
+    v.trim();
+  }
+  return v;
+}
+
+// NHKニュースRSSを取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
+String fetchNewsText() {
+  String payload = "";
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (!client) return "";
+  client->setCACert(root_ca_nhk);
+  {
+    HTTPClient https;
+    https.setTimeout(15000);
+    if (https.begin(*client, "https://www3.nhk.or.jp/rss/news/cat0.xml")) {
+      int httpCode = https.GET();
+      Serial.printf("[NHK RSS] GET... code: %d\n", httpCode);
+      if (httpCode == HTTP_CODE_OK) {
+        payload = https.getString();
+      }
+      https.end();
+    }
+  }
+  delete client;
+  if (payload == "") return "";
+
+  String result = "今日のニュースです。";
+  int pos = 0;
+  int count = 0;
+  while (count < 3) {
+    int itemPos = payload.indexOf("<item>", pos);
+    if (itemPos < 0) break;
+    String title = xmlExtract(payload, "title", itemPos);
+    if (title == "") break;
+    String desc = xmlExtract(payload, "description", itemPos);
+    result += title + "。";
+    if (desc != "") result += desc + "。";
+    pos = itemPos + 6;
+    count++;
+  }
+  if (count == 0) return "";
+  return result;
+}
+
+void handle_news() {
+  String news = fetchNewsText();
+  if (news != "") {
+    speech_text = news;
+    server.send(200, "text/plain", news);
+  } else {
+    server.send(200, "text/plain", String("ニュースを取得できませんでした"));
+  }
+}
+
+void handle_voice() {
+  String set = server.arg("set");
+  String message = "";
+  if (set != "") {
+    int n = set.toInt();
+    bool ok = false;
+    for (size_t i = 0; i < VOICE_LIST_SIZE; i++) {
+      if (VOICE_LIST[i].id == n) ok = true;
+    }
+    if (ok) {
+      TTS_SPEAKER_NO = String(n);
+      TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
+      uint32_t nvs_handle;
+      if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+        nvs_set_u8(nvs_handle, "speaker", (uint8_t)n);
+        nvs_close(nvs_handle);
+      }
+      message = "<p><b>声を「" + String(voiceName(n)) + "」に切り替えました（本体に保存済み）。</b></p>";
+    } else {
+      message = "<p><b>その話者IDはリストにありません。</b></p>";
+    }
+  }
+  String speed = server.arg("speed");
+  if (speed != "") {
+    int sx = speed.toInt();
+    if (sx >= 80 && sx <= 150) {
+      TTS_SPEED_RATE = sx / 100.0f;
+      uint32_t nvs_handle;
+      if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+        nvs_set_u8(nvs_handle, "speed_x100", (uint8_t)sx);
+        nvs_close(nvs_handle);
+      }
+      message += "<p><b>話速を " + String(TTS_SPEED_RATE, 2) + " 倍に切り替えました（本体に保存済み）。</b></p>";
+    } else {
+      message += "<p><b>話速の値は 0.8〜1.5 倍の範囲で指定してください。</b></p>";
+    }
+  }
+  String html = String(HEAD) + "<body>";
+  html += "<h1>声の切り替え（VOICEVOX）</h1>";
+  html += message;
+  html += "<p>現在の声: <b>" + String(voiceName(TTS_SPEAKER_NO.toInt())) +
+          "（ID " + TTS_SPEAKER_NO + "）</b></p>";
+  html += "<ul>";
+  for (size_t i = 0; i < VOICE_LIST_SIZE; i++) {
+    String id = String(VOICE_LIST[i].id);
+    html += "<li>" + String(VOICE_LIST[i].name) + "（ID " + id + "） "
+            "<a href=\"/voice?set=" + id + "\">この声にする</a> / "
+            "<a href=\"/speech?voice=" + id +
+            "&say=こんにちは、わたしはスタックチャンです\">試聴</a></li>";
+  }
+  html += "</ul>";
+  html += "<p>「この声にする」で選んだ声は本体に保存され、再起動後も使われます。"
+          "「試聴」はその場で1回だけその声で話します（設定は変わりません）。</p>";
+  html += "<h2>話速（再生速度）</h2>";
+  html += "<p>現在の話速: <b>" + String(TTS_SPEED_RATE, 2) + " 倍</b></p>";
+  html += "<ul>";
+  {
+    const int speed_opts[] = {100, 110, 120, 130};
+    for (int i = 0; i < 4; i++) {
+      html += "<li>" + String(speed_opts[i] / 100.0f, 1) + " 倍 "
+              "<a href=\"/voice?speed=" + String(speed_opts[i]) + "\">この速さにする</a></li>";
+    }
+  }
+  html += "</ul>";
+  html += "<p>再生側で速くする方式のため、速くすると声が少し高くなります。選んだ話速は本体に保存されます。</p>";
+  html += "<p><a href=\"/model\">AIモデルの切り替えはこちら</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+// ==== AIモデル切り替え（/model ページ） ====
+struct ModelEntry { const char* id; const char* name; };
+static const ModelEntry MODEL_LIST[] = {
+  {"gpt-4o-mini",   "gpt-4o-mini（高速・既定）"},
+  {"gpt-4.1-mini",  "gpt-4.1-mini（高速・少し高性能）"},
+  {"gpt-4o",        "gpt-4o（高品質・やや遅い）"},
+  {"gpt-3.5-turbo", "gpt-3.5-turbo（最速・精度は低め）"},
+};
+static const size_t MODEL_LIST_SIZE = sizeof(MODEL_LIST) / sizeof(MODEL_LIST[0]);
+
+void handle_model() {
+  String set = server.arg("set");
+  String message = "";
+  if (set != "") {
+    bool ok = false;
+    for (size_t i = 0; i < MODEL_LIST_SIZE; i++) {
+      if (set == MODEL_LIST[i].id) ok = true;
+    }
+    if (ok) {
+      CHAT_MODEL = set;
+      uint32_t nvs_handle;
+      if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+        nvs_set_str(nvs_handle, "model", set.c_str());
+        nvs_close(nvs_handle);
+      }
+      message = "<p><b>モデルを「" + set + "」に切り替えました（本体に保存済み）。</b></p>";
+    } else {
+      message = "<p><b>そのモデルはリストにありません。</b></p>";
+    }
+  }
+  String current = (CHAT_MODEL != "") ? CHAT_MODEL : String(chat_doc["model"].as<const char*>());
+  String html = String(HEAD) + "<body>";
+  html += "<h1>AIモデルの切り替え</h1>";
+  html += message;
+  html += "<p>現在のモデル: <b>" + current + "</b></p>";
+  html += "<ul>";
+  for (size_t i = 0; i < MODEL_LIST_SIZE; i++) {
+    html += "<li>" + String(MODEL_LIST[i].name) +
+            " <a href=\"/model?set=" + String(MODEL_LIST[i].id) + "\">このモデルにする</a></li>";
+  }
+  html += "</ul>";
+  html += "<p>選んだモデルは本体に保存され、再起動後も使われます。"
+          "応答の速さはモデルだけでなく、回答の長さ（最大150トークンに制限中）や"
+          "音声合成の時間にも左右されます。</p>";
+  html += "<p><a href=\"/voice\">声の切り替えはこちら</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
 }
 
 AudioOutputM5Speaker out(&M5.Speaker, m5spk_virtual_channel);
@@ -906,6 +1141,15 @@ void setup()
       if(speaker_no > 60) speaker_no = 3;
       TTS_SPEAKER_NO = String(speaker_no);
       TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
+      char model_buf[32] = {0};
+      size_t model_len = sizeof(model_buf);
+      if (ESP_OK == nvs_get_str(nvs_handle, "model", model_buf, &model_len) && model_len > 1) {
+        CHAT_MODEL = String(model_buf);
+      }
+      uint8_t speed_x100 = 0;
+      if (ESP_OK == nvs_get_u8(nvs_handle, "speed_x100", &speed_x100) && speed_x100 >= 80 && speed_x100 <= 150) {
+        TTS_SPEED_RATE = speed_x100 / 100.0f;
+      }
       nvs_close(nvs_handle);
     } else {
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
@@ -1068,6 +1312,9 @@ void setup()
   server.on("/chat", handle_chat);
   server.on("/apikey", handle_apikey);
   server.on("/setting", handle_setting);
+  server.on("/voice", handle_voice);
+  server.on("/model", handle_model);
+  server.on("/news", handle_news);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
   server.on("/role", handle_role);
   server.on("/role_set", HTTP_POST, handle_role_set);
@@ -1111,6 +1358,7 @@ void setup()
 //  mp3->RegisterStatusCB(StatusCallback, (void*)"mp3");
   wakeword_init();
 
+  avatar.setFace(new PenguinFace());  // ペンギン顔に変更（2026-10-27 本人希望）
   avatar.init();
   avatar.addTask(lipSync, "lipSync");
   avatar.addTask(servo, "servo");
@@ -1195,7 +1443,15 @@ void SST_ChatGPT() {
         if(ret != "") {
           Serial.println(ret);
           if (!mp3->isRunning() && speech_text=="" && speech_text_buffer == "") {
-            exec_chatGPT(ret);
+            if (ret.indexOf("ニュース") >= 0) {
+              // ニュースは ChatGPT を経由せず NHK RSS を読み上げる（会話履歴には入れない）
+              avatar.setExpression(Expression::Happy);
+              avatar.setSpeechText("ニュースです");
+              String news = fetchNewsText();
+              speech_text = (news != "") ? news : String("ニュースを取得できませんでした");
+            } else {
+              exec_chatGPT(ret);
+            }
             mode = 0;
           }
         } else {

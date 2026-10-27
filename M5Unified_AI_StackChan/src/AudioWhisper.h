@@ -5,6 +5,7 @@
 
 class AudioWhisper {
   byte* record_buffer;
+  size_t recorded_bytes = 0;  // 実際に録音したデータ長（無音早期終了時に短くなる）
  public:
   AudioWhisper();
   ~AudioWhisper();

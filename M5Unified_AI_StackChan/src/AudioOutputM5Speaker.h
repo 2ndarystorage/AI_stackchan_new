@@ -1,5 +1,8 @@
 #include <AudioOutput.h>
 
+// 話速倍率（main.cpp で定義）。playRaw に渡すサンプルレートへ乗算して再生速度を変える
+extern float TTS_SPEED_RATE;
+
 /// set M5Speaker virtual channel (0-7)
 //static constexpr uint8_t m5spk_virtual_channel = 0;
 
@@ -31,7 +34,7 @@ class AudioOutputM5Speaker : public AudioOutput
     {
       if (_tri_buffer_index)
       {
-        _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, hertz, true, 1, _virtual_ch);
+        _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, (uint32_t)(hertz * TTS_SPEED_RATE), true, 1, _virtual_ch);
         _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
         _tri_buffer_index = 0;
         ++_update_count;

@@ -680,7 +680,11 @@ static const char* voiceName(int id) {
   return "カスタム（リスト外）";
 }
 
-// ==== ニュース読み上げ（NHK RSS・見出し方式） ====
+// ==== ニュース読み上げ（NHK RSS・見出し方式＋Googleニュース フォールバック） ====
+// 診断用：直近のニュース取得結果（/news のレスポンスで確認できる）
+int g_nhk_http_code = 0;
+int g_google_top_http_code = 0;
+int g_google_ai_http_code = 0;
 // xml 内で startPos 以降の最初の <tag>...</tag> の中身を返す。見つからなければ空文字
 static String xmlExtract(const String& xml, const char* tag, int startPos) {
   String openTag = String("<") + tag + ">";
@@ -702,6 +706,7 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
 // NHKニュースRSSを取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
 String fetchNewsText() {
   String payload = "";
+  g_nhk_http_code = 0;
   WiFiClientSecure *client = new WiFiClientSecure;
   if (!client) return "";
   client->setCACert(root_ca_nhk);
@@ -710,6 +715,7 @@ String fetchNewsText() {
     https.setTimeout(15000);
     if (https.begin(*client, "https://www3.nhk.or.jp/rss/news/cat0.xml")) {
       int httpCode = https.GET();
+      g_nhk_http_code = httpCode;
       Serial.printf("[NHK RSS] GET... code: %d\n", httpCode);
       if (httpCode == HTTP_CODE_OK) {
         payload = https.getString();
@@ -738,13 +744,144 @@ String fetchNewsText() {
   return result;
 }
 
-void handle_news() {
-  String news = fetchNewsText();
-  if (news != "") {
-    speech_text = news;
-    server.send(200, "text/plain", news);
+// HTMLエンティティを簡易デコードする（Googleニュースの見出し用）
+static String decodeEntities(String s) {
+  s.replace("&amp;", "&");
+  s.replace("&quot;", "\"");
+  s.replace("&#39;", "'");
+  s.replace("&apos;", "'");
+  s.replace("&lt;", "<");
+  s.replace("&gt;", ">");
+  return s;
+}
+
+// Googleニュース見出し末尾の「 - 媒体名」を取り除く
+static String stripMediaSuffix(String t) {
+  int idx = t.lastIndexOf(" - ");
+  if (idx > 0) t = t.substring(0, idx);
+  return t;
+}
+
+// GoogleニュースRSSをストリームで少しずつ読みながら、<item> の <title> を最大 want 件抽出する。
+// フィード全文は保持せず、抽出済み見出しだけを outTitles に残す（走査上限 120KB で打ち切り）。
+static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
+  outCount = 0;
+  httpCodeOut = 0;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (!client) return false;
+  client->setCACert(root_ca_google);
+  {
+    HTTPClient https;
+    https.setTimeout(15000);
+    https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (https.begin(*client, url)) {
+      int code = https.GET();
+      httpCodeOut = code;
+      Serial.printf("[Google RSS] GET... code: %d\n", code);
+      if (code == HTTP_CODE_OK) {
+        WiFiClient *stream = https.getStreamPtr();
+        if (stream) {
+          const char* patItem = "<item>";
+          const char* patTitle = "<title>";
+          int state = 0;  // 0:<item>待ち 1:<title>待ち 2:見出し取得中
+          int match = 0;
+          String title = "";
+          const uint32_t MAX_SCAN = 120 * 1024;
+          uint32_t scanned = 0;
+          uint32_t startMs = millis();
+          uint8_t buf[256];
+          while (outCount < want && scanned < MAX_SCAN && (millis() - startMs) < 25000) {
+            size_t avail = stream->available();
+            if (avail == 0) {
+              if (!stream->connected()) break;
+              delay(1);
+              continue;
+            }
+            int n = stream->read(buf, avail < sizeof(buf) ? avail : sizeof(buf));
+            if (n <= 0) { delay(1); continue; }
+            for (int i = 0; i < n && outCount < want && scanned < MAX_SCAN; i++) {
+              char c = (char)buf[i];
+              scanned++;
+              if (state == 2) {
+                if (title.length() < 400) title += c;
+                if (title.endsWith("</title>")) {
+                  title = title.substring(0, title.length() - 8);
+                  title.trim();
+                  if (title.startsWith("<![CDATA[") && title.endsWith("]]>")) {
+                    title = title.substring(9, title.length() - 3);
+                    title.trim();
+                  }
+                  title = stripMediaSuffix(decodeEntities(title));
+                  if (title != "") {
+                    outTitles[outCount++] = title;
+                  }
+                  title = "";
+                  state = 0;
+                  match = 0;
+                }
+              } else {
+                const char* pat = (state == 0) ? patItem : patTitle;
+                if (c == pat[match]) {
+                  match++;
+                  if (pat[match] == '\0') {
+                    state++;
+                    match = 0;
+                    if (state == 2) title = "";
+                  }
+                } else {
+                  match = (c == pat[0]) ? 1 : 0;
+                }
+              }
+            }
+          }
+          Serial.printf("[Google RSS] headlines: %d (scanned %u bytes)\n", outCount, (unsigned)scanned);
+        }
+      }
+      https.end();
+    }
+  }
+  delete client;
+  return outCount > 0;
+}
+
+// ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
+String exec_news() {
+  // 一般ニュース：NHK（見出し＋説明）→ 失敗時は Google トップニュースの見出しで代替
+  String text = fetchNewsText();
+  if (text == "") {
+    String heads[3];
+    int n = 0;
+    if (fetchGoogleHeadlines("https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja", 3, heads, n, g_google_top_http_code)) {
+      text = "今日のニュースです。";
+      for (int i = 0; i < n; i++) text += heads[i] + "。";
+    }
+  }
+  // AIニュース：Google検索フィードの見出し（失敗しても一般ニュースだけ読み上げる）
+  {
+    String heads[2];
+    int n = 0;
+    if (fetchGoogleHeadlines("https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja", 2, heads, n, g_google_ai_http_code)) {
+      text += (text == "") ? String("AIニュースです。") : String("続いて、AIニュースです。");
+      for (int i = 0; i < n; i++) text += heads[i] + "。";
+    }
+  }
+  if (text != "") {
+    speech_text = text;
   } else {
-    server.send(200, "text/plain", String("ニュースを取得できませんでした"));
+    speech_text = "ニュースを取得できませんでした";
+  }
+  return text;
+}
+
+void handle_news() {
+  String news = exec_news();
+  String diag = String("\n[diag] NHK httpCode=") + String(g_nhk_http_code)
+              + " GoogleTop httpCode=" + String(g_google_top_http_code)
+              + " GoogleAI httpCode=" + String(g_google_ai_http_code);
+  if (news != "") {
+    server.send(200, "text/plain", news + diag);
+  } else {
+    server.send(200, "text/plain", String("ニュースを取得できませんでした") + diag);
   }
 }
 
@@ -1444,11 +1581,10 @@ void SST_ChatGPT() {
           Serial.println(ret);
           if (!mp3->isRunning() && speech_text=="" && speech_text_buffer == "") {
             if (ret.indexOf("ニュース") >= 0) {
-              // ニュースは ChatGPT を経由せず NHK RSS を読み上げる（会話履歴には入れない）
+              // ニュースは ChatGPT を経由せず RSS を読み上げる（会話履歴には入れない）
               avatar.setExpression(Expression::Happy);
               avatar.setSpeechText("ニュースです");
-              String news = fetchNewsText();
-              speech_text = (news != "") ? news : String("ニュースを取得できませんでした");
+              exec_news();
             } else {
               exec_chatGPT(ret);
             }
@@ -1497,7 +1633,16 @@ void loop()
     }
   }
 
+  // BtnB短押し（ニュース読み上げ）検出用：押下時刻を記録する
+  static uint32_t btnB_press_start = 0;
+  static bool btnB_long_fired = false;
+  if (M5.BtnB.wasPressed()) {
+    btnB_press_start = millis();
+    btnB_long_fired = false;
+  }
+
   if (M5.BtnB.pressedFor(2000)) {
+     btnB_long_fired = true;  // 長押し（ウェイクワード登録）が発動したら短押し扱いしない
      M5.Mic.end();
      M5.Speaker.tone(1000, 100);
      delay(500);
@@ -1514,6 +1659,19 @@ void loop()
       delay(500);
 #endif
     avatar.setSpeechText("ウェイクワード登録開始");
+  }
+
+  // BtnBを短く押して離したらニュース読み上げ（長押し登録とは競合させない）
+  if (M5.BtnB.wasReleased()) {
+    if (!btnB_long_fired && btnB_press_start != 0 && (millis() - btnB_press_start) < 1500 && mode >= 0) {
+      if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "") {
+        sw_tone();
+        avatar.setExpression(Expression::Happy);
+        avatar.setSpeechText("ニュースです");
+        exec_news();
+      }
+    }
+    btnB_press_start = 0;
   }
 
   if (M5.BtnC.wasPressed())

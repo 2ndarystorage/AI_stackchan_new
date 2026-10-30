@@ -5,7 +5,7 @@
 #include <M5Unified.h>
 #include <nvs.h>
 #include <Avatar.h>
-#include "PenguinFace.h"  // ペンギン顔（カスタムFace）
+#include "KinakoFace.h"  // きなこ写真の顔（カスタムFace）※PenguinFace.h は残置
 
 #include <AudioOutput.h>
 #include <AudioFileSourceBuffer.h>
@@ -1621,8 +1621,8 @@ void setup()
 //  mp3->RegisterStatusCB(StatusCallback, (void*)"mp3");
   wakeword_init();
 
-  avatar.setFace(new PenguinFace());  // ペンギン顔に変更（2026-10-27 本人希望）
-  avatar.init();
+  avatar.setFace(new KinakoFace());  // きなこ写真の顔に変更（2026-10-31 本人希望）
+  avatar.init(16);  // 写真をカラー表示するため 16bit カラーで初期化（従来は 1bit）
   avatar.addTask(lipSync, "lipSync");
   avatar.addTask(servo, "servo");
   avatar.setSpeechFont(&fonts::efontJA_16);

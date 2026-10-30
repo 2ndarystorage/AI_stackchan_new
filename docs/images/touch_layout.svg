@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="600" viewBox="0 0 680 600" font-family="sans-serif">
+  <rect x="0" y="0" width="680" height="600" fill="#ffffff"/>
+  <text x="340" y="30" font-size="22" font-weight="bold" text-anchor="middle" fill="#222">タッチ操作レイアウト（画面 320×240、第6弾）</text>
+  <!-- screen -->
+  <rect x="20" y="50" width="640" height="480" rx="18" fill="#f7f3ea" stroke="#333" stroke-width="4"/>
+  <!-- corners -->
+  <rect x="20" y="50" width="180" height="140" fill="#dbeafe" stroke="#2563eb" stroke-width="2" stroke-dasharray="6 4"/>
+  <rect x="480" y="50" width="180" height="140" fill="#fef3c7" stroke="#d97706" stroke-width="2" stroke-dasharray="6 4"/>
+  <rect x="20" y="390" width="180" height="140" fill="#dbeafe" stroke="#2563eb" stroke-width="2" stroke-dasharray="6 4"/>
+  <rect x="480" y="390" width="180" height="140" fill="#fef3c7" stroke="#d97706" stroke-width="2" stroke-dasharray="6 4"/>
+  <!-- side bands -->
+  <rect x="20" y="250" width="80" height="120" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 4"/>
+  <rect x="580" y="250" width="80" height="120" fill="#ede9fe" stroke="#7c3aed" stroke-width="2" stroke-dasharray="6 4"/>
+  <!-- bottom center servo -->
+  <rect x="280" y="420" width="120" height="100" fill="#dcfce7" stroke="#16a34a" stroke-width="2" stroke-dasharray="6 4"/>
+  <!-- center STT -->
+  <rect x="240" y="210" width="200" height="160" rx="14" fill="#fee2e2" stroke="#dc2626" stroke-width="3"/>
+  <!-- labels -->
+  <text x="110" y="105" font-size="19" font-weight="bold" text-anchor="middle" fill="#1e3a8a">左上タップ</text>
+  <text x="110" y="135" font-size="17" text-anchor="middle" fill="#1e3a8a">◀ 前のカテゴリ</text>
+  <text x="570" y="105" font-size="19" font-weight="bold" text-anchor="middle" fill="#92400e">右上タップ</text>
+  <text x="570" y="135" font-size="17" text-anchor="middle" fill="#92400e">音量アップ ＋</text>
+  <text x="110" y="445" font-size="19" font-weight="bold" text-anchor="middle" fill="#1e3a8a">左下タップ</text>
+  <text x="110" y="475" font-size="17" text-anchor="middle" fill="#1e3a8a">次のカテゴリ ▶</text>
+  <text x="570" y="445" font-size="19" font-weight="bold" text-anchor="middle" fill="#92400e">右下タップ</text>
+  <text x="570" y="475" font-size="17" text-anchor="middle" fill="#92400e">音量ダウン －</text>
+  <text x="340" y="275" font-size="21" font-weight="bold" text-anchor="middle" fill="#991b1b">中央タップ</text>
+  <text x="340" y="310" font-size="18" text-anchor="middle" fill="#991b1b">会話開始（聞き取り）</text>
+  <text x="60" y="300" font-size="15" text-anchor="middle" fill="#5b21b6">左帯</text>
+  <text x="60" y="325" font-size="14" text-anchor="middle" fill="#5b21b6">独り言</text>
+  <text x="620" y="300" font-size="15" text-anchor="middle" fill="#5b21b6">右帯</text>
+  <text x="620" y="325" font-size="14" text-anchor="middle" fill="#5b21b6">定期通知</text>
+  <text x="340" y="478" font-size="15" text-anchor="middle" fill="#166534">サーボ切替</text>
+  <!-- physical buttons -->
+  <rect x="70" y="548" width="160" height="36" rx="18" fill="#e5e7eb" stroke="#6b7280"/>
+  <rect x="260" y="548" width="160" height="36" rx="18" fill="#e5e7eb" stroke="#6b7280"/>
+  <rect x="450" y="548" width="160" height="36" rx="18" fill="#e5e7eb" stroke="#6b7280"/>
+  <text x="150" y="572" font-size="15" text-anchor="middle" fill="#111">A：ウェイク切替</text>
+  <text x="340" y="572" font-size="15" text-anchor="middle" fill="#111">B：ニュース／登録</text>
+  <text x="530" y="572" font-size="15" text-anchor="middle" fill="#111">C：定期通知／電池</text>
+</svg>

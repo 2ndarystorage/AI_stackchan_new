@@ -310,6 +310,52 @@ void newsDispReset() {
   g_news_disp_idx = 0;
   g_news_disp_clear_ms = 0;
 }
+
+// ==== 音量のタッチ操作（5段階） ====
+// レベル1〜5 → M5.Speaker の音量値（0〜255 を等分）
+static const uint8_t VOL_VALUES[5] = {51, 102, 153, 204, 255};
+uint8_t g_vol_level = 3;             // 現在の音量レベル（1〜5、初期値3）
+bool g_vol_gauge_active = false;     // 音量ゲージを吹き出し表示中
+uint32_t g_vol_gauge_until = 0;      // ゲージを消す時刻
+
+// 音量レベルをスピーカーへ適用する（save=true で NVS "setting"/"vol" へ保存）
+static void applyVolLevel(bool save) {
+  uint8_t v = VOL_VALUES[g_vol_level - 1];
+  // MP3再生は AudioOutputM5Speaker が仮想チャンネル0へ playRaw するため、
+  // マスター音量とチャンネル音量の両方へ設定する（既存の /setting や起動時適用と同じ経路）
+  M5.Speaker.setVolume(v);
+  M5.Speaker.setChannelVolume(m5spk_virtual_channel, v);
+  if (save) {
+    uint32_t nvs_handle;
+    if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+      nvs_set_u8(nvs_handle, "vol", g_vol_level);
+      nvs_close(nvs_handle);
+    }
+  }
+}
+
+// ==== ニュースカテゴリ選択メニュー ====
+struct NewsCatDef {
+  const char* label;      // メニュー表示名
+  const char* intro;      // 読み上げ導入文
+  int nhkCat;             // NHK RSS のカテゴリ番号（-1 = NHKなし）
+  const char* googleUrl;  // フォールバック／単独取得用の Google ニュース RSS
+};
+static const NewsCatDef NEWS_CATS[5] = {
+  {"トピックス",   "今日のニュースです。",     0,  "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"},
+  {"AIニュース",   "AIニュースです。",        -1, "https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja"},
+  {"芸能ニュース", "芸能ニュースです。",       6,  "https://news.google.com/rss/search?q=%E8%8A%B8%E8%83%BD&hl=ja&gl=JP&ceid=JP:ja"},
+  {"テック",       "テックニュースです。",    -1, "https://news.google.com/rss/search?q=%E3%83%86%E3%82%AF%E3%83%8E%E3%83%AD%E3%82%B8%E3%83%BC&hl=ja&gl=JP&ceid=JP:ja"},
+  {"その他",       "その他のニュースです。",   1,  "https://news.google.com/rss/search?q=%E7%A4%BE%E4%BC%9A&hl=ja&gl=JP&ceid=JP:ja"},
+};
+bool g_menu_open = false;        // カテゴリ選択メニュー表示中
+int g_menu_sel = 0;              // 選択中のカテゴリ（0〜4）
+uint32_t g_menu_deadline = 0;    // 最後のタップから約2.5秒後に確定する時刻
+
+// ==== 定期通知モード（BtnC短押しトグル、5分おきニュース） ====
+// 状態は RAM のみ（再起動で OFF に戻る）
+bool g_periodic_on = false;          // 定期通知モード
+uint32_t g_periodic_next_ms = 0;     // 次回ニュース読み上げの発火時刻
 DynamicJsonDocument chat_doc(1024*10);
 String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"messages\": [{\"role\": \"user\", \"content\": \"""\"}]}";
 String Role_JSON = "";
@@ -799,9 +845,10 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
   return v;
 }
 
-// NHKニュースRSSを取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
+// NHKニュースRSS（カテゴリ nhkCat）を取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
 // dispItems には表示用に「見出し＋説明」を1件ずつ格納する（吹き出し表示キュー構築用）
-String fetchNewsText(String* dispItems, int maxDispItems, int& dispCount) {
+// intro は読み上げ文の導入（例「今日のニュースです。」）
+String fetchNewsText(int nhkCat, const char* intro, String* dispItems, int maxDispItems, int& dispCount) {
   String payload = "";
   dispCount = 0;
   g_nhk_http_code = 0;
@@ -811,7 +858,7 @@ String fetchNewsText(String* dispItems, int maxDispItems, int& dispCount) {
   {
     HTTPClient https;
     https.setTimeout(15000);
-    if (https.begin(*client, "https://www3.nhk.or.jp/rss/news/cat0.xml")) {
+    if (https.begin(*client, String("https://www3.nhk.or.jp/rss/news/cat") + String(nhkCat) + ".xml")) {
       int httpCode = https.GET();
       g_nhk_http_code = httpCode;
       Serial.printf("[NHK RSS] GET... code: %d\n", httpCode);
@@ -824,7 +871,7 @@ String fetchNewsText(String* dispItems, int maxDispItems, int& dispCount) {
   delete client;
   if (payload == "") return "";
 
-  String result = "今日のニュースです。";
+  String result = intro;
   int pos = 0;
   int count = 0;
   while (count < 3) {
@@ -954,7 +1001,7 @@ String exec_news() {
   // 一般ニュース：NHK（見出し＋説明）→ 失敗時は Google トップニュースの見出しで代替
   String dispItems[5];
   int dispCount = 0;
-  String text = fetchNewsText(dispItems, 5, dispCount);
+  String text = fetchNewsText(0, "今日のニュースです。", dispItems, 5, dispCount);
   if (text == "") {
     String heads[3];
     int n = 0;
@@ -997,6 +1044,43 @@ String exec_news() {
     speech_text = "ニュースを取得できませんでした";
   }
   return text;
+}
+
+// カテゴリ単独のニュース読み上げ（タッチメニュー用）
+// NHKカテゴリがあれば NHK（見出し＋説明×3）を優先し、失敗時は Google 見出し×3 で代替。
+// NHKのないカテゴリ（AI／テック）は最初から Google 見出し×3。
+// 従来の exec_news()（トピックス＋AI連結）とは独立した読み上げにする
+void exec_news_category(int cat) {
+  if (cat < 0 || cat > 4) cat = 0;
+  const NewsCatDef& c = NEWS_CATS[cat];
+  newsDispReset();  // 前回の表示キューが残っていたら破棄する
+  String dispItems[5];
+  int dispCount = 0;
+  String text = "";
+  if (c.nhkCat >= 0) {
+    text = fetchNewsText(c.nhkCat, c.intro, dispItems, 5, dispCount);
+  }
+  if (text == "") {
+    String heads[3];
+    int n = 0;
+    int dummyCode = 0;
+    if (fetchGoogleHeadlines(c.googleUrl, 3, heads, n, dummyCode)) {
+      text = c.intro;
+      for (int i = 0; i < n; i++) {
+        text += heads[i] + "。";
+        if (dispCount < 5) dispItems[dispCount++] = heads[i] + "。";
+      }
+    }
+  }
+  if (text != "") {
+    // 表示用セグメント列を構築する（loop の発話開始時に吹き出し表示を開始）
+    newsDispPush(c.label);
+    for (int i = 0; i < dispCount; i++) newsDispAddText(dispItems[i]);
+    if (g_news_seg_count > 0) g_news_disp_armed = true;
+    speech_text = text;
+  } else {
+    speech_text = "ニュースを取得できませんでした";
+  }
 }
 
 void handle_news() {
@@ -1274,6 +1358,10 @@ static box_t box_servo;
 static box_t box_stt;
 static box_t box_BtnA;
 static box_t box_BtnC;
+static box_t box_vol_up;    // 右上：音量アップ
+static box_t box_vol_down;  // 右下：音量ダウン
+static box_t box_cat_prev;  // 左上：前のニュースカテゴリ
+static box_t box_cat_next;  // 左下：次のニュースカテゴリ
 
 void Wifi_setup() {
   // 前回接続時情報で接続する
@@ -1430,6 +1518,27 @@ void setup()
         TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
       }
     }
+  }
+
+  { // 音量レベル（タッチ操作・5段階）を NVS "setting"/"vol" から読み込んで適用する
+    uint8_t lv = 0;
+    uint32_t nvs_handle;
+    if (ESP_OK == nvs_open("setting", NVS_READONLY, &nvs_handle)) {
+      if (ESP_OK == nvs_get_u8(nvs_handle, "vol", &lv) && lv >= 1 && lv <= 5) {
+        g_vol_level = lv;
+      } else {
+        // "vol" 未保存なら既存の "volume"（/setting の音量）から近いレベルを初期値にする
+        size_t volume = 0;
+        if (ESP_OK == nvs_get_u32(nvs_handle, "volume", &volume) && volume > 0) {
+          int derived = (int)((volume * 5 + 127) / 255);
+          if (derived < 1) derived = 1;
+          if (derived > 5) derived = 5;
+          g_vol_level = (uint8_t)derived;
+        }
+      }
+      nvs_close(nvs_handle);
+    }
+    applyVolLevel(false);
   }
 
   M5.Lcd.setTextSize(2);
@@ -1628,10 +1737,17 @@ void setup()
   avatar.setSpeechFont(&fonts::efontJA_16);
 
 //  M5.Speaker.setVolume(200);
-  box_servo.setupBox(80, 120, 80, 80);
-  box_stt.setupBox(0, 0, M5.Display.width(), 60);
+  // タッチレイアウト：四隅＝音量（右上/右下）とニュースカテゴリ選択（左上/左下）、
+  // 中央＝会話開始(STT)、左右の帯＝独り言切替(box_BtnA)/定期通知トグル(box_BtnC)、
+  // 下部中央＝サーボ切替。四隅・中央・帯が重ならないよう配置している
+  box_servo.setupBox(130, 185, 60, 50);
+  box_stt.setupBox(110, 80, 100, 80);
   box_BtnA.setupBox(0, 100, 40, 60);
   box_BtnC.setupBox(280, 100, 40, 60);
+  box_vol_up.setupBox(230, 0, 90, 70);
+  box_vol_down.setupBox(230, 170, 90, 70);
+  box_cat_prev.setupBox(0, 0, 90, 70);
+  box_cat_next.setupBox(0, 170, 90, 70);
 }
 
 String random_words[18] = {"あなたは誰","楽しい","怒った","可愛い","悲しい","眠い","ジョークを言って","泣きたい","怒ったぞ","こんにちは","お疲れ様","詩を書いて","疲れた","お腹空いた","嫌いだ","苦しい","俳句を作って","歌をうたって"};
@@ -1727,6 +1843,88 @@ void SST_ChatGPT() {
         } 
 }
 
+// 音量ゲージ文字列（例「音量 ■■■□□」）
+static String volGaugeText() {
+  String s = "音量 ";
+  for (int i = 0; i < 5; i++) s += (i < g_vol_level) ? "■" : "□";
+  return s;
+}
+
+// 音量を delta 段階変える（右上/右下タップ）
+static void change_volume(int delta) {
+  int nl = (int)g_vol_level + delta;
+  if (nl < 1) nl = 1;
+  if (nl > 5) nl = 5;
+  bool changed = (nl != (int)g_vol_level);
+  g_vol_level = (uint8_t)nl;
+  applyVolLevel(changed);
+  if (!mp3->isRunning()) {
+    sw_tone();
+  } else {
+    // 再生中は sw_tone（Speaker.end を伴う）で再生を止めないよう、
+    // 別チャンネル(7)へ短い確認音だけを重ねる
+    M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level - 1]);
+    M5.Speaker.tone(1320.0f, 70, 7, false);
+  }
+  // 吹き出しが空いているときだけゲージを表示し、約2秒で消す（loop 側で消去）
+  if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
+      !g_news_disp_active && !g_news_disp_armed && !g_menu_open) {
+    avatar.setSpeechText(volGaugeText().c_str());
+    g_vol_gauge_active = true;
+    g_vol_gauge_until = millis() + 2000;
+  }
+}
+
+// メニュー選択中を吹き出しに表示する（例「2/5 AIニュース」）
+static void menuShowBalloon() {
+  String s = String(g_menu_sel + 1) + "/5 " + NEWS_CATS[g_menu_sel].label;
+  avatar.setSpeechText(s.c_str());
+}
+
+// メニューのカテゴリ一覧を画面左側へ描く。
+// Avatar の再描画で上書きされるため、メニュー表示中は loop のたびに描き直す
+static void drawMenuList() {
+  M5.Lcd.fillRect(0, 76, 176, 106, TFT_BLACK);
+  M5.Lcd.setFont(&fonts::efontJA_16);
+  M5.Lcd.setTextSize(1);
+  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
+  for (int i = 0; i < 5; i++) {
+    M5.Lcd.setCursor(4, 80 + i * 20);
+    M5.Lcd.print((i == g_menu_sel) ? "▶ " : "  ");
+    M5.Lcd.print(NEWS_CATS[i].label);
+  }
+}
+
+// 左上/左下タップ：メニューを開く／前後のカテゴリへ移動する
+static void menu_step(int delta) {
+  // 発話中・ニュース表示中はメニューを開かない（吹き出しを奪わない）
+  if (mp3->isRunning() || speech_text != "" || speech_text_buffer != "" || g_news_disp_active) return;
+  if (g_menu_open) {
+    g_menu_sel = (g_menu_sel + delta + 5) % 5;
+  } else {
+    g_menu_open = true;
+  }
+  g_menu_deadline = millis() + 2500;
+  sw_tone();
+  menuShowBalloon();
+}
+
+// 定期通知モードの ON/OFF（物理 BtnC 短押し・タッチ box_BtnC 共用）
+static void toggle_periodic() {
+  sw_tone();
+  bool speechFree = !mp3->isRunning() && speech_text == "" && speech_text_buffer == "";
+  if (!g_periodic_on) {
+    g_periodic_on = true;
+    g_periodic_next_ms = millis();  // すぐ1回読み上げる（発話が空き次第 loop が発火）
+    avatar.setSpeechText("定期通知オン");
+    if (speechFree) speech_text = "定期通知モードをオンにしました";
+  } else {
+    g_periodic_on = false;
+    avatar.setSpeechText("定期通知オフ");
+    if (speechFree) speech_text = "定期通知モードをオフにしました";
+  }
+}
+
 void loop()
 {
   static int lastms = 0;
@@ -1738,6 +1936,19 @@ void loop()
     if (!mp3->isRunning() && speech_text=="" && speech_text_buffer == "") {
       exec_chatGPT(random_words[random(18)]);
       mode = 0;
+    }
+  }
+
+  // 定期通知モード：ON で発火時刻を過ぎたらニュース（トピックス＋AI）を読み上げる。
+  // 再生中・発話待ちがある場合は割り込まず、約30秒後に再試行する
+  if (g_periodic_on && (int32_t)(millis() - g_periodic_next_ms) >= 0) {
+    if (mode >= 0 && !mp3->isRunning() && speech_text == "" && speech_text_buffer == "") {
+      g_menu_open = false;
+      avatar.setSpeechText("ニュースです");
+      exec_news();
+      g_periodic_next_ms = millis() + 300000UL;
+    } else {
+      g_periodic_next_ms = millis() + 30000UL;
     }
   }
 
@@ -1801,10 +2012,23 @@ void loop()
     btnB_press_start = 0;
   }
 
-  if (M5.BtnC.wasPressed())
-  {
+  // BtnC短押し＝定期通知モードのトグル、長押し(2秒)＝バッテリー残量読み上げ
+  static uint32_t btnC_press_start = 0;
+  static bool btnC_long_fired = false;
+  if (M5.BtnC.wasPressed()) {
+    btnC_press_start = millis();
+    btnC_long_fired = false;
+  }
+  if (M5.BtnC.pressedFor(2000) && !btnC_long_fired) {
+    btnC_long_fired = true;  // 長押しが発動したら短押し扱いしない
     sw_tone();
     report_batt_level();
+  }
+  if (M5.BtnC.wasReleased()) {
+    if (!btnC_long_fired && btnC_press_start != 0 && (millis() - btnC_press_start) < 1500 && mode >= 0) {
+      toggle_periodic();
+    }
+    btnC_press_start = 0;
   }
 
 #if defined(ARDUINO_M5STACK_Core2) || defined( ARDUINO_M5STACK_CORES3 )
@@ -1814,10 +2038,38 @@ void loop()
     auto t = M5.Touch.getDetail();
     if (t.wasPressed())
     {          
-      if (box_stt.contain(t.x, t.y)&&(!mp3->isRunning()))
+      // 右上＝音量アップ、右下＝音量ダウン（5段階）
+      if (box_vol_up.contain(t.x, t.y))
       {
-        sw_tone();
-        SST_ChatGPT();
+        change_volume(+1);
+      }
+      if (box_vol_down.contain(t.x, t.y))
+      {
+        change_volume(-1);
+      }
+      // 左上＝前のカテゴリ、左下＝次のカテゴリ（ニュース選択メニュー）
+      if (box_cat_prev.contain(t.x, t.y))
+      {
+        menu_step(-1);
+      }
+      if (box_cat_next.contain(t.x, t.y))
+      {
+        menu_step(+1);
+      }
+      // 中央＝会話開始。メニュー表示中はキャンセルとして働く
+      if (box_stt.contain(t.x, t.y))
+      {
+        if (g_menu_open)
+        {
+          g_menu_open = false;
+          sw_tone();
+          if (!mp3->isRunning()) avatar.setSpeechText("");
+        }
+        else if (!mp3->isRunning())
+        {
+          sw_tone();
+          SST_ChatGPT();
+        }
       }
 #ifdef USE_SERVO
       if (box_servo.contain(t.x, t.y))
@@ -1831,14 +2083,38 @@ void loop()
         sw_tone();
         switch_monologue_mode();
       }
+      // 右の帯＝定期通知モードのトグル（物理 BtnC 短押しと同じ挙動）
       if (box_BtnC.contain(t.x, t.y))
       {
-        sw_tone();
-        report_batt_level();
+        toggle_periodic();
       }
     }
   }
 #endif
+
+  // ニュースカテゴリ選択メニュー：表示中は一覧を描き続け、
+  // 最後のタップから約2.5秒操作がなければ選択中カテゴリを読み上げて閉じる
+  if (g_menu_open) {
+    drawMenuList();
+    if ((int32_t)(millis() - g_menu_deadline) >= 0) {
+      if (mode >= 0 && !mp3->isRunning() && speech_text == "" && speech_text_buffer == "" && !g_news_disp_active) {
+        g_menu_open = false;
+        avatar.setSpeechText("ニュースです");
+        exec_news_category(g_menu_sel);
+      } else {
+        g_menu_deadline = millis() + 2500;  // 混んでいる間は確定を少し延ばす
+      }
+    }
+  }
+
+  // 音量ゲージの吹き出しを約2秒で消す（発話やニュース表示・メニューが始まっていたら触らない）
+  if (g_vol_gauge_active && (int32_t)(millis() - g_vol_gauge_until) >= 0) {
+    g_vol_gauge_active = false;
+    if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
+        !g_news_disp_active && !g_menu_open) {
+      avatar.setSpeechText("");
+    }
+  }
 
   if(speech_text != ""){
     avatar.setExpression(Expression::Happy);

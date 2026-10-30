@@ -216,6 +216,100 @@ static const char ROLE_HTML[] PROGMEM = R"KEWL(
 
 String speech_text = "";
 String speech_text_buffer = "";
+
+// ==== ニュース内容のディスプレイ表示（吹き出しへのセグメント表示） ====
+// M5Stack-Avatar の吹き出し(Balloon)は1行表示で折り返しがなく、長い文字列は
+// 画面(320px)からはみ出して切れる。フォント efontJA_16 を2倍で描くため
+// 全角1文字=32px・半角1文字=16px。吹き出しに収まる幅(288px=全角9文字相当)
+// ごとに読み上げ文を分割し、発話に合わせて順に切り替えて表示する。
+static const int NEWS_SEG_MAX = 64;
+static const int NEWS_SEG_MAX_WIDTH_PX = 288;
+String g_news_segments[NEWS_SEG_MAX];
+int g_news_seg_count = 0;
+bool g_news_disp_armed = false;    // exec_news が表示キューを用意した（次の発話開始で有効化）
+bool g_news_disp_active = false;   // ニュース表示中
+int g_news_disp_idx = 0;
+uint32_t g_news_disp_next_ms = 0;  // 次のセグメントへ切り替える時刻
+uint32_t g_news_disp_start_ms = 0; // 表示開始時刻
+uint32_t g_news_disp_clear_ms = 0; // 発話終了後、吹き出しを消す時刻（0=未定）
+
+static int newsUtf8CharLen(uint8_t b) {
+  if (b < 0x80) return 1;
+  if ((b & 0xE0) == 0xC0) return 2;
+  if ((b & 0xF0) == 0xE0) return 3;
+  if ((b & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+
+static int newsSegCharCount(const String& seg) {
+  int chars = 0;
+  for (int i = 0; i < (int)seg.length();) {
+    i += newsUtf8CharLen((uint8_t)seg[i]);
+    chars++;
+  }
+  return chars;
+}
+
+// セグメントの表示時間：1文字≈180ms、最小3.5秒
+static uint32_t newsSegDurationMs(const String& seg) {
+  uint32_t d = (uint32_t)newsSegCharCount(seg) * 180;
+  return d < 3500 ? 3500 : d;
+}
+
+static void newsDispPush(const String& seg) {
+  if (seg.length() == 0) return;
+  if (g_news_seg_count < NEWS_SEG_MAX) {
+    g_news_segments[g_news_seg_count++] = seg;
+  }
+}
+
+// テキストを吹き出しに収まる幅で分割してキューへ追加（、。の直後での分割を優先）
+static void newsDispAddText(const String& text) {
+  int n = (int)text.length();
+  int start = 0;      // 現在のセグメントの開始バイト位置
+  int curW = 0;       // 現在のセグメントの推定幅(px)
+  int breakPos = -1;  // 現在のセグメント内にある「、。」直後のバイト位置
+  int breakW = 0;     // breakPos 時点の幅
+  int i = 0;
+  while (i < n) {
+    int clen = newsUtf8CharLen((uint8_t)text[i]);
+    if (i + clen > n) clen = 1;
+    int cw = (clen == 1) ? 16 : 32;  // 半角16px / 全角32px（efontJA_16 の2倍描画）
+    if (curW + cw > NEWS_SEG_MAX_WIDTH_PX && i > start) {
+      if (breakPos > start && breakW >= NEWS_SEG_MAX_WIDTH_PX / 2) {
+        newsDispPush(text.substring(start, breakPos));
+        start = breakPos;
+        curW -= breakW;
+        breakPos = -1;
+        breakW = 0;
+      } else {
+        newsDispPush(text.substring(start, i));
+        start = i;
+        curW = 0;
+        breakPos = -1;
+        breakW = 0;
+      }
+      continue;
+    }
+    curW += cw;
+    if (clen == 3 && (uint8_t)text[i] == 0xE3 && (uint8_t)text[i + 1] == 0x80 &&
+        ((uint8_t)text[i + 2] == 0x81 || (uint8_t)text[i + 2] == 0x82)) {
+      breakPos = i + clen;  // 、(U+3001) または 。(U+3002) の直後
+      breakW = curW;
+    }
+    i += clen;
+  }
+  if (start < n) newsDispPush(text.substring(start, n));
+}
+
+// ニュース表示キューを破棄する（通常会話の開始時などに呼ぶ）
+void newsDispReset() {
+  g_news_seg_count = 0;
+  g_news_disp_armed = false;
+  g_news_disp_active = false;
+  g_news_disp_idx = 0;
+  g_news_disp_clear_ms = 0;
+}
 DynamicJsonDocument chat_doc(1024*10);
 String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"messages\": [{\"role\": \"user\", \"content\": \"""\"}]}";
 String Role_JSON = "";
@@ -362,6 +456,7 @@ void applyChatSpeedSettings() {
 }
 
 void handle_chat() {
+  newsDispReset();  // 通常会話が始まるのでニュース表示キューは破棄する
   static String response = "";
   // tts_parms_no = 1;
   String text = server.arg("text");
@@ -419,6 +514,7 @@ void handle_chat() {
 }
 
 void exec_chatGPT(String text) {
+  newsDispReset();  // 通常会話が始まるのでニュース表示キューは破棄する
   static String response = "";
   Serial.println(InitBuffer);
   init_chat_doc(InitBuffer.c_str());
@@ -704,8 +800,10 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
 }
 
 // NHKニュースRSSを取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
-String fetchNewsText() {
+// dispItems には表示用に「見出し＋説明」を1件ずつ格納する（吹き出し表示キュー構築用）
+String fetchNewsText(String* dispItems, int maxDispItems, int& dispCount) {
   String payload = "";
+  dispCount = 0;
   g_nhk_http_code = 0;
   WiFiClientSecure *client = new WiFiClientSecure;
   if (!client) return "";
@@ -737,6 +835,11 @@ String fetchNewsText() {
     String desc = xmlExtract(payload, "description", itemPos);
     result += title + "。";
     if (desc != "") result += desc + "。";
+    if (dispItems && dispCount < maxDispItems) {
+      String item = title + "。";
+      if (desc != "") item += desc + "。";
+      dispItems[dispCount++] = item;
+    }
     pos = itemPos + 6;
     count++;
   }
@@ -845,27 +948,50 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
 }
 
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
+// あわせて吹き出し表示用のセグメント列を構築し、次の発話開始時に表示が始まるよう arm する
 String exec_news() {
+  newsDispReset();  // 前回の表示キューが残っていたら破棄する
   // 一般ニュース：NHK（見出し＋説明）→ 失敗時は Google トップニュースの見出しで代替
-  String text = fetchNewsText();
+  String dispItems[5];
+  int dispCount = 0;
+  String text = fetchNewsText(dispItems, 5, dispCount);
   if (text == "") {
     String heads[3];
     int n = 0;
     if (fetchGoogleHeadlines("https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja", 3, heads, n, g_google_top_http_code)) {
       text = "今日のニュースです。";
-      for (int i = 0; i < n; i++) text += heads[i] + "。";
+      for (int i = 0; i < n; i++) {
+        text += heads[i] + "。";
+        if (dispCount < 5) dispItems[dispCount++] = heads[i] + "。";
+      }
     }
   }
+  bool hasGeneral = (text != "");
   // AIニュース：Google検索フィードの見出し（失敗しても一般ニュースだけ読み上げる）
+  String aiHeads[2];
+  int aiCount = 0;
   {
     String heads[2];
     int n = 0;
     if (fetchGoogleHeadlines("https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja", 2, heads, n, g_google_ai_http_code)) {
       text += (text == "") ? String("AIニュースです。") : String("続いて、AIニュースです。");
-      for (int i = 0; i < n; i++) text += heads[i] + "。";
+      for (int i = 0; i < n; i++) {
+        text += heads[i] + "。";
+        aiHeads[aiCount++] = heads[i];
+      }
     }
   }
   if (text != "") {
+    // 表示用セグメント列を構築する（loop の発話開始時に吹き出し表示を開始）
+    if (hasGeneral) {
+      newsDispPush("今日のニュースです");
+      for (int i = 0; i < dispCount; i++) newsDispAddText(dispItems[i]);
+    }
+    if (aiCount > 0) {
+      newsDispPush("AIニュース");
+      for (int i = 0; i < aiCount; i++) newsDispAddText(aiHeads[i] + "。");
+    }
+    if (g_news_seg_count > 0) g_news_disp_armed = true;
     speech_text = text;
   } else {
     speech_text = "ニュースを取得できませんでした";
@@ -1556,6 +1682,7 @@ void sw_tone(){
 }
 
 void SST_ChatGPT() {
+        newsDispReset();  // 通常会話が始まるのでニュース表示キューは破棄する（ニュース分岐では exec_news が再構築する）
         bool prev_servo_home = servo_home;
         random_speak = true;
         random_time = -1;
@@ -1721,6 +1848,16 @@ void loop()
     M5.Speaker.begin();
     mode = 0;
     Voicevox_tts((char*)speech_text_buffer.c_str(), (char*)TTS_PARMS.c_str());
+    // ニュース発話なら、内容の吹き出し表示を開始する
+    if (g_news_disp_armed && g_news_seg_count > 0) {
+      g_news_disp_armed = false;
+      g_news_disp_active = true;
+      g_news_disp_idx = 0;
+      g_news_disp_start_ms = millis();
+      g_news_disp_clear_ms = 0;
+      avatar.setSpeechText(g_news_segments[0].c_str());
+      g_news_disp_next_ms = millis() + newsSegDurationMs(g_news_segments[0]);
+    }
   }
 
   if (mp3->isRunning()) {
@@ -1739,6 +1876,32 @@ void loop()
     delay(1);
   } else {
   server.handleClient();
+  }
+
+  // ニュース内容の吹き出し表示を進める（発話中はセグメントを順に切り替え、
+  // 発話が終わったら最後のセグメントを3秒残してから消す）
+  if (g_news_disp_active) {
+    if (mp3->isRunning()) {
+      g_news_disp_clear_ms = 0;
+      if (g_news_disp_idx < g_news_seg_count - 1 &&
+          (int32_t)(millis() - g_news_disp_next_ms) >= 0) {
+        g_news_disp_idx++;
+        avatar.setSpeechText(g_news_segments[g_news_disp_idx].c_str());
+        g_news_disp_next_ms = millis() + newsSegDurationMs(g_news_segments[g_news_disp_idx]);
+      }
+    } else if (speech_text_buffer == "" || (millis() - g_news_disp_start_ms) > 5000) {
+      // 発話終了（または発話開始に失敗）：最後のセグメントを3秒残してから消す
+      if (g_news_disp_clear_ms == 0) {
+        if (g_news_disp_idx != g_news_seg_count - 1) {
+          g_news_disp_idx = g_news_seg_count - 1;
+          avatar.setSpeechText(g_news_segments[g_news_disp_idx].c_str());
+        }
+        g_news_disp_clear_ms = millis() + 3000;
+      } else if ((int32_t)(millis() - g_news_disp_clear_ms) >= 0) {
+        avatar.setSpeechText("");
+        newsDispReset();
+      }
+    }
   }
 
   if (mode == 0) { return; }

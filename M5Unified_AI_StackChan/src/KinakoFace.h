@@ -55,6 +55,13 @@ extern volatile bool g_caption_show;
 extern volatile uint8_t g_caption_front;
 extern char g_caption_buf[2][2][128];
 
+// バッテリーアイコン・音量表示の共有状態（実体は main.cpp、第9.6弾）
+// バッテリーは loop 側が数秒おきに取得して更新し、描画側は読むだけ。
+// 音量は描画時に現在のレベルを読むため、変更が即座に反映される。
+extern volatile int g_batt_pct;        // 残量 %（-1=未取得・アイコンを出さない）
+extern volatile bool g_batt_charging;  // 充電中か
+extern uint8_t g_vol_level;            // 音量レベル（0〜5、第8弾の6段階）
+
 // ポーズ切り替えの共有状態（実体は main.cpp、優先順位管理も main.cpp 側）
 extern volatile int g_pose_state;            // 状態ポーズ (-1=なし)
 extern volatile int g_pose_timed;            // 一時ポーズ (-1=なし)
@@ -163,6 +170,41 @@ class KinakoImage : public Drawable {
       } else {
         // 初回デコードが終わるまでの仮表示
         spi->fillRect(0, 0, 320, 240, 0x0000);
+      }
+    }
+    // バッテリーアイコン（右上・4段階）と音量表示（その下）を写真の上に重ねる（第9.6弾）
+    // 字幕と同じく顔合成のキャンバスへ描くため、ちらつきなく常時表示できる。
+    // 下地は字幕パネルと同じ黒の角丸。表示のみでタッチ判定には影響しない。
+    {
+      int pct = g_batt_pct;
+      if (pct >= 0) {
+        // 段階: 75%以上=4、50%以上=3、25%以上=2、25%未満=1
+        int bars = (pct >= 75) ? 4 : (pct >= 50) ? 3 : (pct >= 25) ? 2 : 1;
+        uint32_t barCol = g_batt_charging ? 0x00FF00u : (bars <= 1 ? 0xFF0000u : 0xFFFFFFu);
+        spi->fillRoundRect(284, 2, 34, 16, 3, 0x000000);
+        spi->drawRoundRect(288, 4, 24, 12, 2, 0xFFFFFF);  // 電池の外枠（24x12）
+        spi->fillRect(313, 7, 3, 6, 0xFFFFFF);             // 端子の出っ張り
+        for (int i = 0; i < bars; i++) {
+          spi->fillRect(290 + i * 5, 6, 4, 8, barCol);     // 残量バー（幅4px＋間隔1px）
+        }
+      }
+      // 音量: スピーカーグリフ＋5目盛りバー（右ほど高い）。レベル0は×付きミュート表示
+      int vol = (int)g_vol_level;
+      if (vol < 0) vol = 0;
+      if (vol > 5) vol = 5;
+      spi->fillRoundRect(284, 20, 34, 14, 3, 0x000000);
+      if (vol == 0) {
+        spi->fillRect(287, 25, 3, 5, 0x808080);
+        spi->fillTriangle(290, 23, 290, 32, 295, 27, 0x808080);
+        spi->drawLine(286, 22, 297, 32, 0xFF0000);
+        spi->drawLine(297, 22, 286, 32, 0xFF0000);
+      } else {
+        spi->fillRect(287, 25, 3, 5, 0xFFFFFF);
+        spi->fillTriangle(290, 23, 290, 32, 295, 27, 0xFFFFFF);
+      }
+      for (int i = 0; i < 5; i++) {
+        int h = 3 + i;  // 目盛りの高さ 3〜7px
+        spi->fillRect(299 + i * 4, 31 - h, 3, h, (i < vol) ? 0xFFFFFFu : 0x404040u);
       }
     }
     // 読み上げ字幕（2行）を写真の上に重ねる

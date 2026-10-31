@@ -1,4 +1,5 @@
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>  // 最大連続ブロック計測（第9.6弾）
 #include "Whisper.h"
 
 namespace {
@@ -11,7 +12,16 @@ Whisper::Whisper(const char* root_ca, const char* api_key) : client(), key(api_k
   client.setCACert(root_ca);
   client.setTimeout(10000); 
   if (!client.connect(API_HOST, API_PORT)) {
-    Serial.println("Connection failed!");
+    // 第9.6弾: SSLメモリ確保失敗など一時的な接続失敗は、切り分け用の
+    // メモリ情報をログに出し、接続を閉じてから1回だけ再試行する
+    Serial.printf("Connection failed! heap=%u largest=%u; retry in 1.5s\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    client.stop();
+    delay(1500);
+    if (!client.connect(API_HOST, API_PORT)) {
+      Serial.println("Connection failed! (retry exhausted)");
+    }
   }
 }
 

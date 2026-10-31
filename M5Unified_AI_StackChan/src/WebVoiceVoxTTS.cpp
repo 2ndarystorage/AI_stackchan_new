@@ -1,9 +1,11 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>  // 最大連続ブロック計測（第9.6弾）
 #include "WebVoiceVoxRootCA.h"
 #include <AudioGeneratorMP3.h>
 #include <AudioFileSourceBuffer.h>
+#include <AudioFileSourcePROGMEM.h>
 #include "AudioFileSourceHTTPSStream.h"
 //#include "AudioOutputM5Speaker.h"
 
@@ -12,11 +14,12 @@ extern String VOICEVOX_API_KEY;
 extern AudioGeneratorMP3 *mp3;
 extern AudioFileSourceBuffer *buff;
 extern AudioFileSourceHTTPSStream *file;
+extern AudioFileSourcePROGMEM *memfile;
 extern int preallocateBufferSize;
 extern uint8_t *preallocateBuffer;
 //extern AudioOutputM5Speaker out;
 void StatusCallback(void *cbData, int code, const char *string);
-bool playMP3(AudioFileSourceBuffer *buff);
+bool playMP3(AudioFileSource *src);
 //-----------------------------------------------------
 
 String https_get(const char* url, const char* root_ca) {
@@ -189,8 +192,9 @@ String voicevox_synth_url(const char* text, const char* tts_parms) {
   String req_url = String("https://api.tts.quest/v3/voicevox/synthesis?key=") + VOICEVOX_API_KEY +
                    String("&text=") + URLEncode(text) + String(tts_parms);
   uint32_t t0 = millis();
-  Serial.printf("[TTS] synth start (%u bytes) heap=%u\n",
-                (unsigned)strlen(text), (unsigned)ESP.getFreeHeap());
+  Serial.printf("[TTS] synth start (%u bytes) heap=%u largest=%u\n",
+                (unsigned)strlen(text), (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 
   static const char* retryAfterHeader[] = {"Retry-After"};
   String payload = "";
@@ -272,6 +276,153 @@ String voicevox_synth_url(const char* text, const char* tts_parms) {
   Serial.printf("[TTS] synth OK in %lu ms (isApiKeyValid: %s)\n",
                 (unsigned long)(millis() - t0), doc["isApiKeyValid"] ? "OK" : "NG");
   return String(mp3url);
+}
+
+// ==== 第9.6弾: MP3ダウンロード（TLS一本化）とメモリ再生 ====
+// 第9.4/9.5系の実機で、合成用TLSと再生ストリーム用TLSが同時存在すると、
+// 内蔵ヒープ不足（合成開始時点で空き約55KB・断片化）により再生側の
+// SSLメモリ確保が失敗し、ニュースが無音になる問題が確認された。
+// そこで再生経路を変更する：文の音声はまずMP3を丸ごとPSRAMへ
+// ダウンロードし（この間だけTLSを使う）、接続を閉じてからメモリ上の
+// データで再生する。再生中に次文を合成・ダウンロードしても、TLS接続は
+// 常に最大1本だけになる。
+// ダウンロードは合成と同じクライアントペアを使い回す（接続先ホストが
+// 変わるため接続自体は張り替えるが、TLSコンテキストが同時に2つ存在する
+// ことはない）。接続を閉じるタイミングで TLS バッファは解放される。
+static const size_t TTS_DL_MAX_BYTES = 768 * 1024;  // 1文MP3の上限（PSRAM 4MBに対して余裕を持たせた値）
+static const uint32_t TTS_DL_TIMEOUT_MS = 30000;    // ダウンロード全体の締切
+static const uint32_t TTS_DL_STALL_MS = 5000;       // データ無着信の許容時間（これを超えたら失敗）
+static const uint32_t TTS_DL_RETRY_WAIT_MS = 1500;  // 接続失敗時の再試行間隔（再試行は1回だけ）
+
+int voicevox_download_mp3(const String& url, uint8_t** outData, size_t* outLen) {
+  *outData = nullptr;
+  *outLen = 0;
+  uint32_t t0 = millis();
+  Serial.printf("[TTS] download start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  for (int attempt = 0; attempt <= 1; attempt++) {
+    if (!tts_ensure_connection()) {
+      Serial.println("[TTS] download failed: client alloc");
+      return -1;
+    }
+    // 合成で使った接続（tts.quest向け）は閉じてからダウンロード先へ張り替える
+    tts_https->end();
+    if (!tts_https->begin(*tts_client, url)) {
+      Serial.println("[TTS] download failed: begin");
+      tts_forget_connection();
+      if (attempt < 1) { delay(TTS_DL_RETRY_WAIT_MS); continue; }
+      return -1;
+    }
+    tts_https->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    int code = tts_https->GET();
+    if (code == HTTP_CODE_OK) {
+      int size = tts_https->getSize();  // Content-Length（チャンク形式なら -1）
+      if (size > (int)TTS_DL_MAX_BYTES) {
+        Serial.printf("[TTS] download too large: %d bytes (cap %u)\n",
+                      size, (unsigned)TTS_DL_MAX_BYTES);
+        tts_https->end();
+        return 1;
+      }
+      WiFiClient *stream = tts_https->getStreamPtr();
+      if (stream == nullptr) {
+        tts_https->end();
+        return -1;
+      }
+      size_t cap = (size > 0) ? (size_t)size : 128 * 1024;
+      uint8_t *buf = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (buf == nullptr) {
+        Serial.println("[TTS] download failed: PSRAM alloc");
+        tts_https->end();
+        return -1;
+      }
+      size_t got = 0;
+      bool over = false, failed = false;
+      uint32_t lastData = millis();
+      while ((int32_t)(millis() - t0) < (int32_t)TTS_DL_TIMEOUT_MS) {
+        if (size > 0 && got >= (size_t)size) break;
+        size_t avail = stream->available();
+        if (avail == 0) {
+          if (size < 0 && !stream->connected()) break;  // チャンク形式の終端（接続クローズ）
+          // チャンク形式は終端をサイズで判定できないため、2秒無着信で終端とみなす
+          if (size < 0 && got > 0 && (int32_t)(millis() - lastData) > 2000) break;
+          if ((int32_t)(millis() - lastData) > (int32_t)TTS_DL_STALL_MS) { failed = true; break; }
+          delay(1);
+          continue;
+        }
+        if (got + avail > cap) {
+          if (size > 0) { failed = true; break; }  // 申告サイズと実データの不一致
+          if (cap >= TTS_DL_MAX_BYTES) { over = true; break; }
+          size_t newCap = cap * 2;
+          if (newCap > TTS_DL_MAX_BYTES) newCap = TTS_DL_MAX_BYTES;
+          uint8_t *nb = (uint8_t *)heap_caps_realloc(buf, newCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+          if (nb == nullptr) { failed = true; break; }
+          buf = nb;
+          cap = newCap;
+        }
+        size_t want = cap - got;
+        if (want > avail) want = avail;
+        int n = stream->read(buf + got, want);
+        if (n > 0) {
+          got += (size_t)n;
+          lastData = millis();
+        } else {
+          delay(1);
+        }
+      }
+      tts_https->end();  // ここでTLSを閉じる（再生中にTLS接続は残らない）
+      if (over) {
+        heap_caps_free(buf);
+        Serial.printf("[TTS] download too large: over %u bytes cap\n", (unsigned)TTS_DL_MAX_BYTES);
+        return 1;
+      }
+      if (failed || got == 0 || (size > 0 && got < (size_t)size)) {
+        heap_caps_free(buf);
+        Serial.printf("[TTS] download incomplete: %u/%d bytes\n", (unsigned)got, size);
+        tts_forget_connection();
+        if (attempt < 1) { delay(TTS_DL_RETRY_WAIT_MS); continue; }
+        return -1;
+      }
+      *outData = buf;
+      *outLen = got;
+      Serial.printf("[TTS] download OK: %u bytes in %lu ms heap=%u largest=%u\n",
+                    (unsigned)got, (unsigned long)(millis() - t0),
+                    (unsigned)ESP.getFreeHeap(),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+      return 0;
+    }
+    if (code > 0) {
+      // HTTPエラーは再試行しない（呼び出し側がストリーム再生へフォールバックする）
+      Serial.printf("[TTS] download failed: HTTP %d\n", code);
+      tts_forget_connection();
+      return -1;
+    }
+    // 接続エラー（SSLメモリ確保失敗を含む）。全て解放して1回だけ再試行する
+    Serial.printf("[TTS] download failed: %s heap=%u largest=%u\n",
+                  tts_https->errorToString(code).c_str(),
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    tts_forget_connection();
+    if (attempt < 1) { delay(TTS_DL_RETRY_WAIT_MS); continue; }
+    return -1;
+  }
+  return -1;
+}
+
+// PSRAM上のMP3データから再生を開始する（TLSは使わない）。
+// AudioFileSourcePROGMEM はポインタを参照するだけなので、データ本体は
+// 再生終了まで呼び出し側（main.cpp の再生管理）が保持・解放する。
+bool voicevox_play_memory(const uint8_t* data, size_t len) {
+  if (data == nullptr || len == 0) return false;
+  memfile = new AudioFileSourcePROGMEM(data, (uint32_t)len);
+  if (memfile == nullptr) return false;
+  if (!playMP3(memfile)) {
+    Serial.println("[TTS] play begin failed in generator (memory)");
+    delete memfile;
+    memfile = nullptr;
+    return false;
+  }
+  return true;
 }
 
 // 取得済みのストリーミングURLから MP3 再生を開始する

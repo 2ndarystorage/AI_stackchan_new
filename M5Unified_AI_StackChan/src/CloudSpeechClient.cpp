@@ -2,6 +2,7 @@
 //#include "network_param.h"
 #include <base64.h>
 #include <ArduinoJson.h>
+#include <esp_heap_caps.h>  // 最大連続ブロック計測（第9.6弾）
 
 String LANG_CODE = "ja-jp";
 
@@ -17,7 +18,15 @@ CloudSpeechClient::CloudSpeechClient(const char* root_ca, const char* api_key) :
   client.setCACert(root_ca);
   client.setTimeout( 10000 ); 
   if (!client.connect(API_HOST, API_PORT)) {
-    Serial.println("Connection failed!");
+    // 第9.6弾: Whisper 側と同様、接続失敗時はメモリ情報を出して1回だけ再試行する
+    Serial.printf("Connection failed! heap=%u largest=%u; retry in 1.5s\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    client.stop();
+    delay(1500);
+    if (!client.connect(API_HOST, API_PORT)) {
+      Serial.println("Connection failed! (retry exhausted)");
+    }
   }
 }
 

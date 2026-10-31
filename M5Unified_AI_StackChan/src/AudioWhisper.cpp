@@ -16,7 +16,10 @@ AudioWhisper::AudioWhisper() {
 }
 
 AudioWhisper::~AudioWhisper() {
-  delete record_buffer;
+  // 第9.6弾: heap_caps_malloc と対になる heap_caps_free へ修正
+  // （従来は delete で、確保方法と解放方法が不整合だった）
+  heap_caps_free(record_buffer);
+  record_buffer = nullptr;
 }
 
 size_t AudioWhisper::GetSize() const {

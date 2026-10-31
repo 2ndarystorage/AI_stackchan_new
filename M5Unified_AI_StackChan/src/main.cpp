@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <esp_system.h>  // esp_reset_reason（起動時診断、第8弾）
+#include <esp_heap_caps.h>  // 最大連続ブロック計測（メモリ切り分け、第9.6弾）
 //#include <FS.h>
 #include <SD.h>
 #include <SPIFFS.h>
@@ -12,6 +13,7 @@
 
 #include <AudioOutput.h>
 #include <AudioFileSourceBuffer.h>
+#include <AudioFileSourcePROGMEM.h>
 #include <AudioGeneratorMP3.h>
 #include "AudioFileSourceHTTPSStream.h"
 #include "AudioOutputM5Speaker.h"
@@ -260,6 +262,21 @@ volatile bool g_caption_show = false;
 volatile uint8_t g_caption_front = 0;
 char g_caption_buf[2][2][128];
 
+// バッテリーアイコンの共有状態（第9.6弾。宣言は KinakoFace.h 側にも extern）
+// loop 側が数秒おきに M5.Power から取得して更新し、描画側は読むだけ。
+// 取得できていない間は -1（アイコンを出さない）。取得失敗時は前回値を維持する。
+volatile int g_batt_pct = -1;          // 残量 %（0〜100、-1=未取得）
+volatile bool g_batt_charging = false; // 充電中か
+static uint32_t g_batt_last_ms = 0;
+static void battery_icon_tick() {
+  uint32_t now = millis();
+  if (g_batt_last_ms != 0 && (int32_t)(now - g_batt_last_ms) < 5000) return;
+  g_batt_last_ms = now;
+  int32_t lv = M5.Power.getBatteryLevel();
+  if (lv >= 0 && lv <= 100) g_batt_pct = (int)lv;
+  g_batt_charging = (M5.Power.isCharging() == m5::Power_Class::is_charging);
+}
+
 // ==== ポーズ画像の切り替え状態（第9弾） ====
 // 優先順位と復帰先はここ（main.cpp 側）で一元管理する。
 // 「一時ポーズ（期限内）> 状態ポーズ > 表情連動 > 待機（ピース）」の順。
@@ -444,7 +461,7 @@ static void capBuildFromText(const String& text) {
 // GPIO25 に信号が出るだけで無害。駆動は既存依存の FastLED を使う。
 #define SIDE_LED_PIN 25
 #define SIDE_LED_COUNT 10
-#define SIDE_LED_MAX_BRIGHTNESS 16   // 全体の明るさ上限（第9.5弾：48→16、省電力化）
+#define SIDE_LED_MAX_BRIGHTNESS 6   // 全体の明るさ上限（第9.5弾：48→16、第9.6弾：16→6、省電力化）
 CRGB g_side_leds[SIDE_LED_COUNT];
 bool g_led_enable = true;            // 全体の有効/無効（NVS "setting"/"led"、既定ON）
 bool g_led_listening = false;        // 録音中（青）
@@ -583,12 +600,15 @@ struct TtsChunk {
 };
 static std::deque<TtsChunk> g_tts_queue;   // 合成待ちチャンク
 static String g_tts_ready_url = "";        // 合成済みの次文URL（有効な間だけ意味を持つ）
+static uint8_t *g_tts_ready_data = nullptr; // 合成済み次文のMP3データ（PSRAM。第9.6弾: メモリ再生用。所有権はスロット保持中は合成タスク側→消費時に再生側へ）
+static size_t g_tts_ready_len = 0;          // g_tts_ready_data のバイト数
 static bool g_tts_ready = false;           // ready_url がセットされた（空URL=合成失敗でスキップ）
 static bool g_tts_synth_busy = false;      // 合成タスクが1文を処理中
 static bool g_speech_session = false;      // 発話セッション中（投入〜全チャンク再生完了）
 static SemaphoreHandle_t g_tts_mutex = nullptr;
 static uint32_t g_tts_gen = 0;             // 発話セッションの世代（中断時に進めて合成結果を無効化）
 static uint32_t g_stop_msg_until = 0;      // 「中断しました」吹き出しを消す時刻（0=非表示）
+static uint32_t g_info_msg_until = 0;      // 通知吹き出し（ニュース取得失敗など）を消す時刻（0=非表示。第9.6弾）
 
 void ttsSynthTask(void *args);  // 実体は後方（setup でタスク起動）
 void tts_drive();               // 実体は後方（loop から毎回呼ぶ）
@@ -1200,13 +1220,14 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
   return v;
 }
 
-// NHKニュースRSS（カテゴリ nhkCat）を取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
-// dispItems には表示用に「見出し＋説明」を1件ずつ格納する（吹き出し表示キュー構築用）
-// intro は読み上げ文の導入（例「今日のニュースです。」）
-String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* dispTitles, String* dispDescs, int maxDispItems, int& dispCount) {
+// NHKニュースRSS（カテゴリ nhkCat）の本文を取得する（第9.6弾で分離）。
+// 成否コードは g_nhk_http_code に残す（接続失敗時は負値）。
+static String fetchNhkRssBody(int nhkCat) {
   String payload = "";
-  dispCount = 0;
   g_nhk_http_code = 0;
+  Serial.printf("[NHK RSS] start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   WiFiClientSecure *client = new WiFiClientSecure;
   if (!client) return "";
   client->setCACert(root_ca_nhk);
@@ -1250,6 +1271,21 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
     }
   }
   delete client;
+  return payload;
+}
+
+// NHKニュースRSS（カテゴリ nhkCat）を取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
+// dispItems には表示用に「見出し＋説明」を1件ずつ格納する（吹き出し表示キュー構築用）
+// intro は読み上げ文の導入（例「今日のニュースです。」）
+String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* dispTitles, String* dispDescs, int maxDispItems, int& dispCount) {
+  dispCount = 0;
+  String payload = fetchNhkRssBody(nhkCat);
+  if (payload == "" && g_nhk_http_code < 0) {
+    // 接続失敗（SSLメモリ確保失敗を含む）は、全て解放したうえで1回だけ再試行する（第9.6弾）
+    Serial.printf("[NHK RSS] retry after connection failure (code %d)\n", g_nhk_http_code);
+    delay(1500);
+    payload = fetchNhkRssBody(nhkCat);
+  }
   if (payload == "") return "";
 
   String result = intro;
@@ -1298,9 +1334,12 @@ static String stripMediaSuffix(String t) {
 
 // GoogleニュースRSSをストリームで少しずつ読みながら、<item> の <title> を最大 want 件抽出する。
 // フィード全文は保持せず、抽出済み見出しだけを outTitles に残す（走査上限 120KB で打ち切り）。
-static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
+static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
   outCount = 0;
   httpCodeOut = 0;
+  Serial.printf("[Google RSS] start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   WiFiClientSecure *client = new WiFiClientSecure;
   if (!client) return false;
   client->setCACert(root_ca_google);
@@ -1379,6 +1418,18 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
   return outCount > 0;
 }
 
+// 接続失敗（httpCodeOut < 0、SSLメモリ確保失敗を含む）時は、全て解放した
+// うえで1回だけ再試行するラッパー（第9.6弾）
+static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
+  bool ok = fetchGoogleHeadlinesOnce(url, want, outTitles, outCount, httpCodeOut);
+  if (!ok && httpCodeOut < 0) {
+    Serial.printf("[Google RSS] retry after connection failure (code %d)\n", httpCodeOut);
+    delay(1500);
+    ok = fetchGoogleHeadlinesOnce(url, want, outTitles, outCount, httpCodeOut);
+  }
+  return ok;
+}
+
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
 // あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
 String exec_news() {
@@ -1438,6 +1489,9 @@ String exec_news() {
     speech_text = text;
   } else {
     speech_text = "ニュースを取得できませんでした";
+    // 第9.6弾: 音声が出ない場合でも理由が分かるよう、吹き出しにも表示して残す
+    avatar.setSpeechText("ニュースを取得できませんでした");
+    g_info_msg_until = millis() + 4000;
   }
   g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   return text;
@@ -1488,6 +1542,9 @@ void exec_news_category(int cat) {
     speech_text = text;
   } else {
     speech_text = "ニュースを取得できませんでした";
+    // 第9.6弾: 音声が出ない場合でも理由が分かるよう、吹き出しにも表示して残す
+    avatar.setSpeechText("ニュースを取得できませんでした");
+    g_info_msg_until = millis() + 4000;
   }
   g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
 }
@@ -1670,9 +1727,20 @@ AudioFileSourceBuffer *buff = nullptr;
 int preallocateBufferSize = 30*1024;
 uint8_t *preallocateBuffer;
 AudioFileSourceHTTPSStream *file = nullptr;
+AudioFileSourcePROGMEM *memfile = nullptr;   // メモリ再生用ソース（第9.6弾）
+static uint8_t *g_play_data = nullptr;       // 再生中のMP3データ（PSRAM。再生側が所有し、再生終了時に解放）
 
-bool playMP3(AudioFileSourceBuffer *buff){
-  return mp3->begin(buff, &out);
+bool playMP3(AudioFileSource *src){
+  return mp3->begin(src, &out);
+}
+
+// 再生ソース一式の後片付け（ストリーム再生・メモリ再生の両対応、第9.6弾）。
+// 再生が終わっているタイミングでのみ呼ぶこと（再生中ソースを消さない）。
+static void tts_cleanup_playback_sources() {
+  if (buff != nullptr) { delete buff; buff = nullptr; }
+  if (file != nullptr) { delete file; file = nullptr; }
+  if (memfile != nullptr) { delete memfile; memfile = nullptr; }
+  if (g_play_data != nullptr) { heap_caps_free(g_play_data); g_play_data = nullptr; }
 }
 
 // 文単位パイプラインTTS: 合成専用タスク（第8弾）。
@@ -1707,14 +1775,32 @@ void ttsSynthTask(void *args)
     } else {
       Serial.println("[TTS] synth skipped: WiFi disconnected");
     }
+    // 第9.6弾: 合成できたら、その場でMP3をPSRAMへ丸ごとダウンロードしておく。
+    // 再生はメモリから行い、再生用にTLS接続を新たに張らない（TLS一本化）。
+    // 上限超過・ダウンロード失敗の場合はURLを ready スロットへ残し、
+    // 再生側が従来のストリーム再生へフォールバックする。
+    uint8_t *dlData = nullptr;
+    size_t dlLen = 0;
+    String readyUrl = "";
+    if (url != "") {
+      int rc = voicevox_download_mp3(url, &dlData, &dlLen);
+      if (rc != 0) {
+        Serial.printf("[TTS] download fallback to streaming (rc=%d)\n", rc);
+        readyUrl = url;
+      }
+    }
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
     // 中断などで世代が進んでいたら、この合成結果は破棄する（再生させない）
     if (gen == g_tts_gen) {
-      g_tts_ready_url = url;
+      g_tts_ready_url = readyUrl;
+      g_tts_ready_data = dlData;
+      g_tts_ready_len = dlLen;
       g_tts_ready = true;
+      dlData = nullptr;  // 所有権は ready スロットへ移った
     }
     g_tts_synth_busy = false;
     xSemaphoreGive(g_tts_mutex);
+    if (dlData != nullptr) heap_caps_free(dlData);  // 世代が進んでいた場合は破棄
   }
 }
 
@@ -1722,34 +1808,59 @@ void ttsSynthTask(void *args)
 // 再生中でないとき、合成済みの文があれば再生を開始し、キューが空になって
 // 合成も終わっていれば発話セッションの終了処理（従来は mp3 終了時に実施）を
 // 1回だけ行う。
+// 再生開始直後の共通処理（第9.6弾で切り出し）：字幕キューが用意されていれば、
+// 最初の文の再生開始に合わせて字幕表示を開始する（ニュース・会話応答の両方が対象）
+static void tts_on_play_started() {
+  if (g_cap_armed && g_cap_count > 0) {
+    g_cap_armed = false;
+    g_cap_active = true;
+    g_led_news_active = true;   // 側面LED：字幕表示中はニュース色（会話時は白）
+    g_cap_idx = 0;
+    g_cap_start_ms = millis();
+    g_cap_clear_ms = 0;
+    captionShowUnit(0);
+    g_cap_next_ms = millis() + capUnitDurationMs(0);
+  }
+}
+
 void tts_drive()
 {
   if (mp3 == nullptr || mp3->isRunning()) return;
 
   if (g_tts_ready) {
     String url;
+    uint8_t *data = nullptr;
+    size_t len = 0;
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
     url = g_tts_ready_url;
+    data = g_tts_ready_data;
+    len = g_tts_ready_len;
     g_tts_ready = false;
     g_tts_ready_url = "";
+    g_tts_ready_data = nullptr;
+    g_tts_ready_len = 0;
     xSemaphoreGive(g_tts_mutex);
+    if (data != nullptr) {
+      // 第9.6弾: メモリ再生（再生用にTLSを張らない）
+      tts_cleanup_playback_sources();
+      g_play_data = data;  // 所有権は再生側へ（再生終了時に後片付けで解放）
+      if (voicevox_play_memory(data, len)) {
+        Serial.println("[TTS] play start (memory)");
+        tts_on_play_started();
+        return;
+      }
+      // begin 失敗時はソースとデータをここで解放する
+      if (memfile != nullptr) { delete memfile; memfile = nullptr; }
+      if (g_play_data != nullptr) { heap_caps_free(g_play_data); g_play_data = nullptr; }
+      Serial.println("[TTS] play begin failed (memory); skip sentence");
+      return;
+    }
     if (url != "") {
-      if (buff != nullptr) { delete buff; buff = nullptr; }
-      if (file != nullptr) { delete file; file = nullptr; }
+      // ストリーム再生（ダウンロード上限超過時のフォールバック）
+      tts_cleanup_playback_sources();
       if (voicevox_play_url(url)) {
         Serial.println("[TTS] play start");
-        // 字幕キューが用意されていれば、最初の文の再生開始に合わせて
-        // 字幕表示を開始する（ニュース・会話応答の両方が対象）
-        if (g_cap_armed && g_cap_count > 0) {
-          g_cap_armed = false;
-          g_cap_active = true;
-          g_led_news_active = true;   // 側面LED：字幕表示中はニュース色（会話時は白）
-          g_cap_idx = 0;
-          g_cap_start_ms = millis();
-          g_cap_clear_ms = 0;
-          captionShowUnit(0);
-          g_cap_next_ms = millis() + capUnitDurationMs(0);
-        }
+        tts_on_play_started();
         return;
       }
       Serial.println("[TTS] play begin failed; skip sentence");
@@ -1792,11 +1903,15 @@ static void stop_news_speech() {
   while (!g_tts_queue.empty()) g_tts_queue.pop_front();
   g_tts_ready = false;
   g_tts_ready_url = "";
+  if (g_tts_ready_data != nullptr) {  // ダウンロード済みMP3も破棄する（第9.6弾）
+    heap_caps_free(g_tts_ready_data);
+    g_tts_ready_data = nullptr;
+    g_tts_ready_len = 0;
+  }
   g_tts_synth_busy = false;
   xSemaphoreGive(g_tts_mutex);
   if (mp3 != nullptr && mp3->isRunning()) mp3->stop();
-  if (buff != nullptr) { delete buff; buff = nullptr; }
-  if (file != nullptr) { delete file; file = nullptr; }
+  tts_cleanup_playback_sources();
   speech_text = "";
   speech_text_buffer = "";
   g_news_playing = false;
@@ -2073,6 +2188,9 @@ void Wifi_setup() {
 
 String SpeechToText(bool isGoogle){
   uint32_t stt_t0 = millis();
+  Serial.printf("[STT] start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   Serial.println("\r\nRecord start!\r\n");
   g_led_listening = true;   // 側面LED：録音中（青）
 
@@ -2887,6 +3005,8 @@ void loop()
 
   pose_prepare_tick();  // 第9.2弾: ポーズ画像の先行デコード（draw タスク外で実施）
 
+  battery_icon_tick();  // 第9.6弾: バッテリー残量の定期取得（描画は顔合成側）
+
   dance_guard_tick();  // 第9.2弾: 再生後ガードの解除（再生終了から5秒安定したら）
 
   dance_boot_check();  // 第9.1弾: 起動時ダンス動画の自動再生（初回のみ・ガード付き）
@@ -3097,6 +3217,15 @@ void loop()
     }
   }
 
+  // 通知吹き出し（ニュース取得失敗など、第9.6弾）を約4秒で消す（同上の条件）
+  if (g_info_msg_until != 0 && (int32_t)(millis() - g_info_msg_until) >= 0) {
+    g_info_msg_until = 0;
+    if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
+        !g_cap_active && !g_menu_open) {
+      avatar.setSpeechText("");
+    }
+  }
+
   if(speech_text != ""){
     avatar.setExpression(Expression::Happy);
     speech_text_buffer = speech_text;
@@ -3127,8 +3256,7 @@ void loop()
   if (mp3->isRunning()) {
     if (!mp3->loop()) {
       mp3->stop();
-      if(file != nullptr){delete file; file = nullptr;}
-      if(buff != nullptr){delete buff; buff = nullptr;}
+      tts_cleanup_playback_sources();  // ストリーム/メモリ両対応の後片付け（第9.6弾）
       Serial.println("mp3 stop");
       // 発話セッションの終了処理（表情・Mic・mode の復帰）は、続きの文が
       // 無いことを確認してから tts_drive() が行う（文ごとに繰り返さない）

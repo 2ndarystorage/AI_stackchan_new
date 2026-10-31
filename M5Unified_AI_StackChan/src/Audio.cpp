@@ -8,7 +8,10 @@ Audio::Audio() {
 }
 
 Audio::~Audio() {
-  delete wavData;
+  // 第9.6弾: heap_caps_malloc と対になる heap_caps_free へ修正
+  // （従来は delete で、確保方法と解放方法が不整合だった）
+  heap_caps_free(wavData);
+  wavData = nullptr;
 }
 
 void Audio::CreateWavHeader(byte* header, int waveDataSize){

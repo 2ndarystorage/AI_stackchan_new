@@ -2,6 +2,8 @@
 
 #include <Arduino.h>
 
+void voicevox_log_ca();
+
 // 第8弾: 文単位パイプラインTTS 用のAPI。
 // voicevox_synth_url() は tts.quest へ1文（チャンク）を合成依頼し、
 // 再生用ストリーミングURLを返す。失敗/タイムアウト時は空文字を返す。

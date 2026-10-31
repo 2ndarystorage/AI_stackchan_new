@@ -18,6 +18,10 @@ extern AudioFileSourceHTTPSStream *file;
 extern AudioFileSourcePROGMEM *memfile;
 extern int preallocateBufferSize;
 extern uint8_t *preallocateBuffer;
+
+void voicevox_log_ca() {
+  Serial.println("[BOOT] TTS CA: ISRG Root X1 self-signed (v9.14)");
+}
 //extern AudioOutputM5Speaker out;
 void StatusCallback(void *cbData, int code, const char *string);
 bool playMP3(AudioFileSource *src);

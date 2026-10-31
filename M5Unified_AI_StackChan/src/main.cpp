@@ -2433,6 +2433,7 @@ void setup()
     for (;;) delay(1000);
   }
   Serial.println("[BOOT] Avatar gfx lock: vendored-v9.13 (shared mutex, draw stack=8192)");
+  voicevox_log_ca();
 
   // 起動時診断（第8弾）: リセット要因と空きヒープを Serial と画面に出す。
   // 異常リセット（パニック/ウォッチドッグ/電圧低下）の切り分けを
@@ -2799,7 +2800,7 @@ void setup()
     Serial.println("[BOOT] FATAL: MP3 decoder task unavailable");
     for (;;) delay(1000);
   }
-  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 v9.13)");
+  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 v9.14)");
   wakeword_init();
 
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動

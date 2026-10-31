@@ -4,6 +4,11 @@
 
 #include "Avatar.h"
 
+// 第9.3弾 (vendored change): drawLoop 側の描画を、アプリ共有の
+// グラフィックス直列化ロック (プロジェクト側 src/GfxLock.h) の内側で行う。
+// 理由は VENDORED.md を参照。
+#include "../../../src/GfxLock.h"
+
 #ifndef PI
 #define PI 3.1415926535897932384626433832795
 #endif
@@ -193,6 +198,10 @@ void Avatar::start(int colorDepth) {
 }
 
 void Avatar::draw() {
+  // 第9.3弾 (vendored change): 描画全体をアプリ共有ロックで直列化する。
+  // loop 側の直接描画 (ダンス動画・ニュース一覧・ポーズの先行デコード) と
+  // パネル transaction の begin/end がタスクをまたいで崩れるのを防ぐ。
+  GfxLockGuard gfx_guard;
   Gaze g = Gaze(this->gazeV, this->gazeH);
   DrawContext *ctx = new DrawContext(this->expression, this->breath,
                                      &this->palette, g, this->eyeOpenRatio,

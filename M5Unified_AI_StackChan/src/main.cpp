@@ -38,6 +38,12 @@
 #include "WakeWord.h"
 #include <FastLED.h>
 #include "Scheduler.h"
+#include "GfxLock.h"  // グラフィックス直列化ロック（第9.3弾）
+
+// グラフィックス直列化ロックの実体（第9.3弾、GfxLock.h）。
+// setup() の最初で生成し、描画タスク (drawLoop) と loop 側の直接描画が
+// 同じ LGFX オブジェクトを同時に触らないよう直列化する。
+SemaphoreHandle_t g_gfx_mutex = nullptr;
 
 // 保存する質問と回答の最大数
 const int MAX_HISTORY = 5;
@@ -289,7 +295,12 @@ static int resolve_target_pose() {
 
 // loop から毎回呼ぶ。目標ポーズが変わったときだけ裏スプライトへ先行デコード
 // され、描画側はデコード完了後にスプライトを切り替える。
+// 第9.3弾: デコード (LGFX キャンバス操作) を描画タスクと直列化するため、
+// グラフィックス直列化ロックの中で行う。ポーズが変わらない回はロックの
+// 取得・解放だけで即座に戻る。デコード中は描画が最大でデコード時間
+// （数十〜百数十ms）待たされるが、顔は静止画のため実害はない。
 static void pose_prepare_tick() {
+  GfxLockGuard gfx_guard;
   kinakoPreparePose(resolve_target_pose());
 }
 
@@ -2093,6 +2104,10 @@ String SpeechToText(bool isGoogle){
 
 void setup()
 {
+  // 第9.3弾: グラフィックス直列化ロックを最初に生成する
+  // （avatar.init() で描画タスクが始まる前に必ず用意する）
+  g_gfx_mutex = xSemaphoreCreateRecursiveMutex();
+
   auto cfg = M5.config();
 
   cfg.external_spk = true;    /// use external speaker (SPK HAT / ATOMIC SPK)
@@ -2595,8 +2610,13 @@ static bool play_dance_video() {
     return false;
   }
   g_dance_playing_rtc = true;   // クラッシュガード：再生中フラグを立てる
-  avatar.suspend();
-  delay(40);  // 描画タスクが現在のフレームを描き終えるのを待つ
+  // 第9.3弾: avatar.suspend() による描画タスクの凍結は廃止した。suspend は
+  // 描画タスクをパネル transaction の途中で凍結し得て、SPI mutex の所有権
+  // 競合の一因だった。代わりにグラフィックス直列化ロックを再生の間ずっと
+  // 保持する: drawLoop は Avatar::draw() の入口でブロックされ、描画は
+  // フレーム境界で確実に止まる。ガードは関数を抜けるときに自動解放され、
+  // そこで描画が再開する。
+  GfxLockGuard gfx_guard;
   g_led_dance_until = millis() + 11000;  // 側面LED：再生中は色サイクル
   const uint32_t frame_ms = 1000 / 10;   // 10fps（第9.1弾で軽量化）
   const uint32_t t0 = millis();
@@ -2658,7 +2678,7 @@ static bool play_dance_video() {
     drawn++;
   }
   g_led_dance_until = 0;
-  avatar.resume();
+  // 第9.3弾: avatar.resume() は廃止（suspend 自体をやめたため）。
   // 第9.2弾: フラグはここでは下ろさない。再生直後の描画再開で落ちるケースを
   // ガードするため、5 秒間は立てたままにし、dance_guard_tick() が下ろす。
   g_dance_guard_clear_at = millis() + 5000;
@@ -2806,7 +2826,10 @@ static void menuShowBalloon() {
 
 // メニューのカテゴリ一覧を画面左側へ描く。
 // Avatar の再描画で上書きされるため、メニュー表示中は loop のたびに描き直す
+// 第9.3弾: LCD への直接描画はグラフィックス直列化ロックの中で行う
+// （描画タスクのパネル transaction と begin/end が競合しないように）。
 static void drawMenuList() {
+  GfxLockGuard gfx_guard;
   M5.Lcd.fillRect(0, 76, 176, 106, TFT_BLACK);
   M5.Lcd.setFont(&fonts::efontJA_16);
   M5.Lcd.setTextSize(1);

@@ -15,6 +15,7 @@ class AudioOutputM5Speaker : public AudioOutput
       _virtual_ch = virtual_sound_channel;
     }
     virtual ~AudioOutputM5Speaker(void) {};
+    void setAbort(bool value) { _abort = value; }
     virtual bool begin(void) override { return true; }
     virtual bool ConsumeSample(int16_t sample[2]) override
     {
@@ -34,7 +35,7 @@ class AudioOutputM5Speaker : public AudioOutput
     {
       if (_tri_buffer_index)
       {
-        _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, (uint32_t)(hertz * TTS_SPEED_RATE), true, 1, _virtual_ch);
+        if (!_m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, (uint32_t)(hertz * TTS_SPEED_RATE), true, 1, _virtual_ch)) return;
         _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
         _tri_buffer_index = 0;
         ++_update_count;
@@ -42,8 +43,14 @@ class AudioOutputM5Speaker : public AudioOutput
     }
     virtual bool stop(void) override
     {
-      flush();
+      if (!_abort) {
+        // Do not discard the final queued PCM or overwrite buffers still in use.
+        uint32_t start = millis();
+        while (_tri_buffer_index && millis() - start < 1000) { flush(); delay(1); }
+        while (_m5sound->isPlaying(_virtual_ch) && millis() - start < 1000) delay(1);
+      }
       _m5sound->stop(_virtual_ch);
+      _tri_buffer_index = 0;
       for (size_t i = 0; i < 3; ++i)
       {
         memset(_tri_buffer[i], 0, tri_buf_size * sizeof(int16_t));
@@ -58,6 +65,7 @@ class AudioOutputM5Speaker : public AudioOutput
   protected:
     m5::Speaker_Class* _m5sound;
     uint8_t _virtual_ch;
+    bool _abort = false;
     static constexpr size_t tri_buf_size = 640;
     int16_t _tri_buffer[3][tri_buf_size];
     size_t _tri_buffer_index = 0;

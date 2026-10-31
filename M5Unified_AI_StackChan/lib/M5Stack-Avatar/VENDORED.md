@@ -1,8 +1,10 @@
 # Vendored library note (第9.2弾・第9.3弾)
 
 This is a vendored copy of meganetaaan/M5Stack-Avatar 0.9.2 (the same version
-that PlatformIO previously fetched into `.pio/libdeps`). Placing it under the
-project `lib/` folder makes PlatformIO prefer it over the registry copy.
+that PlatformIO previously fetched into `.pio/libdeps`). It must be selected explicitly via `symlink://lib/M5Stack-Avatar` in both
+PlatformIO environments. An explicit registry `lib_deps` previously overrode
+the local copy in the v9.12 build and omitted these crash fixes. The header
+revision and linked implementation marker now make an unpatched build fail.
 
 ## Changes from upstream
 
@@ -31,3 +33,12 @@ project `lib/` folder makes PlatformIO prefer it over the registry copy.
 Everything else is byte-identical to the 0.9.2 registry package (examples/
 and .github/ were dropped). If the upstream library is ever upgraded, this
 folder must be re-vendored and both changes re-applied.
+
+## v9.13 build and lifecycle guards
+
+The local Avatar header declares `STACKCHAN_AVATAR_GFX_LOCKED=0x0913`.
+The implementation exports `stackchan_avatar_gfx_lock_revision()`, which the
+application calls at boot. A registry header fails compilation; a registry
+implementation fails linking. `setExpression()` takes the shared recursive
+graphics lock rather than suspending drawLoop mid-transaction. The draw stack
+remains 8192 bytes and `Avatar::draw()` holds the same lock as dance playback.

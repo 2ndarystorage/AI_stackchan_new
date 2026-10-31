@@ -255,12 +255,43 @@ volatile uint8_t g_caption_front = 0;
 char g_caption_buf[2][2][128];
 
 // ==== ポーズ画像の切り替え状態（第9弾） ====
-// 優先順位と復帰先はここ（main.cpp 側）で一元管理し、描画側 (KinakoFace) は
-// 「一時ポーズ（期限内）> 状態ポーズ > 表情連動 > 待機（ピース）」の順で読む。
+// 優先順位と復帰先はここ（main.cpp 側）で一元管理する。
+// 「一時ポーズ（期限内）> 状態ポーズ > 表情連動 > 待機（ピース）」の順。
+// 第9.2弾: ポーズの解決と JPEG デコードは loop 側 (resolve_target_pose /
+// pose_prepare_tick) で行い、描画側 (KinakoFace) はデコード済みスプライトの
+// 切替と pushSprite だけを行う（drawLoop のスタック不足対策）。
 volatile int g_pose_state = -1;             // 状態ポーズ（会話開始・発話セッション中）
 volatile int g_pose_timed = -1;             // 一時ポーズ（ウェイク検出のジャンプ等）
 volatile uint32_t g_pose_timed_until = 0;   // 一時ポーズの終了時刻 (millis)
 static int g_pending_pose = -1;             // 次の発話セッションで使うポーズ（発話のセット側が指定し、loop の発話開始時に消費）
+
+namespace m5avatar { KinakoImage *g_kinako_image = nullptr; }  // 実体（宣言は KinakoFace.h）
+
+// 現在表示すべきポーズを解決する（KinakoFace 側フォールバック解決と同一規則）
+static int resolve_target_pose() {
+  uint32_t now = millis();
+  int timed = g_pose_timed;
+  if (timed >= 0 && timed < POSE_COUNT &&
+      (int32_t)(g_pose_timed_until - now) > 0) {
+    return timed;
+  }
+  int st = g_pose_state;
+  if (st >= 0 && st < POSE_COUNT) return st;
+  switch (avatar.getExpression()) {
+    case Expression::Happy:  return POSE_HEART;
+    case Expression::Sleepy: return POSE_SLEEP;
+    case Expression::Doubt:  return POSE_SURPRISE;
+    case Expression::Sad:    return POSE_BOW;
+    case Expression::Angry:  return POSE_FISTS;
+    default:                 return POSE_PEACE;  // Neutral は待機ポーズ
+  }
+}
+
+// loop から毎回呼ぶ。目標ポーズが変わったときだけ裏スプライトへ先行デコード
+// され、描画側はデコード完了後にスプライトを切り替える。
+static void pose_prepare_tick() {
+  kinakoPreparePose(resolve_target_pose());
+}
 
 static void captionHide() { g_caption_show = false; }
 
@@ -957,9 +988,8 @@ void handle_apikey_set() {
   OPENAI_API_KEY = openai;
   VOICEVOX_API_KEY = voicevox;
   STT_API_KEY = sttapikey;
-  Serial.println(openai);
-  Serial.println(voicevox);
-  Serial.println(sttapikey);
+  // 第9.2弾: APIキーの平文 Serial 出力を廃止（値そのものは出力しない）
+  Serial.println("apikey updated via /apikey_set (values not logged)");
 
   uint32_t nvs_handle;
   if (ESP_OK == nvs_open("apikey", NVS_READWRITE, &nvs_handle)) {
@@ -2258,11 +2288,9 @@ void setup()
         nvs_set_str(nvs_handle, "openai", buf);
         nvs_set_str(nvs_handle, "voicevox", &buf[y]);
         nvs_set_str(nvs_handle, "sttapikey", &buf[z]);
-        Serial.println("------------------------");
-        Serial.println(buf);
-        Serial.println(&buf[y]);
-        Serial.println(&buf[z]);
-        Serial.println("------------------------");
+        // 第9.2弾: APIキーの平文 Serial 出力を廃止（シリアルログへの露出防止）。
+        // 読み込めた事実だけを出し、値そのものは絶対に出力しない。
+        Serial.println("apikey.txt loaded from SD (values not logged)");
       }
       
       nvs_close(nvs_handle);
@@ -2417,6 +2445,9 @@ void setup()
   init_schedule();
 
   avatar.setFace(new KinakoFace());  // きなこ写真の顔に変更（2026-10-31 本人希望）
+  // 第9.2弾: 初回ポーズ（待機＝ピース）は描画タスク開始前にここでデコード
+  // しておく。draw 内ではデコードしない（drawLoop のスタック不足対策）。
+  kinakoPreparePose(POSE_PEACE, true);
   avatar.init(16);  // 写真をカラー表示するため 16bit カラーで初期化（従来は 1bit）
   avatar.addTask(lipSync, "lipSync");
   avatar.addTask(servo, "servo");
@@ -2505,10 +2536,17 @@ void sw_tone(){
 //    不正なフレームはスキップして続行し、デコードエラーが連続したら打ち切る。
 //  - 再生前に空きヒープを確認し、逼迫時は再生自体を行わない。
 //  - RTC メモリの「再生中」フラグでブートループを断つ：再生開始で立て、
-//    正常終了で下ろす。panic で再起動するとフラグが残るため、起動時の
-//    自動再生はその回だけスキップされる（dance_boot_check 参照）。
+//    panic で再起動するとフラグが残るため、起動時の自動再生はその回だけ
+//    スキップされる（dance_boot_check 参照）。
 //  - 起動時の自動再生は setup() ではなく loop() 初回に移設した。
-RTC_DATA_ATTR static bool g_dance_playing_rtc = false;  // 再生中クラッシュ検出用
+//
+// 第9.2弾のガード拡張：実機で「再生は完走したのに、その直後の顔描画再開で
+// panic」する事象が確認されたため、フラグは再生完了で即座に下ろさず、
+// 再生終了から 5 秒間（通常描画が安定するまで）保持する。その間に panic
+// した場合も、次回起動の自動再生がスキップされる。フラグの解除は loop の
+// dance_guard_tick() が行う。
+RTC_DATA_ATTR static bool g_dance_playing_rtc = false;  // 再生中〜直後クラッシュ検出用
+static uint32_t g_dance_guard_clear_at = 0;             // フラグ解除予定時刻 (millis、0=未設定)
 static const uint32_t DANCE_FRAME_MAX = 65536;          // 1フレームの長さ上限
 static const uint32_t DANCE_HEAP_MIN = 60000;           // 再生に必要な空きヒープ下限
 
@@ -2621,7 +2659,9 @@ static bool play_dance_video() {
   }
   g_led_dance_until = 0;
   avatar.resume();
-  g_dance_playing_rtc = false;  // 正常に戻れたのでクラッシュガードを下ろす
+  // 第9.2弾: フラグはここでは下ろさない。再生直後の描画再開で落ちるケースを
+  // ガードするため、5 秒間は立てたままにし、dance_guard_tick() が下ろす。
+  g_dance_guard_clear_at = millis() + 5000;
   Serial.printf("[DANCE] done: drawn=%d skipped=%d errors=%d, heap %u -> %u (%s)\n",
                 drawn, skipped, errors, (unsigned)heap_before,
                 (unsigned)ESP.getFreeHeap(), completed ? "complete" : "stopped");
@@ -2634,11 +2674,23 @@ static bool play_dance_video() {
   return completed;
 }
 
+// 再生後ガードの解除（第9.2弾）。再生が正常に終わり、描画再開後 5 秒が
+// 無事に経過したら RTC フラグを下ろす。途中で panic した場合はフラグが
+// 残り、次回起動の自動再生がスキップされる。
+static void dance_guard_tick() {
+  if (g_dance_playing_rtc && g_dance_guard_clear_at != 0 &&
+      (int32_t)(millis() - g_dance_guard_clear_at) >= 0) {
+    g_dance_playing_rtc = false;
+    g_dance_guard_clear_at = 0;
+    Serial.println("[DANCE] guard cleared (stable after playback)");
+  }
+}
+
 // 起動時の自動再生（第9.1弾で setup() から loop() 初回へ移設）。
 // 起動後 3 秒経過して通常タスクが回り始めてから、Wi-Fi 接続済みなら
-// 1 回だけ再生する。前回起動で再生中に panic していた場合（RTC フラグが
-// 立ったまま）は、フラグを下ろして今回の自動再生だけをスキップし、
-// 無限ブートループを断つ（音声トリガーの再生は通常どおり可能）。
+// 1 回だけ再生する。前回起動で再生中〜再生直後に panic していた場合
+// （RTC フラグが立ったまま）は、フラグを下ろして今回の自動再生だけを
+// スキップし、無限ブートループを断つ（音声トリガーの再生は通常どおり可能）。
 static void dance_boot_check() {
   static bool decided = false;
   if (decided) return;
@@ -2801,6 +2853,10 @@ void loop()
   static int lastms = 0;
 
   wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続
+
+  pose_prepare_tick();  // 第9.2弾: ポーズ画像の先行デコード（draw タスク外で実施）
+
+  dance_guard_tick();  // 第9.2弾: 再生後ガードの解除（再生終了から5秒安定したら）
 
   dance_boot_check();  // 第9.1弾: 起動時ダンス動画の自動再生（初回のみ・ガード付き）
 

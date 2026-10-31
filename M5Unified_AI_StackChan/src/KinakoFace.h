@@ -13,10 +13,21 @@
 //   一時ポーズ (g_pose_timed、期限内) > 状態ポーズ (g_pose_state)
 //   > 表情連動 (Happy=ハート/Sleepy=寝る/Doubt=驚き/Sad=お辞儀/Angry=両拳上げ)
 //   > 待機 (ピース)
-// の順で、ポーズが変わったときだけ JPEG をデコードし直して PSRAM 上の
-// M5Canvas キャッシュへ差し替える。以後のフレームはキャッシュの
-// pushSprite 転送のみ (デコードなし)。
-// キャッシュ確保に失敗した場合は毎フレーム drawJpg で直接描くフォールバック。
+// の順。
+//
+// 第9.2弾: JPEG デコードを draw コールバック（drawLoop タスク上）から追い出した。
+// 第9.1弾までの実装はポーズ変更時に draw 内で drawJpg デコードしており、
+// drawLoop のスタック（2048 バイトしかない）では収まらず、実機で
+// 「Stack canary watchpoint triggered (drawLoop)」panic が発生した。
+// 現在の方式:
+//   - PSRAM 上に M5Canvas スプライトを2枚（ダブルバッファ）保持する。
+//   - loop/setup 側が kinakoPreparePose() で次のポーズを裏スプライトへ
+//     先にデコードし、完了したら staged フラグを立てる。
+//   - draw 側は staged フラグを見て表裏を入れ替えるだけ（アトミックな
+//     インデックス切替）で、あとは pushSprite のみ。デコードは一切しない。
+//     デコード完了までは前のポーズを表示し続ける。
+//   - スプライト確保に失敗した場合のみ、従来どおり毎フレーム drawJpg で
+//     直接描くフォールバックに落ちる（PSRAM 枯渇時用の非常手段）。
 // ポーズ画像のデコードに失敗した場合は従来の単一写真 (kinako_img.h) を描く。
 //
 // 読み上げ字幕（2行表示）：写真を描いた直後に、同じキャンバスへ画面下部の
@@ -48,12 +59,36 @@ namespace m5avatar {
 // きなこ写真 (全面描画・mouth スロット)
 class KinakoImage : public Drawable {
  private:
-  M5Canvas cache;  // デコード済み画像キャッシュ
-  bool cacheReady = false;
-  bool cacheFailed = false;
-  int cachedPose = -1;  // キャッシュ中のポーズ (-1=未デコード)
+  M5Canvas sprA;  // ダブルバッファ用スプライト (PSRAM)
+  M5Canvas sprB;
+  bool sprReady = false;    // スプライト2枚の確保が完了したか
+  bool sprFailed = false;   // 確保失敗（フォールバック描画へ）
+  int frontIdx = 0;         // 表示中スプライト (0=sprA, 1=sprB)
+  int displayedPose = -1;   // front スプライトに表示中のポーズ (-1=なし)
+  volatile int stagedPose = -1;     // デコード済み・切替待ちのポーズ
+  volatile bool stagedReady = false;  // 切替待ちがあるか
 
-  // 表示すべきポーズを決める
+  M5Canvas &sprAt(int i) { return (i == 0) ? sprA : sprB; }
+
+  // スプライト2枚を PSRAM に確保する（draw の外からだけ呼ぶこと）
+  bool ensureSprites() {
+    if (sprReady) return true;
+    if (sprFailed) return false;
+    for (int i = 0; i < 2; i++) {
+      M5Canvas &s = sprAt(i);
+      s.setColorDepth(16);
+      s.setPsram(true);  // 320x240x16bit = 150KB/枚 は PSRAM に確保
+      if (s.createSprite(320, 240) == nullptr) {
+        sprFailed = true;  // 確保失敗。以後はフォールバック描画
+        return false;
+      }
+    }
+    sprReady = true;
+    return true;
+  }
+
+  // 表示すべきポーズを決める（フォールバック描画専用。
+  // 通常経路の解決は main.cpp の resolve_target_pose() が同じ規則で行う）
   int resolvePose(DrawContext *ctx) {
     uint32_t now = millis();
     int timed = g_pose_timed;
@@ -74,32 +109,54 @@ class KinakoImage : public Drawable {
   }
 
  public:
-  KinakoImage() : cache(&M5.Lcd) {}
+  KinakoImage();  // 定義はクラス外（グローバル登録のため）
+
+  // 次のポーズを裏スプライトへ先にデコードする。draw タスク以外の文脈
+  // （loop / setup）から呼ぶこと。immediate=true の場合は切替まで即時に
+  // 行う（描画タスクがまだ動いていない setup 中の初回表示用）。
+  // 戻り値: スプライト経路が使える状態なら true。
+  bool prepare(int pose, bool immediate) {
+    if (pose < 0 || pose >= POSE_COUNT) return false;
+    if (!ensureSprites()) return false;
+    if (pose == displayedPose) return true;
+    if (!immediate && stagedReady && pose == stagedPose) return true;
+    int back = frontIdx ^ 1;
+    M5Canvas &s = sprAt(back);
+    // ポーズ画像のデコード。失敗時は従来の単一写真で代替
+    if (!s.drawJpg(pose_jpgs[pose], pose_jpg_lens[pose], 0, 0)) {
+      s.drawJpg(kinako_jpg, kinako_jpg_len, 0, 0);
+    }
+    if (immediate) {
+      frontIdx = back;
+      displayedPose = pose;
+      stagedReady = false;
+    } else {
+      stagedPose = pose;
+      stagedReady = true;  // 最後に立てる（draw 側の切替トリガ）
+    }
+    return true;
+  }
+
   void draw(M5Canvas *spi, BoundingRect rect, DrawContext *ctx) override {
     (void)rect;
-    int pose = resolvePose(ctx);
-    if (!cacheReady && !cacheFailed) {
-      cache.setColorDepth(16);
-      cache.setPsram(true);  // 320x240x16bit = 150KB は PSRAM に確保
-      if (cache.createSprite(320, 240) != nullptr) {
-        cacheReady = true;
-      } else {
-        cacheFailed = true;  // 確保失敗。以後はフォールバック描画
-      }
-    }
-    if (cacheReady) {
-      if (pose != cachedPose) {
-        // ポーズが変わったときだけデコードし直す。失敗時は従来写真で代替
-        if (!cache.drawJpg(pose_jpgs[pose], pose_jpg_lens[pose], 0, 0)) {
-          cache.drawJpg(kinako_jpg, kinako_jpg_len, 0, 0);
-        }
-        cachedPose = pose;
-      }
-      cache.pushSprite(spi, 0, 0);
-    } else {
-      // フォールバック: 毎フレーム JPEG を直接デコード描画
+    if (sprFailed) {
+      // フォールバック: 毎フレーム JPEG を直接デコード描画（従来方式）
+      int pose = resolvePose(ctx);
       if (!spi->drawJpg(pose_jpgs[pose], pose_jpg_lens[pose], 0, 0)) {
         spi->drawJpg(kinako_jpg, kinako_jpg_len, 0, 0);
+      }
+    } else {
+      // デコード済みの次ポーズがあれば表裏を入れ替える（軽い処理のみ）
+      if (stagedReady) {
+        frontIdx ^= 1;
+        displayedPose = stagedPose;
+        stagedReady = false;
+      }
+      if (sprReady && displayedPose >= 0) {
+        sprAt(frontIdx).pushSprite(spi, 0, 0);
+      } else {
+        // 初回デコードが終わるまでの仮表示
+        spi->fillRect(0, 0, 320, 240, 0x0000);
       }
     }
     // 読み上げ字幕（2行）を写真の上に重ねる
@@ -123,6 +180,20 @@ class KinakoImage : public Drawable {
     }
   }
 };
+
+// 生成中の KinakoImage へのポインタ（コンストラクタで登録される。
+// 実体の定義は main.cpp 側にある）
+extern KinakoImage *g_kinako_image;
+
+inline KinakoImage::KinakoImage() : sprA(&M5.Lcd), sprB(&M5.Lcd) {
+  g_kinako_image = this;
+}
+
+// loop / setup からポーズの先行デコードを依頼する入口
+inline bool kinakoPreparePose(int pose, bool immediate = false) {
+  if (g_kinako_image == nullptr) return false;
+  return g_kinako_image->prepare(pose, immediate);
+}
 
 // 何も描かないパーツ (目・眉スロット用)
 class KinakoBlank : public Drawable {

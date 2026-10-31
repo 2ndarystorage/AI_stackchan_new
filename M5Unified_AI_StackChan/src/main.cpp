@@ -489,6 +489,7 @@ bool g_sched_hourly = true;          // 時報（NVS "setting"/"s_hourly"）
 extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり）で定義
 String exec_news();                  // 実体は後方（ニュース読み上げの節）で定義
 static bool play_dance_video();      // 実体は後方（SST_ChatGPT の直前）で定義。第9弾
+static void dance_boot_check();      // 起動時1回だけの自動再生判定（loop から呼ぶ）。第9.1弾
 
 // スケジューラの発火可否ゲート：発話中・ニュース表示中・メニュー操作中・
 // ウェイクワード登録中（mode<0）は発火しない。録音〜応答生成（SST_ChatGPT）は
@@ -2434,12 +2435,12 @@ void setup()
   box_cat_prev.setupBox(0, 0, 90, 70);
   box_cat_next.setupBox(0, 170, 90, 70);
 
-  // 第9弾: 起動時にダンス動画を1回だけ再生する（タップ/ボタンでスキップ可）。
+  // 第9.1弾: 起動時のダンス動画再生は setup() では行わない。
+  // 第9弾では setup() 末尾で再生していたが、実機で再生中に panic して
+  // ブートループになったため、loop() の初回（起動後 3 秒以降・タスクが
+  // 回り始めた状態）に dance_boot_check() 経由で1回だけ再生する方式へ移した。
   // Wi-Fi 未設定の場合は Wifi_setup() の SmartConfig 待ち→再起動ループに
-  // なるため setup 自体がここまで到達せず、初期設定を妨げることはない。
-  if (WiFi.status() == WL_CONNECTED) {
-    play_dance_video();
-  }
+  // なるため、従来どおり初期設定を妨げることもない。
 }
 
 String random_words[18] = {"あなたは誰","楽しい","怒った","可愛い","悲しい","眠い","ジョークを言って","泣きたい","怒ったぞ","こんにちは","お疲れ様","詩を書いて","疲れた","お腹空いた","嫌いだ","苦しい","俳句を作って","歌をうたって"};
@@ -2490,31 +2491,84 @@ void sw_tone(){
       M5.Mic.begin();
 }
 
-// ==== ダンス動画再生（第9弾） ====
-// 埋め込みモーションJPEG (dance_mjpeg.h、12fps/320x240/120フレーム) の
+// ==== ダンス動画再生（第9弾／第9.1弾で安全化） ====
+// 埋め込みモーションJPEG (dance_mjpeg.h、10fps/320x240/100フレーム) の
 // 連結 JPEG を順に LCD へ直接描画する。再生中は Avatar の描画タスクを
 // suspend して干渉を防ぎ、終了後に resume する（setExpression は呼ばない
 // こと。それ自体が suspend/resume を含むため）。
 // 中断条件：画面タップ（どこでも）または物理ボタン A/B/C の押下。
 // 1フレームも描けなかった場合（データ/デコード異常）は「踊る」ポーズ画像の
 // 一時表示で代替し false を返す。最後まで再生したら true。
+//
+// 第9.1弾の安全化（第9弾の起動時再生で panic→ブートループした対策）:
+//  - 各フレームを描画前に検証する：長さ上限 64KB、SOF で 320x240 を確認。
+//    不正なフレームはスキップして続行し、デコードエラーが連続したら打ち切る。
+//  - 再生前に空きヒープを確認し、逼迫時は再生自体を行わない。
+//  - RTC メモリの「再生中」フラグでブートループを断つ：再生開始で立て、
+//    正常終了で下ろす。panic で再起動するとフラグが残るため、起動時の
+//    自動再生はその回だけスキップされる（dance_boot_check 参照）。
+//  - 起動時の自動再生は setup() ではなく loop() 初回に移設した。
+RTC_DATA_ATTR static bool g_dance_playing_rtc = false;  // 再生中クラッシュ検出用
+static const uint32_t DANCE_FRAME_MAX = 65536;          // 1フレームの長さ上限
+static const uint32_t DANCE_HEAP_MIN = 60000;           // 再生に必要な空きヒープ下限
+
+// JPEG のセグメントを走査し、SOF0/SOF2 から画像寸法を取り出す。
+// SOI で始まらない・走査が破綻する場合は false（＝検証NGとしてスキップ）。
+static bool jpeg_frame_size(const uint8_t *f, uint32_t flen,
+                            uint16_t *out_w, uint16_t *out_h) {
+  if (f == nullptr || flen < 10 || f[0] != 0xFF || f[1] != 0xD8) return false;
+  uint32_t p = 2;
+  while (p + 3 < flen) {
+    if (f[p] != 0xFF) return false;
+    uint8_t marker = f[p + 1];
+    if (marker == 0xC0 || marker == 0xC2) {  // SOF0 / SOF2
+      if (p + 8 >= flen) return false;
+      *out_h = ((uint16_t)f[p + 5] << 8) | f[p + 6];
+      *out_w = ((uint16_t)f[p + 7] << 8) | f[p + 8];
+      return true;
+    }
+    if (marker == 0xDA) return false;       // SOS 到達（SOF が無かった）
+    if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD9)) {
+      p += 2;                               // 長さフィールドを持たないマーカー
+      continue;
+    }
+    uint32_t seglen = ((uint32_t)f[p + 2] << 8) | f[p + 3];
+    if (seglen < 2) return false;
+    p += 2 + seglen;
+  }
+  return false;
+}
+
 static bool play_dance_video() {
   const uint8_t *data = dance_mjpeg;
   const uint32_t len = dance_mjpeg_len;
   if (data == nullptr || len < 1024) {
+    Serial.println("[DANCE] aborted: embedded data invalid");
     g_pose_timed = POSE_DANCE;
     g_pose_timed_until = millis() + 9400;
     return false;
   }
+  // ヒープが逼迫していたら再生自体を見送る（デコーダ確保失敗や競合を避ける）
+  uint32_t heap_before = ESP.getFreeHeap();
+  Serial.printf("[DANCE] start: data=%u bytes, free heap=%u\n",
+                (unsigned)len, (unsigned)heap_before);
+  if (heap_before < DANCE_HEAP_MIN) {
+    Serial.println("[DANCE] skipped: low heap");
+    return false;
+  }
+  g_dance_playing_rtc = true;   // クラッシュガード：再生中フラグを立てる
   avatar.suspend();
   delay(40);  // 描画タスクが現在のフレームを描き終えるのを待つ
-  g_led_dance_until = millis() + 10500;  // 側面LED：再生中は色サイクル
-  const uint32_t frame_ms = 1000 / 12;   // 12fps
+  g_led_dance_until = millis() + 11000;  // 側面LED：再生中は色サイクル
+  const uint32_t frame_ms = 1000 / 10;   // 10fps（第9.1弾で軽量化）
   const uint32_t t0 = millis();
   uint32_t pos = 0;
-  int frame_no = 0;
+  int frame_no = 0;        // 時間軸上の通し番号（検証スキップ・コマ落とし込み）
+  int drawn = 0;           // 実際に描画できた数
+  int skipped = 0;         // 検証NGで飛ばした数
+  int errors = 0;          // drawJpg が失敗した数
+  int consec_errors = 0;   // 連続デコードエラー数
   bool completed = true;
-  bool drew_any = false;
   while (pos < len) {
     // フレーム先頭 (SOI: FF D8) を探す
     while (pos + 1 < len && !(data[pos] == 0xFF && data[pos + 1] == 0xD8)) pos++;
@@ -2526,6 +2580,16 @@ static bool play_dance_video() {
     if (pos + 1 >= len) { completed = false; break; }
     uint32_t flen = (pos + 2) - fstart;
     pos += 2;
+    frame_no++;
+
+    // フレーム検証：長さ上限と SOF 寸法（320x240）。NG はスキップして続行
+    uint16_t fw = 0, fh = 0;
+    if (flen > DANCE_FRAME_MAX ||
+        !jpeg_frame_size(&data[fstart], flen, &fw, &fh) ||
+        fw != 320 || fh != 240) {
+      skipped++;
+      continue;
+    }
 
     // 中断チェック（タップ／物理ボタン）
     M5.update();
@@ -2539,24 +2603,58 @@ static bool play_dance_video() {
     // 表示タイミング：経過時間から出すべきフレーム番号を求め、
     // デコード遅延で遅れていたら中間のフレームを読み飛ばして追いつく
     uint32_t elapsed = millis() - t0;
-    int should = (int)(elapsed / frame_ms);
-    if (frame_no < should) { frame_no++; continue; }  // コマ落とし
-    uint32_t target = (uint32_t)frame_no * frame_ms;
+    int should = (int)(elapsed / frame_ms) + 1;
+    if (frame_no < should) continue;  // コマ落とし
+    uint32_t target = (uint32_t)(frame_no - 1) * frame_ms;
     if (target > elapsed && target - elapsed <= frame_ms) delay(target - elapsed);
-    if (!M5.Lcd.drawJpg(&data[fstart], flen, 0, 0)) { completed = false; break; }
-    drew_any = true;
-    frame_no++;
+    if (!M5.Lcd.drawJpg(&data[fstart], flen, 0, 0)) {
+      errors++;
+      if (++consec_errors >= 3) {
+        Serial.println("[DANCE] aborted: consecutive decode errors");
+        completed = false;
+        break;
+      }
+      continue;  // 1フレームの失敗では止めず次へ
+    }
+    consec_errors = 0;
+    drawn++;
   }
   g_led_dance_until = 0;
   avatar.resume();
-  Serial.printf("[DANCE] frames=%d (%s)\n", frame_no, completed ? "complete" : "stopped");
-  if (!drew_any) {
+  g_dance_playing_rtc = false;  // 正常に戻れたのでクラッシュガードを下ろす
+  Serial.printf("[DANCE] done: drawn=%d skipped=%d errors=%d, heap %u -> %u (%s)\n",
+                drawn, skipped, errors, (unsigned)heap_before,
+                (unsigned)ESP.getFreeHeap(), completed ? "complete" : "stopped");
+  if (drawn == 0) {
     // 再生できなかった場合はポーズ画像で代替表示する
     g_pose_timed = POSE_DANCE;
     g_pose_timed_until = millis() + 9400;
     return false;
   }
   return completed;
+}
+
+// 起動時の自動再生（第9.1弾で setup() から loop() 初回へ移設）。
+// 起動後 3 秒経過して通常タスクが回り始めてから、Wi-Fi 接続済みなら
+// 1 回だけ再生する。前回起動で再生中に panic していた場合（RTC フラグが
+// 立ったまま）は、フラグを下ろして今回の自動再生だけをスキップし、
+// 無限ブートループを断つ（音声トリガーの再生は通常どおり可能）。
+static void dance_boot_check() {
+  static bool decided = false;
+  if (decided) return;
+  if (g_dance_playing_rtc) {
+    g_dance_playing_rtc = false;
+    decided = true;
+    Serial.println("[DANCE] boot autoplay skipped: previous playback crashed (boot-loop guard)");
+    return;
+  }
+  uint32_t now = millis();
+  if (now > 30000) { decided = true; return; }  // 条件が揃わなければ見送る
+  if (now < 3000) return;                       // 起動直後はまだ待つ
+  if (WiFi.status() != WL_CONNECTED) return;
+  decided = true;
+  Serial.println("[DANCE] boot autoplay");
+  play_dance_video();
 }
 
 void SST_ChatGPT() {
@@ -2703,6 +2801,8 @@ void loop()
   static int lastms = 0;
 
   wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続
+
+  dance_boot_check();  // 第9.1弾: 起動時ダンス動画の自動再生（初回のみ・ガード付き）
 
   if (random_time >= 0 && millis() - lastms1 > random_time)
   {

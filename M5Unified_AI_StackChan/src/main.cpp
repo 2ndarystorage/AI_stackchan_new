@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_system.h>  // esp_reset_reason（起動時診断、第8弾）
 //#include <FS.h>
 #include <SD.h>
 #include <SPIFFS.h>
@@ -219,21 +220,50 @@ static const char ROLE_HTML[] PROGMEM = R"KEWL(
 String speech_text = "";
 String speech_text_buffer = "";
 
-// ==== ニュース内容のディスプレイ表示（吹き出しへのセグメント表示） ====
-// M5Stack-Avatar の吹き出し(Balloon)は1行表示で折り返しがなく、長い文字列は
-// 画面(320px)からはみ出して切れる。フォント efontJA_16 を2倍で描くため
-// 全角1文字=32px・半角1文字=16px。吹き出しに収まる幅(288px=全角9文字相当)
-// ごとに読み上げ文を分割し、発話に合わせて順に切り替えて表示する。
-static const int NEWS_SEG_MAX = 64;
-static const int NEWS_SEG_MAX_WIDTH_PX = 288;
-String g_news_segments[NEWS_SEG_MAX];
-int g_news_seg_count = 0;
-bool g_news_disp_armed = false;    // exec_news が表示キューを用意した（次の発話開始で有効化）
-bool g_news_disp_active = false;   // ニュース表示中
-int g_news_disp_idx = 0;
-uint32_t g_news_disp_next_ms = 0;  // 次のセグメントへ切り替える時刻
-uint32_t g_news_disp_start_ms = 0; // 表示開始時刻
-uint32_t g_news_disp_clear_ms = 0; // 発話終了後、吹き出しを消す時刻（0=未定）
+// ==== 読み上げ文の2行字幕表示（顔キャンバス内パネル） ====
+// M5Stack-Avatar の吹き出し(Balloon)は1行表示で折り返しがなく、長い文は
+// 画面からはみ出して切れる。そこで読み上げ文は、顔(KinakoFace)の描画
+// キャンバス内に画面下部の字幕パネル（2行）として描く。顔と同じフレーム
+// 合成で描かれるためちらつきがない（描画自体は KinakoFace.h 側）。
+// フォントは efontJA_16 等倍（全角16px・半角8px）。1行は全角19文字相当
+// （304px）まで、1ユニット＝2行。送りは従来どおり時間ベースで、ユニット内の
+// 総文字数×180ms（最小3.5秒）を目安に読み上げの進行へ合わせる。
+// ニュースは各記事の見出しをその記事の表示の先頭に置き、先頭ユニットには
+// カテゴリ名（ラベル）を表示する。通常会話の ChatGPT 応答文も字幕対象。
+// 短いシステム表示（音量ゲージ・メニュー・定期通知等）は従来どおり吹き出し。
+static const int CAP_MAX_UNITS = 48;
+static const float CAP_LINE_UNITS = 19.0f;  // 1行の容量（全角=1.0 / 半角=0.5）
+String g_cap_units[CAP_MAX_UNITS][2];       // 字幕ユニット [unit][行0/行1]
+int g_cap_count = 0;
+bool g_cap_armed = false;    // 字幕キューが用意された（次の発話開始で表示開始）
+bool g_cap_active = false;   // 字幕表示中
+int g_cap_idx = 0;
+uint32_t g_cap_next_ms = 0;  // 次のユニットへ切り替える時刻
+uint32_t g_cap_start_ms = 0; // 表示開始時刻
+uint32_t g_cap_clear_ms = 0; // 発話終了後、字幕を消す時刻（0=未定）
+
+// ニュース由来の発話かどうか（中央タップでの中断対象の判定に使う）
+bool g_pending_news_speech = false;  // exec_news 系が発話をセットした（開始待ち）
+bool g_news_playing = false;         // ニュース発話セッション中
+
+// 字幕の共有描画バッファ（loop 側が裏バッファへ書いてから front を切り替え、
+// KinakoFace の描画タスク側が front を読む。宣言は KinakoFace.h 側にも extern）
+volatile bool g_caption_show = false;
+volatile uint8_t g_caption_front = 0;
+char g_caption_buf[2][2][128];
+
+static void captionHide() { g_caption_show = false; }
+
+static void captionShowUnit(int idx) {
+  if (idx < 0 || idx >= g_cap_count) { captionHide(); return; }
+  uint8_t back = (uint8_t)(g_caption_front ^ 1);
+  strncpy(g_caption_buf[back][0], g_cap_units[idx][0].c_str(), sizeof(g_caption_buf[back][0]) - 1);
+  g_caption_buf[back][0][sizeof(g_caption_buf[back][0]) - 1] = '\0';
+  strncpy(g_caption_buf[back][1], g_cap_units[idx][1].c_str(), sizeof(g_caption_buf[back][1]) - 1);
+  g_caption_buf[back][1][sizeof(g_caption_buf[back][1]) - 1] = '\0';
+  g_caption_front = back;
+  g_caption_show = true;
+}
 
 static int newsUtf8CharLen(uint8_t b) {
   if (b < 0x80) return 1;
@@ -243,65 +273,114 @@ static int newsUtf8CharLen(uint8_t b) {
   return 1;
 }
 
-static int newsSegCharCount(const String& seg) {
+static int capTextCharCount(const String& s) {
   int chars = 0;
-  for (int i = 0; i < (int)seg.length();) {
-    i += newsUtf8CharLen((uint8_t)seg[i]);
+  for (int i = 0; i < (int)s.length();) {
+    i += newsUtf8CharLen((uint8_t)s[i]);
     chars++;
   }
   return chars;
 }
 
-// セグメントの表示時間：1文字≈180ms、最小3.5秒
-static uint32_t newsSegDurationMs(const String& seg) {
-  uint32_t d = (uint32_t)newsSegCharCount(seg) * 180;
+// ユニットの表示時間：総文字数×180ms、最小3.5秒
+static uint32_t capUnitDurationMs(int idx) {
+  uint32_t d = (uint32_t)(capTextCharCount(g_cap_units[idx][0]) +
+                          capTextCharCount(g_cap_units[idx][1])) * 180;
   return d < 3500 ? 3500 : d;
 }
 
-static void newsDispPush(const String& seg) {
-  if (seg.length() == 0) return;
-  if (g_news_seg_count < NEWS_SEG_MAX) {
-    g_news_segments[g_news_seg_count++] = seg;
+// ---- 字幕ビルド（ユニット組み立て） ----
+static String g_cap_build[2];   // 組み立て中のユニットの2行
+static int g_cap_build_lines = 0;
+
+static void capFlushUnit() {
+  if (g_cap_build_lines == 0) return;
+  if (g_cap_count < CAP_MAX_UNITS) {
+    g_cap_units[g_cap_count][0] = g_cap_build[0];
+    g_cap_units[g_cap_count][1] = g_cap_build[1];
+    g_cap_count++;
   }
+  g_cap_build[0] = "";
+  g_cap_build[1] = "";
+  g_cap_build_lines = 0;
 }
 
-// テキストを吹き出しに収まる幅で分割してキューへ追加（、。の直後での分割を優先）
-static void newsDispAddText(const String& text) {
+static void capPushLine(const String& line) {
+  if (line.length() == 0) return;
+  if (g_cap_build_lines >= 2) capFlushUnit();
+  g_cap_build[g_cap_build_lines++] = line;
+}
+
+// テキストを1行容量で折り返して行を積む（、。！？の直後での改行と改行文字での改行を優先）
+static void capAddText(const String& text) {
   int n = (int)text.length();
-  int start = 0;      // 現在のセグメントの開始バイト位置
-  int curW = 0;       // 現在のセグメントの推定幅(px)
-  int breakPos = -1;  // 現在のセグメント内にある「、。」直後のバイト位置
-  int breakW = 0;     // breakPos 時点の幅
+  int start = 0;      // 現在の行の開始バイト位置
+  float curU = 0;     // 現在の行の使用量（全角=1.0 / 半角=0.5）
+  int breakPos = -1;  // 現在の行内にある「、。！？」直後のバイト位置
+  float breakU = 0;   // breakPos 時点の使用量
   int i = 0;
   while (i < n) {
+    if (text[i] == '\n') {  // 改行文字は強制改行
+      if (i > start) capPushLine(text.substring(start, i));
+      start = i + 1;
+      curU = 0;
+      breakPos = -1;
+      breakU = 0;
+      i++;
+      continue;
+    }
     int clen = newsUtf8CharLen((uint8_t)text[i]);
     if (i + clen > n) clen = 1;
-    int cw = (clen == 1) ? 16 : 32;  // 半角16px / 全角32px（efontJA_16 の2倍描画）
-    if (curW + cw > NEWS_SEG_MAX_WIDTH_PX && i > start) {
-      if (breakPos > start && breakW >= NEWS_SEG_MAX_WIDTH_PX / 2) {
-        newsDispPush(text.substring(start, breakPos));
+    float cu = (clen == 1) ? 0.5f : 1.0f;
+    if (curU + cu > CAP_LINE_UNITS && i > start) {
+      if (breakPos > start && breakU >= CAP_LINE_UNITS * 0.5f) {
+        capPushLine(text.substring(start, breakPos));
         start = breakPos;
-        curW -= breakW;
+        curU -= breakU;
         breakPos = -1;
-        breakW = 0;
+        breakU = 0;
       } else {
-        newsDispPush(text.substring(start, i));
+        capPushLine(text.substring(start, i));
         start = i;
-        curW = 0;
+        curU = 0;
         breakPos = -1;
-        breakW = 0;
+        breakU = 0;
       }
       continue;
     }
-    curW += cw;
+    curU += cu;
     if (clen == 3 && (uint8_t)text[i] == 0xE3 && (uint8_t)text[i + 1] == 0x80 &&
         ((uint8_t)text[i + 2] == 0x81 || (uint8_t)text[i + 2] == 0x82)) {
       breakPos = i + clen;  // 、(U+3001) または 。(U+3002) の直後
-      breakW = curW;
+      breakU = curU;
+    }
+    if (clen == 3 && (uint8_t)text[i] == 0xEF && (uint8_t)text[i + 1] == 0xBC &&
+        ((uint8_t)text[i + 2] == 0x81 || (uint8_t)text[i + 2] == 0x9F)) {
+      breakPos = i + clen;  // ！(U+FF01) または ？(U+FF1F) の直後
+      breakU = curU;
     }
     i += clen;
   }
-  if (start < n) newsDispPush(text.substring(start, n));
+  if (start < n) capPushLine(text.substring(start, n));
+}
+
+// 見出し：必ず新しいユニットの先頭行から表示する（記事の先頭に置く）
+static void capAddHeadline(const String& title) {
+  capFlushUnit();
+  capAddText(title);
+}
+
+// カテゴリ名などのラベル：単独ユニットとして表示する
+static void capAddLabel(const String& label) {
+  capFlushUnit();
+  capPushLine(label);
+  capFlushUnit();
+}
+
+// 会話応答文などを丸ごと字幕キュー化する
+static void capBuildFromText(const String& text) {
+  capAddText(text);
+  capFlushUnit();
 }
 
 // ==== 側面LED（M5GO Bottom2 ベースの SK6812×10、GPIO25） ====
@@ -323,26 +402,32 @@ CRGB g_led_news_color = CRGB::White; // 現在のニュースのカテゴリ色
 uint32_t g_led_vol_until = 0;        // 音量ゲージ表示の終了時刻
 uint32_t g_led_ww_until = 0;         // ウェイクワード検出フラッシュの終了時刻
 
-// ニュース表示キューを破棄する（通常会話の開始時などに呼ぶ）
-void newsDispReset() {
-  g_news_seg_count = 0;
-  g_news_disp_armed = false;
-  g_news_disp_active = false;
-  g_news_disp_idx = 0;
-  g_news_disp_clear_ms = 0;
+// 字幕キューを破棄する（通常会話の開始時などに呼ぶ）
+void captionReset() {
+  g_cap_count = 0;
+  g_cap_armed = false;
+  g_cap_active = false;
+  g_cap_idx = 0;
+  g_cap_clear_ms = 0;
+  g_pending_news_speech = false;
+  g_cap_build[0] = "";
+  g_cap_build[1] = "";
+  g_cap_build_lines = 0;
+  captionHide();
   g_led_news_active = false;
 }
 
-// ==== 音量のタッチ操作（5段階） ====
-// レベル1〜5 → M5.Speaker の音量値（0〜255 を等分）
-static const uint8_t VOL_VALUES[5] = {51, 102, 153, 204, 255};
-uint8_t g_vol_level = 3;             // 現在の音量レベル（1〜5、初期値3）
+// ==== 音量のタッチ操作（6段階） ====
+// レベル0〜5 → M5.Speaker の音量値（0＝無音、1〜5 は 0〜255 の等分。
+// 旧5段階時代の保存値 1〜5 はそのまま同じ音量に対応する）
+static const uint8_t VOL_VALUES[6] = {0, 51, 102, 153, 204, 255};
+uint8_t g_vol_level = 3;             // 現在の音量レベル（0〜5、初期値3）
 bool g_vol_gauge_active = false;     // 音量ゲージを吹き出し表示中
 uint32_t g_vol_gauge_until = 0;      // ゲージを消す時刻
 
 // 音量レベルをスピーカーへ適用する（save=true で NVS "setting"/"vol" へ保存）
 static void applyVolLevel(bool save) {
-  uint8_t v = VOL_VALUES[g_vol_level - 1];
+  uint8_t v = VOL_VALUES[g_vol_level];
   // MP3再生は AudioOutputM5Speaker が仮想チャンネル0へ playRaw するため、
   // マスター音量とチャンネル音量の両方へ設定する（既存の /setting や起動時適用と同じ経路）
   M5.Speaker.setVolume(v);
@@ -398,7 +483,7 @@ String exec_news();                  // 実体は後方（ニュース読み上�
 // loop 内の同期処理のため、その間 run_schedule() 自体が呼ばれず割り込まれない
 static bool scheduler_ready() {
   return mode >= 0 && !mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
-         !g_menu_open && !g_news_disp_active;
+         !g_menu_open && !g_cap_active;
 }
 
 // 毎朝7:00：日付の挨拶＋通常ニュース（トピックス＋AI）
@@ -426,6 +511,127 @@ static void init_schedule() {
   scheduler_set_ready_func(scheduler_ready);
   add_schedule(new ScheduleEveryDay(7, 0, sched_fn_morning));   // 毎朝7:00 モーニング読み上げ
   add_schedule(new ScheduleEveryHour(sched_fn_hourly, 7, 23));  // 時報 7:00〜23:00
+}
+
+// ==== 文単位パイプラインTTS（第8弾） ====
+// 従来は発話文全体を1回の合成リクエストで送り、合成が終わるまで再生が
+// 始まらなかった（tts.quest のキュー混雑時は長文で約60秒待ちの実測あり）。
+// 第8弾では文（。！？）単位に分割し、専用の合成タスクが最初の文から順に
+// 合成して、合成できた文から即座に再生する。再生中に次の文を先行合成する
+// （先行は1文分まで）。合成1文の上限は WebVoiceVoxTTS 側で 25 秒とし、
+// 超えた文はスキップして次へ進む。
+// 状態遷移は loop() 内の tts_drive()（実体は音声再生まわりの後方）が担う。
+struct TtsChunk {
+  String text;   // 合成する文（チャンク）
+  String parms;  // そのチャンクの話者パラメータ（&speaker=N）
+};
+static std::deque<TtsChunk> g_tts_queue;   // 合成待ちチャンク
+static String g_tts_ready_url = "";        // 合成済みの次文URL（有効な間だけ意味を持つ）
+static bool g_tts_ready = false;           // ready_url がセットされた（空URL=合成失敗でスキップ）
+static bool g_tts_synth_busy = false;      // 合成タスクが1文を処理中
+static bool g_speech_session = false;      // 発話セッション中（投入〜全チャンク再生完了）
+static SemaphoreHandle_t g_tts_mutex = nullptr;
+static uint32_t g_tts_gen = 0;             // 発話セッションの世代（中断時に進めて合成結果を無効化）
+static uint32_t g_stop_msg_until = 0;      // 「中断しました」吹き出しを消す時刻（0=非表示）
+
+void ttsSynthTask(void *args);  // 実体は後方（setup でタスク起動）
+void tts_drive();               // 実体は後方（loop から毎回呼ぶ）
+
+// テキストを文（。！？と改行で区切る。文末記号は文に含める）に分割し、
+// チャンク列にして返す。先頭の文は単独チャンク（初回発話を最速にする）、
+// 以降は約100バイトまで連結して合成リクエスト数を抑える。
+static std::deque<TtsChunk> splitSpeechChunks(const String& text, const String& parms) {
+  std::deque<String> sentences;
+  int n = (int)text.length();
+  int start = 0;
+  int i = 0;
+  while (i < n) {
+    uint8_t b = (uint8_t)text[i];
+    // 文末記号（。=E3 80 82 / ！=E3 80 81 / ？=E3 80 9F）
+    if (b == 0xE3 && i + 2 < n && (uint8_t)text[i + 1] == 0x80 &&
+        ((uint8_t)text[i + 2] == 0x82 || (uint8_t)text[i + 2] == 0x81 || (uint8_t)text[i + 2] == 0x9F)) {
+      sentences.push_back(text.substring(start, i + 3));
+      i += 3;
+      start = i;
+    } else if (text[i] == '\n') {
+      if (i > start) sentences.push_back(text.substring(start, i));
+      i++;
+      start = i;
+    } else {
+      int clen = newsUtf8CharLen(b);
+      if (i + clen > n) clen = 1;
+      i += clen;
+    }
+  }
+  if (start < n) sentences.push_back(text.substring(start, n));
+
+  std::deque<TtsChunk> chunks;
+  String cur = "";
+  bool firstChunk = true;
+  for (auto& s0 : sentences) {
+    String s = s0;
+    s.trim();
+    if (s.length() == 0) continue;
+    if (cur.length() == 0) {
+      cur = s;
+      continue;
+    }
+    if (firstChunk || cur.length() + s.length() > 100) {
+      TtsChunk c;
+      c.text = cur;
+      c.parms = parms;
+      chunks.push_back(c);
+      cur = s;
+      firstChunk = false;
+    } else {
+      cur += s;
+    }
+  }
+  if (cur.length() > 0) {
+    TtsChunk c;
+    c.text = cur;
+    c.parms = parms;
+    chunks.push_back(c);
+  }
+  return chunks;
+}
+
+// 発話テキストを文チャンクに分割してパイプラインへ投入する。
+// 合成は合成タスクが非同期に行い、再生は tts_drive() が進める。
+static void tts_enqueue(const String& text, const String& parms) {
+  std::deque<TtsChunk> chunks = splitSpeechChunks(text, parms);
+  if (chunks.empty()) return;
+  if (g_tts_mutex == nullptr) g_tts_mutex = xSemaphoreCreateMutex();
+  xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+  for (auto& c : chunks) g_tts_queue.push_back(c);
+  if (!g_speech_session) g_speech_session = true;
+  xSemaphoreGive(g_tts_mutex);
+  Serial.printf("[TTS] enqueue %u chunk(s)\n", (unsigned)chunks.size());
+}
+
+// ==== Wi-Fi 切断監視と自動再接続（第8弾） ====
+// 起動後に AP が落ちたり電波が途切れても復帰できるよう、loop から定期的に
+// 接続状態を確認し、切断が続く場合はバックオフ付きで再接続を試みる。
+// WiFi.reconnect() は接続開始だけを行う（完了を待たない）ため、
+// 再接続試行中も他の処理は止めない。
+static uint32_t g_wifi_last_check = 0;
+static uint32_t g_wifi_next_retry = 0;
+static uint32_t g_wifi_backoff_ms = 10000;
+static void wifi_watchdog() {
+  uint32_t now = millis();
+  if (now - g_wifi_last_check < 3000) return;
+  g_wifi_last_check = now;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (g_wifi_next_retry != 0) Serial.println("[WiFi] reconnected");
+    g_wifi_next_retry = 0;
+    g_wifi_backoff_ms = 10000;
+    return;
+  }
+  if (g_wifi_next_retry != 0 && (int32_t)(now - g_wifi_next_retry) < 0) return;
+  Serial.println("[WiFi] disconnected; trying reconnect...");
+  WiFi.reconnect();
+  g_wifi_next_retry = now + g_wifi_backoff_ms;
+  if (g_wifi_backoff_ms < 60000) g_wifi_backoff_ms *= 2;
 }
 DynamicJsonDocument chat_doc(1024*10);
 String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"messages\": [{\"role\": \"user\", \"content\": \"""\"}]}";
@@ -473,10 +679,17 @@ void handle_speech() {
   }
   Serial.println(message);
   ////////////////////////////////////////
-  // 音声の発声
+  // 音声の発声（第8弾: 文単位パイプラインへ投入。合成・再生は非同期に進む）
   ////////////////////////////////////////
   avatar.setExpression(Expression::Happy);
-  Voicevox_tts((char*)message.c_str(), (char*)TTS_PARMS.c_str());
+  // 発話中扱いにして、再生完了まで他機能（ニュース・スケジューラ等）が
+  // 割り込まないようにする（従来は合成完了までハンドラがブロックしていた）
+  if (speech_text_buffer == "") {
+    speech_text_buffer = message;
+    g_news_playing = false;         // /speech の発話はニュースではない（中断対象外）
+    g_pending_news_speech = false;
+  }
+  tts_enqueue(message, TTS_PARMS);
   TTS_PARMS = savedParms;
   server.send(200, "text/plain", String("OK"));
 }
@@ -489,7 +702,7 @@ String https_post_json(const char* url, const char* json_string, const char* roo
     {
       // Add a scoping block for HTTPClient https to make sure it is destroyed before WiFiClientSecure *client is 
       HTTPClient https;
-      https.setTimeout( 65000 ); 
+      https.setTimeout( 30000 );  // 第8弾: ChatGPT応答の上限（従来65秒→30秒に短縮）
   
       Serial.print("[HTTPS] begin...\n");
       if (https.begin(*client, url)) {  // HTTPS
@@ -532,7 +745,9 @@ String chatGpt(String json_string) {
   g_led_thinking = true;   // 側面LED：応答待ち（紫パルス）
   avatar.setExpression(Expression::Doubt);
   avatar.setSpeechText("考え中…");
+  uint32_t chat_t0 = millis();
   String ret = https_post_json("https://api.openai.com/v1/chat/completions", json_string.c_str(), root_ca_openai);
+  Serial.printf("[ChatGPT] response in %lu ms\n", (unsigned long)(millis() - chat_t0));
   avatar.setExpression(Expression::Neutral);
   avatar.setSpeechText("");
   Serial.println(ret);
@@ -575,7 +790,7 @@ void applyChatSpeedSettings() {
 }
 
 void handle_chat() {
-  newsDispReset();  // 通常会話が始まるのでニュース表示キューは破棄する
+  captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する
   static String response = "";
   // tts_parms_no = 1;
   String text = server.arg("text");
@@ -612,6 +827,10 @@ void handle_chat() {
   if(speech_text=="" && speech_text_buffer == "") {
     response = chatGpt(json_string);
     speech_text = response;
+    // 会話応答文も2行字幕の対象にする（発話の再生開始時に表示）
+    capBuildFromText(response);
+    g_led_news_color = CRGB::White;
+    if (g_cap_count > 0) g_cap_armed = true;
     //mode = 0;
     // 返答をチャット履歴に追加
     chatHistory.push_back(response);
@@ -633,7 +852,7 @@ void handle_chat() {
 }
 
 void exec_chatGPT(String text) {
-  newsDispReset();  // 通常会話が始まるのでニュース表示キューは破棄する
+  captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する
   static String response = "";
   Serial.println(InitBuffer);
   init_chat_doc(InitBuffer.c_str());
@@ -664,6 +883,10 @@ void exec_chatGPT(String text) {
   if(speech_text=="" && speech_text_buffer == "") {
     response = chatGpt(json_string);
     speech_text = response;
+    // 会話応答文も2行字幕の対象にする（発話の再生開始時に表示）
+    capBuildFromText(response);
+    g_led_news_color = CRGB::White;
+    if (g_cap_count > 0) g_cap_armed = true;
     // 返答をチャット履歴に追加
     chatHistory.push_back(response);
   } else {
@@ -921,22 +1144,48 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
 // NHKニュースRSS（カテゴリ nhkCat）を取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
 // dispItems には表示用に「見出し＋説明」を1件ずつ格納する（吹き出し表示キュー構築用）
 // intro は読み上げ文の導入（例「今日のニュースです。」）
-String fetchNewsText(int nhkCat, const char* intro, String* dispItems, int maxDispItems, int& dispCount) {
+String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* dispTitles, String* dispDescs, int maxDispItems, int& dispCount) {
   String payload = "";
   dispCount = 0;
   g_nhk_http_code = 0;
   WiFiClientSecure *client = new WiFiClientSecure;
   if (!client) return "";
   client->setCACert(root_ca_nhk);
+  client->setTimeout(10000);
   {
     HTTPClient https;
-    https.setTimeout(15000);
+    https.setTimeout(10000);
     if (https.begin(*client, String("https://www3.nhk.or.jp/rss/news/cat") + String(nhkCat) + ".xml")) {
       int httpCode = https.GET();
       g_nhk_http_code = httpCode;
       Serial.printf("[NHK RSS] GET... code: %d\n", httpCode);
       if (httpCode == HTTP_CODE_OK) {
-        payload = https.getString();
+        // 第8弾: 本文は締切・総量上限付きで読む。getString() はデータが
+        // 細切れに来続けると全体の締切なくブロックし得るため、ストリームから
+        // 直接読む方式に変更した（過去の「取得処理が正常終了しない」不具合の
+        // 再発防止）。締切 12 秒・上限 200KB で必ず戻る。
+        WiFiClient *stream = https.getStreamPtr();
+        if (stream) {
+          payload.reserve(64 * 1024);
+          const uint32_t deadline = millis() + 12000;
+          const size_t MAX_BYTES = 200 * 1024;
+          uint8_t rbuf[512];
+          while ((int32_t)(millis() - deadline) < 0 && payload.length() < MAX_BYTES) {
+            size_t avail = stream->available();
+            if (avail == 0) {
+              if (!stream->connected()) break;
+              delay(1);
+              continue;
+            }
+            int n = stream->read(rbuf, avail < sizeof(rbuf) ? avail : sizeof(rbuf));
+            if (n > 0) {
+              payload.concat((const char*)rbuf, (unsigned int)n);
+            } else {
+              delay(1);
+            }
+          }
+          Serial.printf("[NHK RSS] body %u bytes\n", (unsigned)payload.length());
+        }
       }
       https.end();
     }
@@ -958,6 +1207,9 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, int maxDi
     if (dispItems && dispCount < maxDispItems) {
       String item = title + "。";
       if (desc != "") item += desc + "。";
+      // 見出しと本文は字幕表示（見出しを記事の先頭に置く）用に分けて保持する
+      if (dispTitles) dispTitles[dispCount] = title;
+      if (dispDescs) dispDescs[dispCount] = desc;
       dispItems[dispCount++] = item;
     }
     pos = itemPos + 6;
@@ -1013,7 +1265,8 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
           uint32_t scanned = 0;
           uint32_t startMs = millis();
           uint8_t buf[256];
-          while (outCount < want && scanned < MAX_SCAN && (millis() - startMs) < 25000) {
+          // 第8弾: 走査の締切は 25 秒→15 秒に短縮（見出しはフィード先頭にあるため十分）
+          while (outCount < want && scanned < MAX_SCAN && (millis() - startMs) < 15000) {
             size_t avail = stream->available();
             if (avail == 0) {
               if (!stream->connected()) break;
@@ -1068,13 +1321,15 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
 }
 
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
-// あわせて吹き出し表示用のセグメント列を構築し、次の発話開始時に表示が始まるよう arm する
+// あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
 String exec_news() {
-  newsDispReset();  // 前回の表示キューが残っていたら破棄する
+  captionReset();  // 前回の表示キューが残っていたら破棄する
   // 一般ニュース：NHK（見出し＋説明）→ 失敗時は Google トップニュースの見出しで代替
   String dispItems[5];
+  String dispTitles[5];
+  String dispDescs[5];
   int dispCount = 0;
-  String text = fetchNewsText(0, "今日のニュースです。", dispItems, 5, dispCount);
+  String text = fetchNewsText(0, "今日のニュースです。", dispItems, dispTitles, dispDescs, 5, dispCount);
   if (text == "") {
     String heads[3];
     int n = 0;
@@ -1082,7 +1337,11 @@ String exec_news() {
       text = "今日のニュースです。";
       for (int i = 0; i < n; i++) {
         text += heads[i] + "。";
-        if (dispCount < 5) dispItems[dispCount++] = heads[i] + "。";
+        if (dispCount < 5) {
+          dispTitles[dispCount] = heads[i];
+          dispDescs[dispCount] = "";
+          dispItems[dispCount++] = heads[i] + "。";
+        }
       }
     }
   }
@@ -1102,21 +1361,26 @@ String exec_news() {
     }
   }
   if (text != "") {
-    // 表示用セグメント列を構築する（loop の発話開始時に吹き出し表示を開始）
+    // 字幕キューを構築する（発話の再生開始時に字幕表示を開始）
     if (hasGeneral) {
-      newsDispPush("今日のニュースです");
-      for (int i = 0; i < dispCount; i++) newsDispAddText(dispItems[i]);
+      capAddLabel("今日のニュースです");
+      for (int i = 0; i < dispCount; i++) {
+        capAddHeadline(dispTitles[i]);
+        if (dispDescs[i] != "") capAddText(dispDescs[i] + "。");
+      }
     }
     if (aiCount > 0) {
-      newsDispPush("AIニュース");
-      for (int i = 0; i < aiCount; i++) newsDispAddText(aiHeads[i] + "。");
+      capAddLabel("AIニュース");
+      for (int i = 0; i < aiCount; i++) capAddHeadline(aiHeads[i]);
     }
+    capFlushUnit();
     g_led_news_color = CRGB::White;  // 通常ニュースのLED色は白
-    if (g_news_seg_count > 0) g_news_disp_armed = true;
+    if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
   } else {
     speech_text = "ニュースを取得できませんでした";
   }
+  g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   return text;
 }
 
@@ -1127,12 +1391,14 @@ String exec_news() {
 void exec_news_category(int cat) {
   if (cat < 0 || cat > 4) cat = 0;
   const NewsCatDef& c = NEWS_CATS[cat];
-  newsDispReset();  // 前回の表示キューが残っていたら破棄する
+  captionReset();  // 前回の表示キューが残っていたら破棄する
   String dispItems[5];
+  String dispTitles[5];
+  String dispDescs[5];
   int dispCount = 0;
   String text = "";
   if (c.nhkCat >= 0) {
-    text = fetchNewsText(c.nhkCat, c.intro, dispItems, 5, dispCount);
+    text = fetchNewsText(c.nhkCat, c.intro, dispItems, dispTitles, dispDescs, 5, dispCount);
   }
   if (text == "") {
     String heads[3];
@@ -1142,20 +1408,29 @@ void exec_news_category(int cat) {
       text = c.intro;
       for (int i = 0; i < n; i++) {
         text += heads[i] + "。";
-        if (dispCount < 5) dispItems[dispCount++] = heads[i] + "。";
+        if (dispCount < 5) {
+          dispTitles[dispCount] = heads[i];
+          dispDescs[dispCount] = "";
+          dispItems[dispCount++] = heads[i] + "。";
+        }
       }
     }
   }
   if (text != "") {
-    // 表示用セグメント列を構築する（loop の発話開始時に吹き出し表示を開始）
-    newsDispPush(c.label);
-    for (int i = 0; i < dispCount; i++) newsDispAddText(dispItems[i]);
+    // 字幕キューを構築する（先頭ユニットにカテゴリ名、各記事は見出しから）
+    capAddLabel(c.label);
+    for (int i = 0; i < dispCount; i++) {
+      capAddHeadline(dispTitles[i]);
+      if (dispDescs[i] != "") capAddText(dispDescs[i] + "。");
+    }
+    capFlushUnit();
     g_led_news_color = NEWS_CAT_COLORS[cat];  // カテゴリ色をLEDに使う
-    if (g_news_seg_count > 0) g_news_disp_armed = true;
+    if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
   } else {
     speech_text = "ニュースを取得できませんでした";
   }
+  g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
 }
 
 void handle_news() {
@@ -1341,6 +1616,139 @@ void playMP3(AudioFileSourceBuffer *buff){
   mp3->begin(buff, &out);
 }
 
+// 文単位パイプラインTTS: 合成専用タスク（第8弾）。
+// キューから1文を取り出して合成し、結果URLを ready スロットへ置く。
+// ready スロットが埋まっている間は次の合成をしない（先行合成は1文分まで）。
+// 合成はブロッキング処理なので、再生デコードを行う loop とは別タスクにして
+// 再生中の音切れを防ぐ。TLS を使うためスタックは大きめに確保する。
+void ttsSynthTask(void *args)
+{
+  (void)args;
+  for (;;)
+  {
+    TtsChunk chunk;
+    bool have = false;
+    uint32_t gen = 0;
+    xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+    if (!g_tts_ready && !g_tts_queue.empty()) {
+      chunk = g_tts_queue.front();
+      g_tts_queue.pop_front();
+      g_tts_synth_busy = true;
+      gen = g_tts_gen;
+      have = true;
+    }
+    xSemaphoreGive(g_tts_mutex);
+    if (!have) {
+      delay(30);
+      continue;
+    }
+    String url = "";
+    if (WiFi.status() == WL_CONNECTED) {
+      url = voicevox_synth_url(chunk.text.c_str(), chunk.parms.c_str());
+    } else {
+      Serial.println("[TTS] synth skipped: WiFi disconnected");
+    }
+    xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+    // 中断などで世代が進んでいたら、この合成結果は破棄する（再生させない）
+    if (gen == g_tts_gen) {
+      g_tts_ready_url = url;
+      g_tts_ready = true;
+    }
+    g_tts_synth_busy = false;
+    xSemaphoreGive(g_tts_mutex);
+  }
+}
+
+// 文単位パイプラインTTS: 再生の進行管理（第8弾）。loop から毎回呼ばれる。
+// 再生中でないとき、合成済みの文があれば再生を開始し、キューが空になって
+// 合成も終わっていれば発話セッションの終了処理（従来は mp3 終了時に実施）を
+// 1回だけ行う。
+void tts_drive()
+{
+  if (mp3 == nullptr || mp3->isRunning()) return;
+
+  if (g_tts_ready) {
+    String url;
+    xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+    url = g_tts_ready_url;
+    g_tts_ready = false;
+    g_tts_ready_url = "";
+    xSemaphoreGive(g_tts_mutex);
+    if (url != "") {
+      if (buff != nullptr) { delete buff; buff = nullptr; }
+      if (file != nullptr) { delete file; file = nullptr; }
+      if (voicevox_play_url(url)) {
+        Serial.println("[TTS] play start");
+        // 字幕キューが用意されていれば、最初の文の再生開始に合わせて
+        // 字幕表示を開始する（ニュース・会話応答の両方が対象）
+        if (g_cap_armed && g_cap_count > 0) {
+          g_cap_armed = false;
+          g_cap_active = true;
+          g_led_news_active = true;   // 側面LED：字幕表示中はニュース色（会話時は白）
+          g_cap_idx = 0;
+          g_cap_start_ms = millis();
+          g_cap_clear_ms = 0;
+          captionShowUnit(0);
+          g_cap_next_ms = millis() + capUnitDurationMs(0);
+        }
+        return;
+      }
+      Serial.println("[TTS] play begin failed; skip sentence");
+    } else {
+      Serial.println("[TTS] sentence skipped (synth failed or timeout)");
+    }
+    return;
+  }
+
+  // セッション終了判定：投入済みチャンクが残っておらず合成も終わっている
+  bool pending;
+  xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+  pending = !g_tts_queue.empty() || g_tts_synth_busy;
+  xSemaphoreGive(g_tts_mutex);
+  if (g_speech_session && !pending) {
+    g_speech_session = false;
+    Serial.println("[TTS] session end");
+    avatar.setExpression(Expression::Neutral);
+    speech_text_buffer = "";
+    g_news_playing = false;
+    g_led_news_active = false;
+    if (g_cap_armed) captionReset();  // 全文の合成失敗などで再生されなかった場合
+    delay(200);
+    M5.Speaker.end();
+    M5.Mic.begin();
+    if (wakeword_is_enable) mode = 1;
+    else mode = 0;
+  }
+}
+
+// ニュース読み上げの中断（追加D）。中央タップから呼ばれる。
+// 再生を即停止し、発話キュー（未合成分＋合成中分）と字幕キューを破棄して
+// 待機状態へ戻す。セッション終了処理（Mic復帰・mode復帰）は、キューを
+// 空にしたことで tts_drive() が通常の終了判定として実施する。
+// 合成タスクが合成中でも、世代カウンタを進めることで結果を無効化できる。
+static void stop_news_speech() {
+  xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+  g_tts_gen++;  // 合成中の文があっても、その結果は再生させない
+  while (!g_tts_queue.empty()) g_tts_queue.pop_front();
+  g_tts_ready = false;
+  g_tts_ready_url = "";
+  g_tts_synth_busy = false;
+  xSemaphoreGive(g_tts_mutex);
+  if (mp3 != nullptr && mp3->isRunning()) mp3->stop();
+  if (buff != nullptr) { delete buff; buff = nullptr; }
+  if (file != nullptr) { delete file; file = nullptr; }
+  speech_text = "";
+  speech_text_buffer = "";
+  g_news_playing = false;
+  captionReset();  // 字幕キュー破棄・字幕パネル消去・LEDのニュース色解除
+  // 中断フィードバック：確認音＋吹き出しに短く表示（loop 側で約1.5秒後に消す）
+  M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level]);
+  M5.Speaker.tone(1046.5f, 60, 7, false);
+  avatar.setSpeechText("中断しました");
+  g_stop_msg_until = millis() + 1500;
+  Serial.println("[NEWS] interrupted by center tap");
+}
+
 // Called when a metadata event occurs (i.e. an ID3 tag, an ICY block, etc.
 void MDCallback(void *cbData, const char *type, bool isUnicode, const char *string)
 {
@@ -1419,7 +1827,7 @@ void ledTask(void *args)
 
     if (g_led_enable) {
       if (now < g_led_vol_until) {
-        // 音量ゲージ：レベル×2 個を緑で点灯（5段階→2/4/6/8/10個）
+        // 音量ゲージ：レベル×2 個を緑で点灯（6段階→0/2/4/6/8/10個）
         int lit = (int)g_vol_level * 2;
         for (int i = 0; i < lit && i < SIDE_LED_COUNT; i++) frame[i] = CRGB::Green;
       } else if (now < g_led_ww_until) {
@@ -1597,6 +2005,7 @@ void Wifi_setup() {
 }
 
 String SpeechToText(bool isGoogle){
+  uint32_t stt_t0 = millis();
   Serial.println("\r\nRecord start!\r\n");
   g_led_listening = true;   // 側面LED：録音中（青）
 
@@ -1623,6 +2032,8 @@ String SpeechToText(bool isGoogle){
     delete audio;
   }
   g_led_listening = false;
+  Serial.printf("[STT] done in %lu ms (%s)\n", (unsigned long)(millis() - stt_t0),
+                isGoogle ? "Google" : "Whisper");
   return ret;
 }
 
@@ -1635,6 +2046,32 @@ void setup()
 //cfg.external_spk_detail.omit_spk_hat    = true; // exclude SPK HAT
 //  cfg.output_power = true;
   M5.begin(cfg);
+
+  // 起動時診断（第8弾）: リセット要因と空きヒープを Serial と画面に出す。
+  // 異常リセット（パニック/ウォッチドッグ/電圧低下）の切り分けを
+  // 書き込みページのシリアルログで後から追えるようにするため。
+  {
+    esp_reset_reason_t reason = esp_reset_reason();
+    const char* reason_str = "UNKNOWN";
+    switch (reason) {
+      case ESP_RST_POWERON:   reason_str = "POWERON";   break;
+      case ESP_RST_EXT:       reason_str = "EXT";       break;
+      case ESP_RST_SW:        reason_str = "SW";        break;
+      case ESP_RST_PANIC:     reason_str = "PANIC";     break;
+      case ESP_RST_INT_WDT:   reason_str = "INT_WDT";   break;
+      case ESP_RST_TASK_WDT:  reason_str = "TASK_WDT";  break;
+      case ESP_RST_WDT:       reason_str = "WDT";       break;
+      case ESP_RST_DEEPSLEEP: reason_str = "DEEPSLEEP"; break;
+      case ESP_RST_BROWNOUT:  reason_str = "BROWNOUT";  break;
+      case ESP_RST_SDIO:      reason_str = "SDIO";      break;
+      default: break;
+    }
+    Serial.printf("[BOOT] reset reason: %s (%d)\n", reason_str, (int)reason);
+    Serial.printf("[BOOT] free heap: %u bytes, free PSRAM: %u bytes\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    M5.Display.printf("reset: %s\n", reason_str);
+    M5.Display.printf("heap: %u\n", (unsigned)ESP.getFreeHeap());
+  }
 
   preallocateBuffer = (uint8_t *)malloc(preallocateBufferSize);
   if (!preallocateBuffer) {
@@ -1706,11 +2143,11 @@ void setup()
     }
   }
 
-  { // 音量レベル（タッチ操作・5段階）を NVS "setting"/"vol" から読み込んで適用する
+  { // 音量レベル（タッチ操作・6段階）を NVS "setting"/"vol" から読み込んで適用する
     uint8_t lv = 0;
     uint32_t nvs_handle;
     if (ESP_OK == nvs_open("setting", NVS_READONLY, &nvs_handle)) {
-      if (ESP_OK == nvs_get_u8(nvs_handle, "vol", &lv) && lv >= 1 && lv <= 5) {
+      if (ESP_OK == nvs_get_u8(nvs_handle, "vol", &lv) && lv <= 5) {
         g_vol_level = lv;
       } else {
         // "vol" 未保存なら既存の "volume"（/setting の音量）から近いレベルを初期値にする
@@ -1846,6 +2283,7 @@ void setup()
 
   M5.Lcd.print("Connecting");
   Wifi_setup();
+  WiFi.setAutoReconnect(true);  // 第8弾: ドライバ側の自動再接続も有効化（loop の監視と併用）
   M5.Lcd.println("\nConnected");
 
   // 時刻同期（スケジューラ用、第7弾）。現行ファームには NTP 同期が無かったため追加。
@@ -1946,6 +2384,11 @@ void setup()
   FastLED.clear(true);
   xTaskCreatePinnedToCore(ledTask, "ledTask", 4096, NULL, 1, NULL, 0);
 
+  // 文単位パイプラインTTS（第8弾）: 合成専用タスクを起動する。
+  // TLS ハンドシェイク＋HTTP＋JSON でスタックを多く使うため大きめに確保
+  if (g_tts_mutex == nullptr) g_tts_mutex = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(ttsSynthTask, "ttsSynth", 24576, NULL, 1, NULL, 0);
+
   // スケジューラ登録（毎朝7:00 モーニング読み上げ／時報 7〜23時）
   init_schedule();
 
@@ -2017,7 +2460,7 @@ void sw_tone(){
 }
 
 void SST_ChatGPT() {
-        newsDispReset();  // 通常会話が始まるのでニュース表示キューは破棄する（ニュース分岐では exec_news が再構築する）
+        captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する（ニュース分岐では exec_news が再構築する）
         bool prev_servo_home = servo_home;
         random_speak = true;
         random_time = -1;
@@ -2062,17 +2505,17 @@ void SST_ChatGPT() {
         } 
 }
 
-// 音量ゲージ文字列（例「音量 ■■■□□」）
+// 音量ゲージ文字列（6マス表示。例「音量 ■■■□□□」、レベル0は全□）
 static String volGaugeText() {
   String s = "音量 ";
-  for (int i = 0; i < 5; i++) s += (i < g_vol_level) ? "■" : "□";
+  for (int i = 0; i < 6; i++) s += (i < g_vol_level) ? "■" : "□";
   return s;
 }
 
-// 音量を delta 段階変える（右上/右下タップ）
+// 音量を delta 段階変える（右上/右下タップ、レベル0〜5・0は無音）
 static void change_volume(int delta) {
   int nl = (int)g_vol_level + delta;
-  if (nl < 1) nl = 1;
+  if (nl < 0) nl = 0;
   if (nl > 5) nl = 5;
   bool changed = (nl != (int)g_vol_level);
   g_vol_level = (uint8_t)nl;
@@ -2083,12 +2526,12 @@ static void change_volume(int delta) {
   } else {
     // 再生中は sw_tone（Speaker.end を伴う）で再生を止めないよう、
     // 別チャンネル(7)へ短い確認音だけを重ねる
-    M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level - 1]);
+    M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level]);
     M5.Speaker.tone(1320.0f, 70, 7, false);
   }
   // 吹き出しが空いているときだけゲージを表示し、約2秒で消す（loop 側で消去）
   if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
-      !g_news_disp_active && !g_news_disp_armed && !g_menu_open) {
+      !g_cap_active && !g_cap_armed && !g_menu_open) {
     avatar.setSpeechText(volGaugeText().c_str());
     g_vol_gauge_active = true;
     g_vol_gauge_until = millis() + 2000;
@@ -2118,7 +2561,7 @@ static void drawMenuList() {
 // 左上/左下タップ：メニューを開く／前後のカテゴリへ移動する
 static void menu_step(int delta) {
   // 発話中・ニュース表示中はメニューを開かない（吹き出しを奪わない）
-  if (mp3->isRunning() || speech_text != "" || speech_text_buffer != "" || g_news_disp_active) return;
+  if (mp3->isRunning() || speech_text != "" || speech_text_buffer != "" || g_cap_active) return;
   if (g_menu_open) {
     g_menu_sel = (g_menu_sel + delta + 5) % 5;
   } else {
@@ -2148,6 +2591,8 @@ static void toggle_periodic() {
 void loop()
 {
   static int lastms = 0;
+
+  wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続
 
   if (random_time >= 0 && millis() - lastms1 > random_time)
   {
@@ -2263,7 +2708,7 @@ void loop()
     auto t = M5.Touch.getDetail();
     if (t.wasPressed())
     {          
-      // 右上＝音量アップ、右下＝音量ダウン（5段階）
+      // 右上＝音量アップ、右下＝音量ダウン（6段階・レベル0は無音）
       if (box_vol_up.contain(t.x, t.y))
       {
         change_volume(+1);
@@ -2281,10 +2726,15 @@ void loop()
       {
         menu_step(+1);
       }
-      // 中央＝会話開始。メニュー表示中はキャンセルとして働く
+      // 中央タップの優先順位：ニュース読み上げ中＝中断（追加D）／
+      // メニュー表示中＝キャンセル／それ以外＝会話開始
       if (box_stt.contain(t.x, t.y))
       {
-        if (g_menu_open)
+        if (g_news_playing || g_pending_news_speech)
+        {
+          stop_news_speech();
+        }
+        else if (g_menu_open)
         {
           g_menu_open = false;
           sw_tone();
@@ -2322,7 +2772,7 @@ void loop()
   if (g_menu_open) {
     drawMenuList();
     if ((int32_t)(millis() - g_menu_deadline) >= 0) {
-      if (mode >= 0 && !mp3->isRunning() && speech_text == "" && speech_text_buffer == "" && !g_news_disp_active) {
+      if (mode >= 0 && !mp3->isRunning() && speech_text == "" && speech_text_buffer == "" && !g_cap_active) {
         g_menu_open = false;
         avatar.setSpeechText("ニュースです");
         exec_news_category(g_menu_sel);
@@ -2336,7 +2786,16 @@ void loop()
   if (g_vol_gauge_active && (int32_t)(millis() - g_vol_gauge_until) >= 0) {
     g_vol_gauge_active = false;
     if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
-        !g_news_disp_active && !g_menu_open) {
+        !g_cap_active && !g_menu_open) {
+      avatar.setSpeechText("");
+    }
+  }
+
+  // 「中断しました」の吹き出しを約1.5秒で消す（同上の条件で、他の表示が始まっていたら触らない）
+  if (g_stop_msg_until != 0 && (int32_t)(millis() - g_stop_msg_until) >= 0) {
+    g_stop_msg_until = 0;
+    if (!mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
+        !g_cap_active && !g_menu_open) {
       avatar.setSpeechText("");
     }
   }
@@ -2348,61 +2807,56 @@ void loop()
     M5.Mic.end();
     M5.Speaker.begin();
     mode = 0;
-    Voicevox_tts((char*)speech_text_buffer.c_str(), (char*)TTS_PARMS.c_str());
-    // ニュース発話なら、内容の吹き出し表示を開始する
-    if (g_news_disp_armed && g_news_seg_count > 0) {
-      g_news_disp_armed = false;
-      g_news_disp_active = true;
-      g_led_news_active = true;   // 側面LED：ニュース再生中はカテゴリ色
-      g_news_disp_idx = 0;
-      g_news_disp_start_ms = millis();
-      g_news_disp_clear_ms = 0;
-      avatar.setSpeechText(g_news_segments[0].c_str());
-      g_news_disp_next_ms = millis() + newsSegDurationMs(g_news_segments[0]);
-    }
+    // 第8弾: 文単位パイプラインへ投入する。合成は専用タスクが文ごとに非同期で
+    // 行い、最初の文の合成が終わり次第 tts_drive() が再生を始める。
+    // 字幕表示の有効化も、最初の文の再生開始時に tts_drive() 側で行う
+    // （ここでは arm のままにしておく）。
+    // ニュース由来の発話なら、中断対象としてセッション中フラグを立てる。
+    g_news_playing = g_pending_news_speech;
+    g_pending_news_speech = false;
+    tts_enqueue(speech_text_buffer, TTS_PARMS);
   }
 
   if (mp3->isRunning()) {
     if (!mp3->loop()) {
       mp3->stop();
       if(file != nullptr){delete file; file = nullptr;}
+      if(buff != nullptr){delete buff; buff = nullptr;}
       Serial.println("mp3 stop");
-      avatar.setExpression(Expression::Neutral);
-      speech_text_buffer = "";
-      g_led_news_active = false;
-      delay(200);
-      M5.Speaker.end();
-      M5.Mic.begin();
-      if(wakeword_is_enable) mode = 1;
-      else  mode = 0;
+      // 発話セッションの終了処理（表情・Mic・mode の復帰）は、続きの文が
+      // 無いことを確認してから tts_drive() が行う（文ごとに繰り返さない）
     }
     delay(1);
-  } else {
-  server.handleClient();
+  }
+  tts_drive();
+  if (!mp3->isRunning()) {
+    server.handleClient();
   }
 
-  // ニュース内容の吹き出し表示を進める（発話中はセグメントを順に切り替え、
-  // 発話が終わったら最後のセグメントを3秒残してから消す）
-  if (g_news_disp_active) {
+  // 読み上げ字幕（2行パネル）を進める（発話中はユニットを順に切り替え、
+  // 発話が終わったら最後のユニットを3秒残してから消す）
+  if (g_cap_active) {
     if (mp3->isRunning()) {
-      g_news_disp_clear_ms = 0;
-      if (g_news_disp_idx < g_news_seg_count - 1 &&
-          (int32_t)(millis() - g_news_disp_next_ms) >= 0) {
-        g_news_disp_idx++;
-        avatar.setSpeechText(g_news_segments[g_news_disp_idx].c_str());
-        g_news_disp_next_ms = millis() + newsSegDurationMs(g_news_segments[g_news_disp_idx]);
+      g_cap_clear_ms = 0;
+      if (g_cap_idx < g_cap_count - 1 &&
+          (int32_t)(millis() - g_cap_next_ms) >= 0) {
+        g_cap_idx++;
+        captionShowUnit(g_cap_idx);
+        g_cap_next_ms = millis() + capUnitDurationMs(g_cap_idx);
       }
-    } else if (speech_text_buffer == "" || (millis() - g_news_disp_start_ms) > 5000) {
-      // 発話終了（または発話開始に失敗）：最後のセグメントを3秒残してから消す
-      if (g_news_disp_clear_ms == 0) {
-        if (g_news_disp_idx != g_news_seg_count - 1) {
-          g_news_disp_idx = g_news_seg_count - 1;
-          avatar.setSpeechText(g_news_segments[g_news_disp_idx].c_str());
+    } else if (speech_text_buffer == "") {
+      // 発話セッション終了後に、最後のユニットを3秒残してから消す。
+      // 第8弾: 文単位パイプラインでは文間に再生が止まる時間があるため、
+      // 従来の「開始から5秒超過」という時間ベースの早期終了条件は使わない
+      // （セッション終了は speech_text_buffer のクリアで正確に分かる）
+      if (g_cap_clear_ms == 0) {
+        if (g_cap_idx != g_cap_count - 1) {
+          g_cap_idx = g_cap_count - 1;
+          captionShowUnit(g_cap_idx);
         }
-        g_news_disp_clear_ms = millis() + 3000;
-      } else if ((int32_t)(millis() - g_news_disp_clear_ms) >= 0) {
-        avatar.setSpeechText("");
-        newsDispReset();
+        g_cap_clear_ms = millis() + 3000;
+      } else if ((int32_t)(millis() - g_cap_clear_ms) >= 0) {
+        captionReset();
       }
     }
   }

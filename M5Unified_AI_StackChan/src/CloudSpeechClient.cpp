@@ -52,7 +52,21 @@ String CloudSpeechClient::Transcribe(Audio* audio) {
   client.print(HttpBody1); //Serial.print(HttpBody1);
   PrintHttpBody2(audio);
   client.print(HttpBody3); //Serial.print(HttpBody3);
-  while (!client.available());
+  // 第8弾: 応答待ちに上限を設ける（従来は無限ループで、本体が永久に固まる要因だった）
+  {
+    uint32_t t0 = millis();
+    while (!client.available()) {
+      if (!client.connected()) {
+        Serial.println(F("STT: disconnected while waiting response"));
+        return String("");
+      }
+      if (millis() - t0 > 15000) {
+        Serial.println(F("STT: response timeout"));
+        return String("");
+      }
+      delay(10);
+    }
+  }
   // Skip HTTP headers
   char endOfHeaders[] = "\r\n\r\n";
   if (!client.find(endOfHeaders)) {

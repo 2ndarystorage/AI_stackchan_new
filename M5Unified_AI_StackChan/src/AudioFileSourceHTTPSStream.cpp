@@ -42,7 +42,9 @@ bool AudioFileSourceHTTPSStream::open(const char *url)
 {
   pos = 0;
   client.setCACert(rootCACertificate);
+  client.setTimeout(10000);
   http.begin(client, url);
+  http.setTimeout(10000);  // 第8弾: 応答待ちの上限を明示（従来は HTTPClient 既定値）
   http.setReuse(true);
 #ifndef ESP32
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);

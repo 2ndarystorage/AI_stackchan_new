@@ -20,6 +20,11 @@ Whisper::~Whisper() {
 }
 
 String Whisper::Transcribe(AudioWhisper* audio) {
+  // 第8弾: コンストラクタで接続できていない場合は送信せず即座に失敗を返す
+  if (!client.connected()) {
+    Serial.println("Whisper: not connected");
+    return "";
+  }
   char boundary[64] = "------------------------";
   for (auto i = 0; i < 2; ++i) {
     ltoa(random(0x7fffffff), boundary + strlen(boundary), 16);
@@ -70,12 +75,29 @@ String Whisper::Transcribe(AudioWhisper* audio) {
 
   bool isBody = false;
   String body = "";
-  while(client.available()){
-    const auto line = client.readStringUntil('\r');
-    if (isBody) {
-      body += line;
-    } else if (line.equals("\n")) {
-      isBody = true;
+  // 第8弾: 読み取り全体に締切（20秒）を設け、データ途絶時は0.5秒の猶予で完了とする
+  // （従来は available() が一瞬途切れた時点で途中終了し、結果が空になりやすかった）
+  {
+    const uint32_t startMs = ::millis();
+    uint32_t lastDataMs = startMs;
+    while (::millis() - startMs < 20000) {
+      if (client.available()) {
+        const auto line = client.readStringUntil('\r');
+        lastDataMs = ::millis();
+        if (isBody) {
+          body += line;
+        } else if (line.equals("\n")) {
+          isBody = true;
+        }
+        if (!client.connected() && !client.available()) break;
+      } else {
+        if (!client.connected()) break;
+        if (::millis() - lastDataMs > 500) break;
+        delay(5);
+      }
+    }
+    if (::millis() - startMs >= 20000) {
+      Serial.println(">>> Response read timeout");
     }
   }
 

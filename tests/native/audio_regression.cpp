@@ -11,13 +11,14 @@ class Speaker_Class {
  public:
   bool reject=true;
   unsigned drain=0;
+  bool abrupt=false;
   std::vector<int16_t> received;
   bool playRaw(const int16_t* p, size_t n, uint32_t, bool, int, uint8_t) {
     if (reject) { reject=false; return false; }
     received.insert(received.end(),p,p+n); drain=3; return true;
   }
   bool isPlaying(uint8_t) { if (drain) { --drain; return true; } return false; }
-  void stop(uint8_t) { assert(drain==0); }
+  void stop(uint8_t) { assert(abrupt || drain==0); drain=0; }
 };
 }
 float TTS_SPEED_RATE=1.2f;
@@ -33,6 +34,13 @@ int main() {
   output.stop();
   assert(speaker.received.size()==2400);
   for(int i=0;i<1200;++i) assert(speaker.received[2*i]==i+1 && speaker.received[2*i+1]==i+1);
+  speaker.abrupt=true;
+  int16_t sample[2]={7,7};
+  for(int i=0;i<321;i++) while(!output.ConsumeSample(sample)) {}
+  output.setAbort(true);
+  uint32_t before=tick;
+  output.stop();
+  assert(tick==before); // User cancellation must not wait for natural drain.
   char data[16]={}, copy[16];
   TrackedMemorySource source(data,16);
   assert(source.read(copy,9)==9 && source.getPos()==9);

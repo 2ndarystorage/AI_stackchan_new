@@ -84,7 +84,7 @@ robo8080 さんの AI_StackChan2 をフォークし、M5Stack Core2 向けにカ
 
 `consumed=0` はclose後に位置が0へ戻る計測上の問題もあったため修正し、`max_decode_gap` を追加しました。`isApiKeyValid: NG` と429はサービス側でキーを受理せずリクエストが制限されているため、`/apikey` のVOICEVOXキーも確認してください。ソフト修正だけでAPIの制限は解消できません。
 
-詳細・検証手順・未確認事項: [NEWS_AUDIO_V912.md](docs/NEWS_AUDIO_V912.md)。実機の再生改善はまだ未確認です。
+詳細・検証手順・未確認事項: [NEWS_AUDIO_V912.md](docs/NEWS_AUDIO_V912.md)。Core2向けビルドと回帰テストは成功。ファームは3,268,896 bytes、SHA-256 `4c7ad5b9184c08c2a213e4f938dd9289b5a81cdb156123005a39bf9b0b471f80`。実機の再生改善はまだ未確認です。
 
 ## カスタム版で追加・変更したこと
 

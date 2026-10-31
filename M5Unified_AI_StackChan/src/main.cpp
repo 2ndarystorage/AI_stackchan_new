@@ -45,12 +45,14 @@ static bool audioRunning();
 #include "WakeWord.h"
 #include <FastLED.h>
 #include "Scheduler.h"
+#include "TlsGate.h"
 #include "GfxLock.h"  // グラフィックス直列化ロック（第9.3弾）
 
 // グラフィックス直列化ロックの実体（第9.3弾、GfxLock.h）。
 // setup() の最初で生成し、描画タスク (drawLoop) と loop 側の直接描画が
 // 同じ LGFX オブジェクトを同時に触らないよう直列化する。
 SemaphoreHandle_t g_gfx_mutex = nullptr;
+SemaphoreHandle_t g_tls_mutex = nullptr;
 
 // 保存する質問と回答の最大数
 const int MAX_HISTORY = 5;
@@ -607,7 +609,6 @@ struct TtsChunk {
   String parms;  // そのチャンクの話者パラメータ（&speaker=N）
 };
 struct TtsReadyItem {
-  String url;         // ストリーム再生用URL（メモリ再生用データがある場合は空）
   uint8_t *data;      // ダウンロード済みMP3（PSRAM。所有権はキュー保持中は合成タスク側→消費時に再生側へ）
   size_t len;         // data のバイト数（末尾ガードパディング込み）
 };
@@ -623,6 +624,15 @@ static uint32_t g_tts_gen = 0;             // 発話セッションの世代（�
 static bool g_tts_release_req = false;     // 接続ペア解放の依頼（第9.8弾: 合成タスク自身がアイドル時に実行する）
 static uint32_t g_stop_msg_until = 0;      // 「中断しました」吹き出しを消す時刻（0=非表示）
 static uint32_t g_info_msg_until = 0;      // 通知吹き出し（ニュース取得失敗など）を消す時刻（0=非表示。第9.6弾）
+
+static unsigned g_tts_failed_chunks = 0;
+static bool tts_processing() {
+  if (!g_tts_mutex) return false;
+  xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+  bool busy = g_speech_session || g_tts_synth_busy;
+  xSemaphoreGive(g_tts_mutex);
+  return busy;
+}
 
 void ttsSynthTask(void *args);  // 実体は後方（setup でタスク起動）
 void tts_drive();               // 実体は後方（loop から毎回呼ぶ）
@@ -703,6 +713,7 @@ static void tts_enqueue(const String& text, const String& parms) {
   for (auto& c : chunks) g_tts_queue.push_back(c);
   if (!g_speech_session) {
     g_speech_session = true;
+    g_tts_failed_chunks = 0;
     g_tts_played_in_session = false;  // 第9.10弾: 新セッションではプリバッファ判定をリセット
     g_tts_prebuf_since = 0;
   }
@@ -797,6 +808,7 @@ void handle_speech() {
 
 String https_post_json(const char* url, const char* json_string, const char* root_ca) {
   String payload = "";
+  TlsGateGuard tls_guard;
   WiFiClientSecure *client = new WiFiClientSecure;
   if(client) {
     client -> setCACert(root_ca);
@@ -1251,6 +1263,7 @@ static String fetchNhkRssBody(int nhkCat) {
   Serial.printf("[NHK RSS] start heap=%u largest=%u\n",
                 (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  TlsGateGuard tls_guard;
   WiFiClientSecure *client = new WiFiClientSecure;
   if (!client) return "";
   client->setCACert(root_ca_nhk);
@@ -1363,6 +1376,7 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
   Serial.printf("[Google RSS] start heap=%u largest=%u\n",
                 (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  TlsGateGuard tls_guard;
   WiFiClientSecure *client = new WiFiClientSecure;
   if (!client) return false;
   client->setCACert(root_ca_google);
@@ -1456,6 +1470,7 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
 // あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
 String exec_news() {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
   // 第9.8弾: ニュース取得（TLS）の前に、TTS接続ペアの解放を合成タスクへ
   // 依頼し、少し待って内蔵ヒープ（最大連続ブロック）を回復させてから
   // 取得する。前セッションの TLS バッファが残っていると、Google RSS の
@@ -1531,6 +1546,7 @@ String exec_news() {
 // NHKのないカテゴリ（AI／テック）は最初から Google 見出し×3。
 // 従来の exec_news()（トピックス＋AI連結）とは独立した読み上げにする
 void exec_news_category(int cat) {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return; }
   if (cat < 0 || cat > 4) cat = 0;
   const NewsCatDef& c = NEWS_CATS[cat];
   // 第9.8弾: exec_news() と同様、取得前に TTS 接続ペアの解放を依頼する
@@ -1892,6 +1908,7 @@ void ttsSynthTask(void *args)
     if (g_tts_ready_q.size() < TTS_READY_MAX && !g_tts_queue.empty()) {
       chunk = g_tts_queue.front();
       g_tts_queue.pop_front();
+      voicevox_reset_cancel();
       g_tts_synth_busy = true;
       gen = g_tts_gen;
       have = true;
@@ -1907,36 +1924,32 @@ void ttsSynthTask(void *args)
       delay(30);
       continue;
     }
-    String url = "";
-    if (WiFi.status() == WL_CONNECTED) {
-      url = voicevox_synth_url(chunk.text.c_str(), chunk.parms.c_str());
-    } else {
-      Serial.println("[TTS] synth skipped: WiFi disconnected");
-    }
-    // 第9.6弾: 合成できたら、その場でMP3をPSRAMへ丸ごとダウンロードしておく。
-    // 再生はメモリから行い、再生用にTLS接続を新たに張らない（TLS一本化）。
-    // 上限超過・ダウンロード失敗の場合はURLを ready スロットへ残し、
-    // 再生側が従来のストリーム再生へフォールバックする。
     uint8_t *dlData = nullptr;
     size_t dlLen = 0;
-    String readyUrl = "";
-    if (url != "") {
-      int rc = voicevox_download_mp3(url, &dlData, &dlLen);
-      if (rc != 0) {
-        Serial.printf("[TTS] download fallback to streaming (rc=%d)\n", rc);
-        readyUrl = url;
+    {
+      TlsGateGuard tls_guard;
+      String url;
+      if (WiFi.status() == WL_CONNECTED) url = voicevox_synth_url(chunk.text.c_str(), chunk.parms.c_str());
+      else Serial.println("[TTS] synth skipped: WiFi disconnected");
+      if (url != "") {
+        int rc = voicevox_download_mp3(url, &dlData, &dlLen);
+        if (rc != 0) Serial.printf("[TTS] download failed (rc=%d); no streaming fallback\n", rc);
       }
+      voicevox_release_connection();
     }
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
     // 中断などで世代が進んでいたら、この合成結果は破棄する（再生させない）
-    if (gen == g_tts_gen) {
+    if (gen == g_tts_gen && dlData != nullptr && dlLen > 0) {
       TtsReadyItem item;
-      item.url = readyUrl;
       item.data = dlData;
       item.len = dlLen;
       g_tts_ready_q.push_back(item);
       dlData = nullptr;  // 所有権は ready キューへ移った
       Serial.printf("[TTS] ready queue: %u chunk(s) stocked\n", (unsigned)g_tts_ready_q.size());
+    }
+    if (gen == g_tts_gen && dlData == nullptr && dlLen == 0) {
+      ++g_tts_failed_chunks;
+      Serial.println("[TTS] chunk failed; no empty ready item queued");
     }
     g_tts_synth_busy = false;
     xSemaphoreGive(g_tts_mutex);
@@ -1992,13 +2005,11 @@ void tts_drive()
     }
     g_tts_prebuf_since = 0;
 
-    String url;
     uint8_t *data = nullptr;
     size_t len = 0;
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
     TtsReadyItem item = g_tts_ready_q.front();
     g_tts_ready_q.pop_front();
-    url = item.url;
     data = item.data;
     len = item.len;
     xSemaphoreGive(g_tts_mutex);
@@ -2025,22 +2036,7 @@ void tts_drive()
       Serial.println("[TTS] play begin failed (memory); skip sentence");
       return;
     }
-    if (url != "") {
-      // ストリーム再生（ダウンロード上限超過時のフォールバック）
-      tts_cleanup_playback_sources();
-      if (voicevox_play_url(url)) {
-        g_play_start_ms = millis();   // 第9.10弾: 所要時間だけ計測（想定長は不明）
-        g_play_data_len = 0;
-        g_play_expect_ms = -1;
-        Serial.println("[TTS] play start");
-        g_tts_played_in_session = true;
-        tts_on_play_started();
-        return;
-      }
-      Serial.println("[TTS] play begin failed; skip sentence");
-    } else {
-      Serial.println("[TTS] sentence skipped (synth failed or timeout)");
-    }
+    Serial.println("[TTS] invalid ready item skipped");
     return;
   }
 
@@ -2052,7 +2048,11 @@ void tts_drive()
   xSemaphoreGive(g_tts_mutex);
   if (g_speech_session && !pending) {
     g_speech_session = false;
-    Serial.println("[TTS] session end");
+    Serial.printf("[TTS] session end: failed_chunks=%u\n", g_tts_failed_chunks);
+    if (g_tts_failed_chunks && !g_tts_played_in_session) {
+      avatar.setSpeechText("音声取得に失敗しました。ログを確認してください");
+      g_info_msg_until = millis() + 5000;
+    }
     // 第9.8弾: セッション終了後は TTS 接続ペアを解放し、TLSバッファ等を
     // 内蔵ヒープへ返却する（最大連続ブロックの回復。実際の破棄は合成
     // タスクがアイドル時に行う）。次の発話では接続を作り直す。
@@ -2093,7 +2093,7 @@ static void stop_news_speech() {
     g_tts_ready_q.pop_front();
     if (item.data != nullptr) heap_caps_free(item.data);
   }
-  g_tts_synth_busy = false;
+  voicevox_cancel();
   g_tts_prebuf_since = 0;
   xSemaphoreGive(g_tts_mutex);
   xSemaphoreTake(g_decoder_mutex, portMAX_DELAY);
@@ -2380,6 +2380,7 @@ void Wifi_setup() {
 }
 
 String SpeechToText(bool isGoogle){
+  TlsGateGuard tls_guard;
   uint32_t stt_t0 = millis();
   Serial.printf("[STT] start heap=%u largest=%u\n",
                 (unsigned)ESP.getFreeHeap(),
@@ -2420,6 +2421,7 @@ void setup()
   // 第9.3弾: グラフィックス直列化ロックを最初に生成する
   // （avatar.init() で描画タスクが始まる前に必ず用意する）
   g_gfx_mutex = xSemaphoreCreateRecursiveMutex();
+  g_tls_mutex = xSemaphoreCreateRecursiveMutex();
 
   auto cfg = M5.config();
 
@@ -2428,8 +2430,8 @@ void setup()
 //cfg.external_spk_detail.omit_spk_hat    = true; // exclude SPK HAT
 //  cfg.output_power = true;
   M5.begin(cfg);
-  if (!g_gfx_mutex || stackchan_avatar_gfx_lock_revision() != STACKCHAN_AVATAR_GFX_LOCKED) {
-    Serial.println("[BOOT] FATAL: graphics lock unavailable");
+  if (!g_gfx_mutex || !g_tls_mutex || stackchan_avatar_gfx_lock_revision() != STACKCHAN_AVATAR_GFX_LOCKED) {
+    Serial.println("[BOOT] FATAL: graphics/TLS lock unavailable");
     for (;;) delay(1000);
   }
   Serial.println("[BOOT] Avatar gfx lock: vendored-v9.13 (shared mutex, draw stack=8192)");
@@ -2800,7 +2802,7 @@ void setup()
     Serial.println("[BOOT] FATAL: MP3 decoder task unavailable");
     for (;;) delay(1000);
   }
-  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 v9.14)");
+  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 v9.15)");
   wakeword_init();
 
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動
@@ -2888,6 +2890,12 @@ void switch_monologue_mode(){
 }
 
 void sw_tone(){
+      if (tts_processing() || audioRunning()) {
+        // A confirmation sound must not switch I2S back to the microphone.
+        M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level]);
+        M5.Speaker.tone(1000, 60, 7, false);
+        return;
+      }
       Serial.println("[AUDIO] handover via sw_tone");  // 第9.10弾: I2S切り分け用マーカー
       M5.Mic.end();
         M5.Speaker.tone(1000, 100);
@@ -3089,6 +3097,7 @@ static void dance_boot_check() {
 }
 
 void SST_ChatGPT() {
+        if (tts_processing()) return;
         captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する（ニュース分岐では exec_news が再構築する）
         g_pose_state = POSE_WAVE;  // 第9弾: 会話開始（挨拶〜聞き取り中）は「手振り」
         bool prev_servo_home = servo_home;

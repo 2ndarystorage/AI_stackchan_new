@@ -289,10 +289,329 @@ String voicevox_synth_url(const char* text, const char* tts_parms) {
 // ダウンロードは合成と同じクライアントペアを使い回す（接続先ホストが
 // 変わるため接続自体は張り替えるが、TLSコンテキストが同時に2つ存在する
 // ことはない）。接続を閉じるタイミングで TLS バッファは解放される。
+//
+// ==== 第9.8弾: ダウンロードの完全性保証と再生末尾対策 ====
+// 第9.7弾の実機で、再生した文が MP3:ERROR_BUFLEN で途中停止し、音が
+// 細切れになる問題が確認された。原因は次のとおり（実測・実コードで確認）。
+// (1) tts.quest の mp3StreamingUrl（audio*.tts.quest の audio.mp3s）は
+//     Content-Length が無く Transfer-Encoding: chunked で送られる。
+//     従来は HTTPClient::getStreamPtr() の生ストリームを読んでいたため、
+//     チャンク境界ごとにフレーミング文字列（"\r\n<16進サイズ>\r\n"）が
+//     MP3データへ混入し、デコーダがその都度 desync して音が途切れた。
+//     さらに終端判定が「チャンク形式は2秒無着信で完了」だったため、
+//     低速受信（実測 約30KBに5秒）の途中の無通信を完了と誤認し、
+//     末尾の欠けたMP3を再生することがあった（→ ERROR_BUFLEN で停止）。
+// (2) libmad は最終フレームのデコードに後続バイト（MAD_BUFFER_GUARD=8）を
+//     必要とするため、完全なMP3でもデータがフレーム境界でぴったり
+//     終わると末尾で BUFLEN になり得る。→ 検証済みデータの末尾に
+//     ゼロのパディングを付けてから再生側へ渡す。
+// 第9.8弾の方式:
+// - Transfer-Encoding と Content-Length をヘッダで判定し、チャンク形式は
+//   プロトコルどおりに解読して終端チャンク（サイズ0）で完了を確定する。
+//   Content-Length がある場合は受信バイト数と必ず突き合わせる。
+//   無着信は「失敗」としてのみ扱い、完了とは絶対にみなさない。
+// - 受信後、MP3フレーム列を先頭から走査して末尾まで過不足なく届いて
+//   いることを検証する（検証NG・不完全は再試行対象とし、最終的には
+//   従来のストリーム再生へフォールバックする）。
+// - ダウンロード全体の締切は、低速回線で大きい文を取り切れるよう60秒。
 static const size_t TTS_DL_MAX_BYTES = 768 * 1024;  // 1文MP3の上限（PSRAM 4MBに対して余裕を持たせた値）
-static const uint32_t TTS_DL_TIMEOUT_MS = 30000;    // ダウンロード全体の締切
-static const uint32_t TTS_DL_STALL_MS = 5000;       // データ無着信の許容時間（これを超えたら失敗）
-static const uint32_t TTS_DL_RETRY_WAIT_MS = 1500;  // 接続失敗時の再試行間隔（再試行は1回だけ）
+static const uint32_t TTS_DL_TIMEOUT_MS = 60000;    // ダウンロード全体の締切
+static const uint32_t TTS_DL_STALL_MS = 5000;       // データ無着信の許容（超えたら失敗。完了判定には使わない）
+static const uint32_t TTS_DL_RETRY_WAIT_MS = 1500;  // 失敗時の再試行間隔（再試行は1回だけ）
+static const size_t TTS_DL_GUARD_BYTES = 64;        // 末尾パディング（MAD_BUFFER_GUARD=8 に対する余裕分）
+
+// ダウンロードしたデータが「末尾までそろったMP3」かを、フレームヘッダを
+// 先頭から辿って検証する。ID3v2 は読み飛ばし、末尾の ID3v1（128バイトの
+// "TAG"）と短いゼロ埋めは許容する。フリー形式など長さを追えない場合は
+// true（受入）にして、誤判定で再生を妨げない。
+static bool mp3_data_complete(const uint8_t *d, size_t len) {
+  if (d == nullptr || len < 4) return false;
+  size_t pos = 0;
+  if (len >= 10 && memcmp(d, "ID3", 3) == 0) {
+    size_t id3size = ((size_t)(d[6] & 0x7F) << 21) | ((size_t)(d[7] & 0x7F) << 14) |
+                     ((size_t)(d[8] & 0x7F) << 7) | (size_t)(d[9] & 0x7F);
+    pos = 10 + id3size + ((d[5] & 0x10) ? 10 : 0);
+    if (pos >= len) return false;
+  }
+  static const uint16_t kBitrateMpeg1L3[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
+  static const uint16_t kBitrateMpeg2L3[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+  static const uint32_t kRateMpeg1[4]  = {44100, 48000, 32000, 0};
+  static const uint32_t kRateMpeg2[4]  = {22050, 24000, 16000, 0};
+  static const uint32_t kRateMpeg25[4] = {11025, 12000, 8000, 0};
+  size_t frames = 0;
+  while (pos + 4 <= len) {
+    uint32_t h = ((uint32_t)d[pos] << 24) | ((uint32_t)d[pos + 1] << 16) |
+                 ((uint32_t)d[pos + 2] << 8) | (uint32_t)d[pos + 3];
+    if ((h & 0xFFE00000u) != 0xFFE00000u) return false;  // 同期ビットなし
+    int version = (h >> 19) & 3;   // 3=MPEG1, 2=MPEG2, 0=MPEG2.5, 1=予約
+    int layer = (h >> 17) & 3;     // 1=Layer III のみ対象
+    if (version == 1 || layer != 1) return false;
+    int brIdx = (h >> 12) & 15;
+    int srIdx = (h >> 10) & 3;
+    int padding = (h >> 9) & 1;
+    if (brIdx == 15 || srIdx == 3) return false;
+    if (brIdx == 0) return true;   // フリー形式は長さを追えないので検証を打ち切る（受入）
+    uint32_t bitrate = (uint32_t)((version == 3 ? kBitrateMpeg1L3 : kBitrateMpeg2L3)[brIdx]) * 1000;
+    uint32_t rate = (version == 3 ? kRateMpeg1 : (version == 2 ? kRateMpeg2 : kRateMpeg25))[srIdx];
+    if (bitrate == 0 || rate == 0) return false;
+    size_t frameLen = (size_t)((version == 3 ? 144u : 72u) * bitrate / rate) + (size_t)padding;
+    if (frameLen < 4 || pos + frameLen > len) return false;  // 末尾が欠けている
+    pos += frameLen;
+    frames++;
+  }
+  if (frames == 0) return false;
+  if (pos == len) return true;
+  size_t rest = len - pos;
+  if (rest == 128 && memcmp(d + pos, "TAG", 3) == 0) return true;  // ID3v1
+  if (rest < 512) {  // 末尾の短いゼロ埋めは許容する
+    bool allZero = true;
+    for (size_t i = pos; i < len; i++) {
+      if (d[i] != 0) { allZero = false; break; }
+    }
+    if (allZero) return true;
+  }
+  return false;
+}
+
+// getStreamPtr() の生ストリームをバッファ付きで読むための小さなリーダ。
+// チャンク解読と終端判定を自前で行うために使う（合成タスク専用）。
+struct DlReader {
+  WiFiClient *s;
+  uint32_t t0;
+  uint32_t lastData;
+  uint8_t buf[1024];
+  size_t pos;
+  size_t len;
+  // バッファを補充する。戻り値: 1=データあり, 0=無着信タイムアウト,
+  // -1=接続終了（これ以上来ない）, -2=全体締切
+  int fill() {
+    if (pos < len) return 1;
+    pos = 0;
+    len = 0;
+    for (;;) {
+      if ((int32_t)(millis() - t0) >= (int32_t)TTS_DL_TIMEOUT_MS) return -2;
+      size_t avail = s->available();
+      if (avail > 0) {
+        int n = s->read(buf, avail < sizeof(buf) ? avail : sizeof(buf));
+        if (n > 0) {
+          len = (size_t)n;
+          lastData = millis();
+          return 1;
+        }
+        delay(1);
+        continue;
+      }
+      if (!s->connected()) return -1;
+      if ((int32_t)(millis() - lastData) > (int32_t)TTS_DL_STALL_MS) return 0;
+      delay(1);
+    }
+  }
+  // 最大 n バイト読み、実際に読んだ数を返す。n に満たない場合は *status に理由
+  size_t read(uint8_t *dst, size_t n, int *status) {
+    size_t done = 0;
+    *status = 1;
+    while (done < n) {
+      int f = fill();
+      if (f != 1) { *status = f; break; }
+      size_t take = len - pos;
+      if (take > n - done) take = n - done;
+      memcpy(dst + done, buf + pos, take);
+      pos += take;
+      done += take;
+    }
+    return done;
+  }
+  // 1行（\n 終端、\r は除く）を読む。戻り値: 1=成功, それ以外は fill の理由
+  int readLine(char *out, size_t maxlen) {
+    size_t i = 0;
+    for (;;) {
+      int f = fill();
+      if (f != 1) return f;
+      uint8_t c = buf[pos++];
+      if (c == '\n') break;
+      if (c != '\r' && i + 1 < maxlen) out[i++] = (char)c;
+    }
+    out[i] = '\0';
+    return 1;
+  }
+};
+
+// PSRAMバッファを need バイト以上に拡張する（末尾ガード分は常に上乗せ確保）
+static bool dl_ensure_cap(uint8_t **buf, size_t *cap, size_t need) {
+  if (need <= *cap) return true;
+  size_t newCap = *cap ? *cap : 128 * 1024;
+  while (newCap < need) newCap *= 2;
+  if (newCap > TTS_DL_MAX_BYTES) newCap = TTS_DL_MAX_BYTES;
+  if (newCap < need) return false;
+  uint8_t *nb = (uint8_t *)heap_caps_realloc(*buf, newCap + TTS_DL_GUARD_BYTES,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (nb == nullptr) return false;
+  *buf = nb;
+  *cap = newCap;
+  return true;
+}
+
+static const int DL_OK = 0;
+static const int DL_TOO_LARGE = 1;
+static const int DL_FAIL_RETRY = -1;    // 接続エラー・不完全・検証NG（再試行する）
+static const int DL_FAIL_NORETRY = -2;  // HTTPエラー（再試行しない）
+
+// ダウンロード1回分。成功時は *outData/*outLen（末尾ガード込み長）に
+// PSRAMバッファを返す。接続は成否によらず閉じる（TLS一本化の維持）。
+static int voicevox_download_once(const String& url, uint32_t t0, uint8_t** outData, size_t* outLen) {
+  if (!tts_ensure_connection()) {
+    Serial.println("[TTS] download failed: client alloc");
+    return DL_FAIL_RETRY;
+  }
+  // 合成で使った接続（tts.quest向け）は閉じてからダウンロード先へ張り替える
+  tts_https->end();
+  if (!tts_https->begin(*tts_client, url)) {
+    Serial.println("[TTS] download failed: begin");
+    return DL_FAIL_RETRY;
+  }
+  tts_https->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  static const char *dlHeaderKeys[] = {"Content-Length", "Transfer-Encoding"};
+  tts_https->collectHeaders(dlHeaderKeys, 2);
+  int code = tts_https->GET();
+  if (code != HTTP_CODE_OK) {
+    if (code > 0) {
+      // HTTPエラーは再試行しない（呼び出し側がストリーム再生へフォールバックする）
+      Serial.printf("[TTS] download failed: HTTP %d\n", code);
+      tts_https->end();
+      return DL_FAIL_NORETRY;
+    }
+    // 接続エラー（SSLメモリ確保失敗を含む）
+    Serial.printf("[TTS] download failed: %s heap=%u largest=%u\n",
+                  tts_https->errorToString(code).c_str(),
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    tts_https->end();
+    return DL_FAIL_RETRY;
+  }
+  const int size = tts_https->getSize();  // Content-Length（無ければ -1）
+  String te = tts_https->header("Transfer-Encoding");
+  te.toLowerCase();
+  const bool chunked = te.indexOf("chunked") >= 0;
+  const char *mode = chunked ? "chunked" : (size > 0 ? "identity" : "close");
+  Serial.printf("[TTS] download headers: content-length=%d transfer-encoding=%s (mode=%s)\n",
+                size, te.c_str(), mode);
+  if (size > (int)TTS_DL_MAX_BYTES) {
+    Serial.printf("[TTS] download too large: %d bytes (cap %u)\n",
+                  size, (unsigned)TTS_DL_MAX_BYTES);
+    tts_https->end();
+    return DL_TOO_LARGE;
+  }
+  WiFiClient *stream = tts_https->getStreamPtr();
+  if (stream == nullptr) {
+    tts_https->end();
+    return DL_FAIL_RETRY;
+  }
+  size_t cap = (size > 0) ? (size_t)size : 128 * 1024;
+  uint8_t *buf = (uint8_t *)heap_caps_malloc(cap + TTS_DL_GUARD_BYTES,
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (buf == nullptr) {
+    Serial.println("[TTS] download failed: PSRAM alloc");
+    tts_https->end();
+    return DL_FAIL_RETRY;
+  }
+  DlReader r;
+  r.s = stream;
+  r.t0 = t0;
+  r.lastData = millis();
+  r.pos = 0;
+  r.len = 0;
+  size_t got = 0;
+  bool complete = false;
+  bool tooLarge = false;
+  int failStatus = 1;
+  if (chunked) {
+    // チャンク形式: サイズ行→データ→CRLF を繰り返し、サイズ0で終端を確定する
+    for (;;) {
+      char line[48];
+      int lr = r.readLine(line, sizeof(line));
+      if (lr != 1) { failStatus = lr; break; }
+      char *endp = nullptr;
+      long csize = strtol(line, &endp, 16);
+      if (endp == line || csize < 0) { failStatus = -3; break; }
+      if (csize == 0) {
+        // 終端チャンク: トレーラ行を空行まで読み捨てて完了を確定する
+        bool trailerOk = true;
+        for (;;) {
+          lr = r.readLine(line, sizeof(line));
+          if (lr != 1) { trailerOk = false; failStatus = lr; break; }
+          if (line[0] == '\0') break;
+        }
+        complete = trailerOk;
+        break;
+      }
+      if (got + (size_t)csize > TTS_DL_MAX_BYTES) { tooLarge = true; break; }
+      if (!dl_ensure_cap(&buf, &cap, got + (size_t)csize)) { tooLarge = true; break; }
+      int st = 1;
+      size_t n = r.read(buf + got, (size_t)csize, &st);
+      got += n;
+      if (n < (size_t)csize) { failStatus = st; break; }
+      uint8_t crlf[2];
+      n = r.read(crlf, 2, &st);
+      if (n < 2 || crlf[0] != '\r' || crlf[1] != '\n') {
+        failStatus = (n < 2 ? st : -3);
+        break;
+      }
+    }
+  } else if (size > 0) {
+    // Content-Length あり: 申告サイズぴったりまで読み、必ず突き合わせる
+    while (got < (size_t)size) {
+      size_t want = (size_t)size - got;
+      if (want > 8192) want = 8192;
+      int st = 1;
+      size_t n = r.read(buf + got, want, &st);
+      got += n;
+      if (n < want) { failStatus = st; break; }
+    }
+    complete = (got == (size_t)size);
+  } else {
+    // 長さ不明（接続クローズで終端）: サーバーが接続を閉じたら完了。
+    // 無着信は失敗として扱い、完了とはみなさない。
+    for (;;) {
+      if (!dl_ensure_cap(&buf, &cap, got + 8192)) { tooLarge = true; break; }
+      int st = 1;
+      size_t want = cap - got;
+      if (want > 8192) want = 8192;
+      size_t n = r.read(buf + got, want, &st);
+      got += n;
+      if (st == -1) { complete = true; break; }  // 接続が閉じた＝終端
+      if (st != 1 || n == 0) { failStatus = st; break; }
+    }
+  }
+  tts_https->end();  // ここでTLSを閉じる（再生中にTLS接続は残らない）
+  if (tooLarge) {
+    heap_caps_free(buf);
+    Serial.printf("[TTS] download too large: over %u bytes cap\n", (unsigned)TTS_DL_MAX_BYTES);
+    return DL_TOO_LARGE;
+  }
+  if (!complete) {
+    heap_caps_free(buf);
+    Serial.printf("[TTS] download incomplete: got %u bytes (content-length=%d, mode=%s, reason=%d)\n",
+                  (unsigned)got, size, mode, failStatus);
+    return DL_FAIL_RETRY;
+  }
+  // 受信データの完全性を MP3 フレーム列の走査で検証する
+  if (!mp3_data_complete(buf, got)) {
+    heap_caps_free(buf);
+    Serial.printf("[TTS] download rejected: MP3 frame check failed (got %u bytes, content-length=%d, mode=%s)\n",
+                  (unsigned)got, size, mode);
+    return DL_FAIL_RETRY;
+  }
+  // libmad が最終フレームをデコードできるよう、末尾にガード用のゼロを付ける
+  memset(buf + got, 0, TTS_DL_GUARD_BYTES);
+  *outData = buf;
+  *outLen = got + TTS_DL_GUARD_BYTES;
+  Serial.printf("[TTS] download OK: %u bytes (content-length=%d, mode=%s, +%u guard) in %lu ms heap=%u largest=%u\n",
+                (unsigned)got, size, mode, (unsigned)TTS_DL_GUARD_BYTES,
+                (unsigned long)(millis() - t0),
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  return DL_OK;
+}
 
 int voicevox_download_mp3(const String& url, uint8_t** outData, size_t* outLen) {
   *outData = nullptr;
@@ -302,111 +621,29 @@ int voicevox_download_mp3(const String& url, uint8_t** outData, size_t* outLen) 
                 (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   for (int attempt = 0; attempt <= 1; attempt++) {
-    if (!tts_ensure_connection()) {
-      Serial.println("[TTS] download failed: client alloc");
-      return -1;
-    }
-    // 合成で使った接続（tts.quest向け）は閉じてからダウンロード先へ張り替える
-    tts_https->end();
-    if (!tts_https->begin(*tts_client, url)) {
-      Serial.println("[TTS] download failed: begin");
-      tts_forget_connection();
-      if (attempt < 1) { delay(TTS_DL_RETRY_WAIT_MS); continue; }
-      return -1;
-    }
-    tts_https->setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    int code = tts_https->GET();
-    if (code == HTTP_CODE_OK) {
-      int size = tts_https->getSize();  // Content-Length（チャンク形式なら -1）
-      if (size > (int)TTS_DL_MAX_BYTES) {
-        Serial.printf("[TTS] download too large: %d bytes (cap %u)\n",
-                      size, (unsigned)TTS_DL_MAX_BYTES);
-        tts_https->end();
-        return 1;
-      }
-      WiFiClient *stream = tts_https->getStreamPtr();
-      if (stream == nullptr) {
-        tts_https->end();
-        return -1;
-      }
-      size_t cap = (size > 0) ? (size_t)size : 128 * 1024;
-      uint8_t *buf = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-      if (buf == nullptr) {
-        Serial.println("[TTS] download failed: PSRAM alloc");
-        tts_https->end();
-        return -1;
-      }
-      size_t got = 0;
-      bool over = false, failed = false;
-      uint32_t lastData = millis();
-      while ((int32_t)(millis() - t0) < (int32_t)TTS_DL_TIMEOUT_MS) {
-        if (size > 0 && got >= (size_t)size) break;
-        size_t avail = stream->available();
-        if (avail == 0) {
-          if (size < 0 && !stream->connected()) break;  // チャンク形式の終端（接続クローズ）
-          // チャンク形式は終端をサイズで判定できないため、2秒無着信で終端とみなす
-          if (size < 0 && got > 0 && (int32_t)(millis() - lastData) > 2000) break;
-          if ((int32_t)(millis() - lastData) > (int32_t)TTS_DL_STALL_MS) { failed = true; break; }
-          delay(1);
-          continue;
-        }
-        if (got + avail > cap) {
-          if (size > 0) { failed = true; break; }  // 申告サイズと実データの不一致
-          if (cap >= TTS_DL_MAX_BYTES) { over = true; break; }
-          size_t newCap = cap * 2;
-          if (newCap > TTS_DL_MAX_BYTES) newCap = TTS_DL_MAX_BYTES;
-          uint8_t *nb = (uint8_t *)heap_caps_realloc(buf, newCap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-          if (nb == nullptr) { failed = true; break; }
-          buf = nb;
-          cap = newCap;
-        }
-        size_t want = cap - got;
-        if (want > avail) want = avail;
-        int n = stream->read(buf + got, want);
-        if (n > 0) {
-          got += (size_t)n;
-          lastData = millis();
-        } else {
-          delay(1);
-        }
-      }
-      tts_https->end();  // ここでTLSを閉じる（再生中にTLS接続は残らない）
-      if (over) {
-        heap_caps_free(buf);
-        Serial.printf("[TTS] download too large: over %u bytes cap\n", (unsigned)TTS_DL_MAX_BYTES);
-        return 1;
-      }
-      if (failed || got == 0 || (size > 0 && got < (size_t)size)) {
-        heap_caps_free(buf);
-        Serial.printf("[TTS] download incomplete: %u/%d bytes\n", (unsigned)got, size);
-        tts_forget_connection();
-        if (attempt < 1) { delay(TTS_DL_RETRY_WAIT_MS); continue; }
-        return -1;
-      }
-      *outData = buf;
-      *outLen = got;
-      Serial.printf("[TTS] download OK: %u bytes in %lu ms heap=%u largest=%u\n",
-                    (unsigned)got, (unsigned long)(millis() - t0),
-                    (unsigned)ESP.getFreeHeap(),
-                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-      return 0;
-    }
-    if (code > 0) {
-      // HTTPエラーは再試行しない（呼び出し側がストリーム再生へフォールバックする）
-      Serial.printf("[TTS] download failed: HTTP %d\n", code);
-      tts_forget_connection();
-      return -1;
-    }
-    // 接続エラー（SSLメモリ確保失敗を含む）。全て解放して1回だけ再試行する
-    Serial.printf("[TTS] download failed: %s heap=%u largest=%u\n",
-                  tts_https->errorToString(code).c_str(),
-                  (unsigned)ESP.getFreeHeap(),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    int rc = voicevox_download_once(url, t0, outData, outLen);
+    if (rc == DL_OK) return 0;
+    if (rc == DL_TOO_LARGE) return 1;
+    // 失敗時は接続まわりを完全に解放してから作り直す（第9.4弾の対管理）
     tts_forget_connection();
+    if (rc == DL_FAIL_NORETRY) return -1;
     if (attempt < 1) { delay(TTS_DL_RETRY_WAIT_MS); continue; }
     return -1;
   }
   return -1;
+}
+
+// 第9.8弾: 接続ペアの明示的な解放。セッション終了後などに合成タスクから
+// 呼ばれ、使い回し接続（TLSレコードバッファ等）を内蔵ヒープへ返却する。
+// 合成タスクからのみ呼ぶこと（他タスクから直接呼ぶと、使用中オブジェクトを
+// 破棄する競合になり得るため、main.cpp 側はフラグ経由で依頼する）。
+void voicevox_release_connection() {
+  if (tts_client != nullptr || tts_https != nullptr) {
+    Serial.printf("[TTS] release connection heap=%u largest=%u\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  }
+  tts_forget_connection();
 }
 
 // PSRAM上のMP3データから再生を開始する（TLSは使わない）。

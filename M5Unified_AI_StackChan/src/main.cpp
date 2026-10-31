@@ -607,6 +607,7 @@ static bool g_tts_synth_busy = false;      // 合成タスクが1文を処理中
 static bool g_speech_session = false;      // 発話セッション中（投入〜全チャンク再生完了）
 static SemaphoreHandle_t g_tts_mutex = nullptr;
 static uint32_t g_tts_gen = 0;             // 発話セッションの世代（中断時に進めて合成結果を無効化）
+static bool g_tts_release_req = false;     // 接続ペア解放の依頼（第9.8弾: 合成タスク自身がアイドル時に実行する）
 static uint32_t g_stop_msg_until = 0;      // 「中断しました」吹き出しを消す時刻（0=非表示）
 static uint32_t g_info_msg_until = 0;      // 通知吹き出し（ニュース取得失敗など）を消す時刻（0=非表示。第9.6弾）
 
@@ -1433,6 +1434,12 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
 // あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
 String exec_news() {
+  // 第9.8弾: ニュース取得（TLS）の前に、TTS接続ペアの解放を合成タスクへ
+  // 依頼し、少し待って内蔵ヒープ（最大連続ブロック）を回復させてから
+  // 取得する。前セッションの TLS バッファが残っていると、Google RSS の
+  // ハンドシェイクがメモリ確保失敗（-32512）になる事象への対策。
+  g_tts_release_req = true;
+  for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
   captionReset();  // 前回の表示キューが残っていたら破棄する
   // 一般ニュース：NHK（見出し＋説明）→ 失敗時は Google トップニュースの見出しで代替
   String dispItems[5];
@@ -1504,6 +1511,9 @@ String exec_news() {
 void exec_news_category(int cat) {
   if (cat < 0 || cat > 4) cat = 0;
   const NewsCatDef& c = NEWS_CATS[cat];
+  // 第9.8弾: exec_news() と同様、取得前に TTS 接続ペアの解放を依頼する
+  g_tts_release_req = true;
+  for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
   captionReset();  // 前回の表示キューが残っていたら破棄する
   String dispItems[5];
   String dispTitles[5];
@@ -1766,6 +1776,12 @@ void ttsSynthTask(void *args)
     }
     xSemaphoreGive(g_tts_mutex);
     if (!have) {
+      // 第9.8弾: 解放依頼があれば、接続ペアの破棄は合成タスク自身が行う
+      // （他タスクから破棄すると、使用中オブジェクトを触る競合になり得る）
+      if (g_tts_release_req) {
+        g_tts_release_req = false;
+        voicevox_release_connection();
+      }
       delay(30);
       continue;
     }
@@ -1878,6 +1894,10 @@ void tts_drive()
   if (g_speech_session && !pending) {
     g_speech_session = false;
     Serial.println("[TTS] session end");
+    // 第9.8弾: セッション終了後は TTS 接続ペアを解放し、TLSバッファ等を
+    // 内蔵ヒープへ返却する（最大連続ブロックの回復。実際の破棄は合成
+    // タスクがアイドル時に行う）。次の発話では接続を作り直す。
+    g_tts_release_req = true;
     avatar.setExpression(Expression::Neutral);
     speech_text_buffer = "";
     g_news_playing = false;
@@ -1911,6 +1931,7 @@ static void stop_news_speech() {
   g_tts_synth_busy = false;
   xSemaphoreGive(g_tts_mutex);
   if (mp3 != nullptr && mp3->isRunning()) mp3->stop();
+  g_tts_release_req = true;  // 第9.8弾: 中断時も TTS 接続ペアの解放を依頼する
   tts_cleanup_playback_sources();
   speech_text = "";
   speech_text_buffer = "";
@@ -2567,7 +2588,23 @@ void setup()
   delay(3000);
 
   audioLogger = &Serial;
-  mp3 = new AudioGeneratorMP3();
+  // 第9.8弾: MP3デコーダの作業領域（約38KB。mad_frame 約21KB＋mad_synth
+  // 約13KB＋入力バッファ等）は、従来 begin() のたびに内蔵ヒープへ
+  // malloc され stop() で free されており、大きな断片化要因になっていた。
+  // ライブラリの preallocation 経路で PSRAM 上の領域を使わせ、内蔵ヒープ
+  // から排除する（再生中に先行合成の TLS が内蔵ヒープを使えるようにもなる）。
+  {
+    size_t mp3WsSize = (size_t)AudioGeneratorMP3::preAllocSize();
+    void *mp3Ws = ps_malloc(mp3WsSize);
+    if (mp3Ws != nullptr) {
+      mp3 = new AudioGeneratorMP3(mp3Ws, (int)mp3WsSize);
+      Serial.printf("[BOOT] mp3 workspace: %u bytes in PSRAM\n", (unsigned)mp3WsSize);
+    }
+    if (mp3 == nullptr) {
+      mp3 = new AudioGeneratorMP3();
+      Serial.printf("[BOOT] mp3 workspace: %u bytes in internal heap (fallback)\n", (unsigned)mp3WsSize);
+    }
+  }
 //  mp3->RegisterStatusCB(StatusCallback, (void*)"mp3");
   wakeword_init();
 

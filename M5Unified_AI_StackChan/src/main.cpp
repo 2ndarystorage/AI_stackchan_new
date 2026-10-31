@@ -444,7 +444,7 @@ static void capBuildFromText(const String& text) {
 // GPIO25 に信号が出るだけで無害。駆動は既存依存の FastLED を使う。
 #define SIDE_LED_PIN 25
 #define SIDE_LED_COUNT 10
-#define SIDE_LED_MAX_BRIGHTNESS 48   // 全体の明るさ上限（控えめに）
+#define SIDE_LED_MAX_BRIGHTNESS 16   // 全体の明るさ上限（第9.5弾：48→16、省電力化）
 CRGB g_side_leds[SIDE_LED_COUNT];
 bool g_led_enable = true;            // 全体の有効/無効（NVS "setting"/"led"、既定ON）
 bool g_led_listening = false;        // 録音中（青）

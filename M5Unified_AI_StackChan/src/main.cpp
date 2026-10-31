@@ -595,7 +595,9 @@ void tts_drive();               // 実体は後方（loop から毎回呼ぶ）
 
 // テキストを文（。！？と改行で区切る。文末記号は文に含める）に分割し、
 // チャンク列にして返す。先頭の文は単独チャンク（初回発話を最速にする）、
-// 以降は約100バイトまで連結して合成リクエスト数を抑える。
+// 以降は約200バイトまで連結して合成リクエスト数を抑える
+// （第9.4弾：約100→約200バイト。tts.quest のレート制限（429）対策として
+// リクエスト数自体を減らす。先頭チャンクは従来どおり1文だけ）。
 static std::deque<TtsChunk> splitSpeechChunks(const String& text, const String& parms) {
   std::deque<String> sentences;
   int n = (int)text.length();
@@ -632,7 +634,7 @@ static std::deque<TtsChunk> splitSpeechChunks(const String& text, const String& 
       cur = s;
       continue;
     }
-    if (firstChunk || cur.length() + s.length() > 100) {
+    if (firstChunk || cur.length() + s.length() > 200) {
       TtsChunk c;
       c.text = cur;
       c.parms = parms;
@@ -1669,8 +1671,8 @@ int preallocateBufferSize = 30*1024;
 uint8_t *preallocateBuffer;
 AudioFileSourceHTTPSStream *file = nullptr;
 
-void playMP3(AudioFileSourceBuffer *buff){
-  mp3->begin(buff, &out);
+bool playMP3(AudioFileSourceBuffer *buff){
+  return mp3->begin(buff, &out);
 }
 
 // 文単位パイプラインTTS: 合成専用タスク（第8弾）。
@@ -2142,7 +2144,13 @@ void setup()
     M5.Display.printf("heap: %u\n", (unsigned)ESP.getFreeHeap());
   }
 
-  preallocateBuffer = (uint8_t *)malloc(preallocateBufferSize);
+  // 第9.4弾: 再生バッファ（30KB）は PSRAM に置き、内蔵ヒープを空ける。
+  // TLS ハンドシェイクは内蔵ヒープから大きな塊を必要とし、バッファが
+  // 内蔵側にあると SSL のメモリ確保失敗（-32512）を招きやすかった。
+  preallocateBuffer = (uint8_t *)ps_malloc(preallocateBufferSize);
+  if (!preallocateBuffer) {
+    preallocateBuffer = (uint8_t *)malloc(preallocateBufferSize);
+  }
   if (!preallocateBuffer) {
     M5.Display.printf("FATAL ERROR:  Unable to preallocate %d bytes for app\n", preallocateBufferSize);
     for (;;) { delay(1000); }

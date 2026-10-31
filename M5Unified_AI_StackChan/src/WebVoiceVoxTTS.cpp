@@ -16,7 +16,7 @@ extern int preallocateBufferSize;
 extern uint8_t *preallocateBuffer;
 //extern AudioOutputM5Speaker out;
 void StatusCallback(void *cbData, int code, const char *string);
-void playMP3(AudioFileSourceBuffer *buff);
+bool playMP3(AudioFileSourceBuffer *buff);
 //-----------------------------------------------------
 
 String https_get(const char* url, const char* root_ca) {
@@ -137,59 +137,121 @@ static String URLEncode(const char* msg);  // 実体は後方（従来位置）
 // 1文あたりの合成上限は TTS_SYNTH_TIMEOUT_MS。tts.quest のキューが混んで
 // 応答が返らない場合は上限で諦め、その文をスキップして次へ進む（呼び出し側）。
 static const uint32_t TTS_SYNTH_TIMEOUT_MS = 25000;
+// 第9.4弾: 失敗時の再試行ポリシー。
+// 429（レート制限）は即スキップせずバックオフして再試行し、接続エラー
+// （SSLメモリ確保失敗を含む）は旧接続を完全に解放してから作り直して再試行する。
+// いずれも再試行は最大 TTS_MAX_RETRY 回まで。
+static const int TTS_MAX_RETRY = 2;
+static const uint32_t TTS_ERR_RETRY_WAIT_MS = 2000;
 static WiFiClientSecure *tts_client = nullptr;
-static HTTPClient tts_https;
+static HTTPClient *tts_https = nullptr;
 
-// 接続が壊れた可能性が高いときに破棄する（次回の合成で作り直す）
+// 接続まわりを完全に破棄する（次回の合成で作り直す）。
+// 第9.3弾の実機クラッシュ対策（addr2line で特定）：HTTPClient::end() は
+// 未接続のとき内部ポインタ _client を消さずに残すため、WiFiClientSecure
+// だけを delete すると、残った _client が解放済みメモリを指し、次回の
+// setTimeout()→connected() で LoadProhibited になる。HTTPClient も
+// ヒープに置き、クライアントと必ず対で破棄することで残留ポインタを無くす。
 static void tts_forget_connection() {
-  tts_https.end();
+  if (tts_https) {
+    tts_https->end();
+    delete tts_https;
+    tts_https = nullptr;
+  }
   if (tts_client) {
     delete tts_client;
     tts_client = nullptr;
   }
 }
 
+// 再利用ペアがそろっていなければ作る（片方だけの不整合があれば作り直す）。
+static bool tts_ensure_connection() {
+  if (tts_client && tts_https) return true;
+  tts_forget_connection();
+  tts_client = new WiFiClientSecure;
+  if (!tts_client) return false;
+  tts_client->setCACert(root_ca);
+  tts_client->setTimeout(TTS_SYNTH_TIMEOUT_MS);
+  tts_https = new HTTPClient;
+  if (!tts_https) {
+    delete tts_client;
+    tts_client = nullptr;
+    return false;
+  }
+  tts_https->setReuse(true);
+  tts_https->setTimeout(TTS_SYNTH_TIMEOUT_MS);
+  return true;
+}
+
 // tts.quest へ1文（チャンク）の合成を依頼し、再生用ストリーミングURLを返す。
-// 失敗/タイムアウト時は空文字を返す。
+// 失敗/タイムアウト時は空文字を返す（429・接続エラーは内部で再試行する）。
 String voicevox_synth_url(const char* text, const char* tts_parms) {
   String req_url = String("https://api.tts.quest/v3/voicevox/synthesis?key=") + VOICEVOX_API_KEY +
                    String("&text=") + URLEncode(text) + String(tts_parms);
   uint32_t t0 = millis();
-  Serial.printf("[TTS] synth start (%u bytes)\n", (unsigned)strlen(text));
+  Serial.printf("[TTS] synth start (%u bytes) heap=%u\n",
+                (unsigned)strlen(text), (unsigned)ESP.getFreeHeap());
 
-  if (!tts_client) {
-    tts_client = new WiFiClientSecure;
-    if (!tts_client) {
-      Serial.println("[TTS] synth failed: client alloc");
+  static const char* retryAfterHeader[] = {"Retry-After"};
+  String payload = "";
+  for (int attempt = 0; attempt <= TTS_MAX_RETRY; attempt++) {
+    if (!tts_ensure_connection()) {
+      Serial.printf("[TTS] synth failed: client alloc heap=%u\n", (unsigned)ESP.getFreeHeap());
       return "";
     }
-    tts_client->setCACert(root_ca);
-    tts_client->setTimeout(TTS_SYNTH_TIMEOUT_MS);
-  }
-  tts_https.setReuse(true);
-  tts_https.setTimeout(TTS_SYNTH_TIMEOUT_MS);
-
-  String payload = "";
-  if (tts_https.begin(*tts_client, req_url)) {
-    int httpCode = tts_https.GET();
-    if (httpCode > 0) {
+    if (!tts_https->begin(*tts_client, req_url)) {
+      Serial.println("[TTS] synth failed: begin");
+      tts_forget_connection();
+      if (attempt < TTS_MAX_RETRY) { delay(TTS_ERR_RETRY_WAIT_MS); continue; }
+      return "";
+    }
+    tts_https->collectHeaders(retryAfterHeader, 1);
+    int httpCode = tts_https->GET();
+    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
       Serial.printf("[TTS] synth code: %d in %lu ms\n", httpCode, (unsigned long)(millis() - t0));
-      if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
-        payload = tts_https.getString();  // 本文を読み切る（接続再利用の前提）
-        // 接続は再利用のため end() しない
-      } else {
-        // エラー応答は本文が残っている可能性があるため、再利用せず切断する
-        tts_https.end();
+      payload = tts_https->getString();  // 本文を読み切る（接続再利用の前提）
+      // 接続は再利用のため end() しない
+      if (payload != "") break;
+      // 本文が空＝異常応答。接続を作り直して再試行する
+      Serial.println("[TTS] synth failed: empty body");
+      tts_forget_connection();
+      if (attempt < TTS_MAX_RETRY) { delay(TTS_ERR_RETRY_WAIT_MS); continue; }
+      return "";
+    }
+    if (httpCode == HTTP_CODE_TOO_MANY_REQUESTS) {
+      // 429: レート制限。Retry-After があれば尊重し（最大30秒）、無ければ
+      // 5秒→10秒のバックオフで再試行する。制限中の接続は使い回さない。
+      String ra = tts_https->header("Retry-After");
+      tts_forget_connection();
+      if (attempt >= TTS_MAX_RETRY) {
+        Serial.printf("[TTS] synth code: 429 (retry exhausted) in %lu ms\n",
+                      (unsigned long)(millis() - t0));
+        return "";
       }
-    } else {
-      Serial.printf("[TTS] synth failed: %s in %lu ms\n",
-                    tts_https.errorToString(httpCode).c_str(), (unsigned long)(millis() - t0));
+      uint32_t wait_ms = 5000UL * (uint32_t)(attempt + 1);
+      long ra_sec = ra.toInt();
+      if (ra_sec > 0) {
+        wait_ms = (uint32_t)ra_sec * 1000UL;
+        if (wait_ms > 30000UL) wait_ms = 30000UL;
+      }
+      Serial.printf("[TTS] synth code: 429; wait %lu ms and retry (%d/%d)\n",
+                    (unsigned long)wait_ms, attempt + 1, TTS_MAX_RETRY);
+      delay(wait_ms);
+      continue;
+    }
+    if (httpCode > 0) {
+      // その他の HTTP エラーは、その文をスキップする（接続は作り直す）
+      Serial.printf("[TTS] synth code: %d in %lu ms\n", httpCode, (unsigned long)(millis() - t0));
       tts_forget_connection();
       return "";
     }
-  } else {
-    Serial.println("[TTS] synth failed: begin");
+    // 接続エラー（SSL のメモリ確保失敗を含む）。旧接続の TLS コンテキストを
+    // 完全に解放してから新規接続で再試行し、二重に TLS が存在する時間を無くす。
+    Serial.printf("[TTS] synth failed: %s in %lu ms heap=%u\n",
+                  tts_https->errorToString(httpCode).c_str(),
+                  (unsigned long)(millis() - t0), (unsigned)ESP.getFreeHeap());
     tts_forget_connection();
+    if (attempt < TTS_MAX_RETRY) { delay(TTS_ERR_RETRY_WAIT_MS); continue; }
     return "";
   }
   if (payload == "") return "";
@@ -216,8 +278,18 @@ String voicevox_synth_url(const char* text, const char* tts_parms) {
 bool voicevox_play_url(const String& url) {
   if (url == "") return false;
   file = new AudioFileSourceHTTPSStream(url.c_str(), root_ca);
+  if (file == nullptr || !file->isOpen()) {
+    // ストリームを開けなかった（TLSメモリ不足など）場合は、開いていない
+    // ソースを再生側へ渡さない。その文はスキップされる（第9.4弾）。
+    Serial.println("[TTS] play open failed: stream not open");
+    if (file != nullptr) { delete file; file = nullptr; }
+    return false;
+  }
   buff = new AudioFileSourceBuffer(file, preallocateBuffer, preallocateBufferSize);
-  playMP3(buff);
+  if (!playMP3(buff)) {
+    Serial.println("[TTS] play begin failed in generator");
+    return false;  // buff/file の後片付けは従来どおり呼び出し側の掃除経路に任せる
+  }
   return true;
 }
 

@@ -33,6 +33,8 @@
 #include "Audio.h"
 #include "CloudSpeechClient.h"
 #include "WakeWord.h"
+#include <FastLED.h>
+#include "Scheduler.h"
 
 // 保存する質問と回答の最大数
 const int MAX_HISTORY = 5;
@@ -302,6 +304,25 @@ static void newsDispAddText(const String& text) {
   if (start < n) newsDispPush(text.substring(start, n));
 }
 
+// ==== 側面LED（M5GO Bottom2 ベースの SK6812×10、GPIO25） ====
+// Core2 本体の LED は電源インジケーターのみで、側面の RGB LED は拡張ベース
+// M5GO Bottom2 装着時に両側面の SK6812×10 が GPIO25 へ接続される
+// （M5Unified の Core2 ピン表でも GPIO25 は RGBLED 用として定義されている）。
+// 競合確認済み：サーボ 33/32、マイク入力 34、スピーカー I2S 12/0/2、
+// SD SPI 18/23/38/CS4 のいずれとも重ならない。ベース未装着でも
+// GPIO25 に信号が出るだけで無害。駆動は既存依存の FastLED を使う。
+#define SIDE_LED_PIN 25
+#define SIDE_LED_COUNT 10
+#define SIDE_LED_MAX_BRIGHTNESS 48   // 全体の明るさ上限（控えめに）
+CRGB g_side_leds[SIDE_LED_COUNT];
+bool g_led_enable = true;            // 全体の有効/無効（NVS "setting"/"led"、既定ON）
+bool g_led_listening = false;        // 録音中（青）
+bool g_led_thinking = false;         // ChatGPT 応答待ち（紫パルス）
+bool g_led_news_active = false;      // ニュース読み上げ中（カテゴリ色）
+CRGB g_led_news_color = CRGB::White; // 現在のニュースのカテゴリ色
+uint32_t g_led_vol_until = 0;        // 音量ゲージ表示の終了時刻
+uint32_t g_led_ww_until = 0;         // ウェイクワード検出フラッシュの終了時刻
+
 // ニュース表示キューを破棄する（通常会話の開始時などに呼ぶ）
 void newsDispReset() {
   g_news_seg_count = 0;
@@ -309,6 +330,7 @@ void newsDispReset() {
   g_news_disp_active = false;
   g_news_disp_idx = 0;
   g_news_disp_clear_ms = 0;
+  g_led_news_active = false;
 }
 
 // ==== 音量のタッチ操作（5段階） ====
@@ -348,6 +370,10 @@ static const NewsCatDef NEWS_CATS[5] = {
   {"テック",       "テックニュースです。",    -1, "https://news.google.com/rss/search?q=%E3%83%86%E3%82%AF%E3%83%8E%E3%83%AD%E3%82%B8%E3%83%BC&hl=ja&gl=JP&ceid=JP:ja"},
   {"その他",       "その他のニュースです。",   1,  "https://news.google.com/rss/search?q=%E7%A4%BE%E4%BC%9A&hl=ja&gl=JP&ceid=JP:ja"},
 };
+// カテゴリごとの側面LED色（トピックス=白、AI=水色、芸能=ピンク、テック=緑、その他=黄）
+static const CRGB NEWS_CAT_COLORS[5] = {
+  CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0),
+};
 bool g_menu_open = false;        // カテゴリ選択メニュー表示中
 int g_menu_sel = 0;              // 選択中のカテゴリ（0〜4）
 uint32_t g_menu_deadline = 0;    // 最後のタップから約2.5秒後に確定する時刻
@@ -356,6 +382,51 @@ uint32_t g_menu_deadline = 0;    // 最後のタップから約2.5秒後に確�
 // 状態は RAM のみ（再起動で OFF に戻る）
 bool g_periodic_on = false;          // 定期通知モード
 uint32_t g_periodic_next_ms = 0;     // 次回ニュース読み上げの発火時刻
+
+// ==== スケジューラ（AI_StackChan_Ex から移植、第7弾） ====
+// 時刻ベースのコールバック登録エンジン（src/Scheduler.h/.cpp）を使う。
+// 既定の登録は init_schedule()：毎朝7:00 モーニング読み上げ＋時報（7〜23時）。
+// 各項目の ON/OFF は NVS "setting" の s_morning / s_hourly に保存され、
+// /schedule ページから切り替えられる（既定は両方 ON）。
+bool g_sched_morning = true;         // モーニング読み上げ（NVS "setting"/"s_morning"）
+bool g_sched_hourly = true;          // 時報（NVS "setting"/"s_hourly"）
+extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり）で定義
+String exec_news();                  // 実体は後方（ニュース読み上げの節）で定義
+
+// スケジューラの発火可否ゲート：発話中・ニュース表示中・メニュー操作中・
+// ウェイクワード登録中（mode<0）は発火しない。録音〜応答生成（SST_ChatGPT）は
+// loop 内の同期処理のため、その間 run_schedule() 自体が呼ばれず割り込まれない
+static bool scheduler_ready() {
+  return mode >= 0 && !mp3->isRunning() && speech_text == "" && speech_text_buffer == "" &&
+         !g_menu_open && !g_news_disp_active;
+}
+
+// 毎朝7:00：日付の挨拶＋通常ニュース（トピックス＋AI）
+static void sched_fn_morning() {
+  if (!g_sched_morning) return;
+  struct tm t;
+  if (!getLocalTime(&t)) return;
+  static const char* wday[] = {"日", "月", "火", "水", "木", "金", "土"};
+  char buf[96];
+  snprintf(buf, sizeof(buf), "おはようございます。今日は%d月%d日（%s曜日）です。",
+           t.tm_mon + 1, t.tm_mday, wday[t.tm_wday % 7]);
+  exec_news();  // speech_text にニュース本文（失敗時はその旨の文）をセットする
+  speech_text = String(buf) + speech_text;
+}
+
+// 時報：○時です
+static void sched_fn_hourly() {
+  if (!g_sched_hourly) return;
+  struct tm t;
+  if (!getLocalTime(&t)) return;
+  speech_text = String(t.tm_hour) + "時です";
+}
+
+static void init_schedule() {
+  scheduler_set_ready_func(scheduler_ready);
+  add_schedule(new ScheduleEveryDay(7, 0, sched_fn_morning));   // 毎朝7:00 モーニング読み上げ
+  add_schedule(new ScheduleEveryHour(sched_fn_hourly, 7, 23));  // 時報 7:00〜23:00
+}
 DynamicJsonDocument chat_doc(1024*10);
 String json_ChatString = "{\"model\": \"gpt-4o-mini\",\"messages\": [{\"role\": \"user\", \"content\": \"""\"}]}";
 String Role_JSON = "";
@@ -458,6 +529,7 @@ String https_post_json(const char* url, const char* json_string, const char* roo
 
 String chatGpt(String json_string) {
   String response = "";;
+  g_led_thinking = true;   // 側面LED：応答待ち（紫パルス）
   avatar.setExpression(Expression::Doubt);
   avatar.setSpeechText("考え中…");
   String ret = https_post_json("https://api.openai.com/v1/chat/completions", json_string.c_str(), root_ca_openai);
@@ -490,6 +562,7 @@ String chatGpt(String json_string) {
     avatar.setSpeechText("");
     avatar.setExpression(Expression::Neutral);
   }
+  g_led_thinking = false;
   return response;
 }
 
@@ -1038,6 +1111,7 @@ String exec_news() {
       newsDispPush("AIニュース");
       for (int i = 0; i < aiCount; i++) newsDispAddText(aiHeads[i] + "。");
     }
+    g_led_news_color = CRGB::White;  // 通常ニュースのLED色は白
     if (g_news_seg_count > 0) g_news_disp_armed = true;
     speech_text = text;
   } else {
@@ -1076,6 +1150,7 @@ void exec_news_category(int cat) {
     // 表示用セグメント列を構築する（loop の発話開始時に吹き出し表示を開始）
     newsDispPush(c.label);
     for (int i = 0; i < dispCount; i++) newsDispAddText(dispItems[i]);
+    g_led_news_color = NEWS_CAT_COLORS[cat];  // カテゴリ色をLEDに使う
     if (g_news_seg_count > 0) g_news_disp_armed = true;
     speech_text = text;
   } else {
@@ -1214,6 +1289,47 @@ void handle_model() {
   server.send(200, "text/html", html);
 }
 
+// ==== スケジュールとLEDの設定（/schedule ページ、第7弾） ====
+// 引数 morning / hourly / led = on|off で切り替え、NVS "setting" に保存する
+static void schedule_apply_arg(const char* argName, bool& flag, const char* nvsKey) {
+  String v = server.arg(argName);
+  if (v == "on" || v == "off") {
+    flag = (v == "on");
+    uint32_t nvs_handle;
+    if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+      nvs_set_u8(nvs_handle, nvsKey, flag ? 1 : 0);
+      nvs_close(nvs_handle);
+    }
+  }
+}
+
+void handle_schedule() {
+  bool prevMorning = g_sched_morning;
+  bool prevHourly = g_sched_hourly;
+  bool prevLed = g_led_enable;
+  schedule_apply_arg("morning", g_sched_morning, "s_morning");
+  schedule_apply_arg("hourly", g_sched_hourly, "s_hourly");
+  schedule_apply_arg("led", g_led_enable, "led");
+  String message = "";
+  if (g_sched_morning != prevMorning) message += "<p><b>モーニング読み上げを" + String(g_sched_morning ? "ON" : "OFF") + "にしました（本体に保存済み）。</b></p>";
+  if (g_sched_hourly != prevHourly) message += "<p><b>時報を" + String(g_sched_hourly ? "ON" : "OFF") + "にしました（本体に保存済み）。</b></p>";
+  if (g_led_enable != prevLed) message += "<p><b>側面LEDを" + String(g_led_enable ? "ON" : "OFF") + "にしました（本体に保存済み）。</b></p>";
+
+  String html = String(HEAD) + "<body>";
+  html += "<h1>スケジュールとLEDの設定</h1>";
+  html += message;
+  html += "<p>モーニング読み上げ（毎朝7:00に日付＋ニュース）: <b>" + String(g_sched_morning ? "ON" : "OFF") + "</b> "
+          "<a href=\"/schedule?morning=on\">ONにする</a> / <a href=\"/schedule?morning=off\">OFFにする</a></p>";
+  html += "<p>時報（7:00〜23:00の毎正時に「○時です」）: <b>" + String(g_sched_hourly ? "ON" : "OFF") + "</b> "
+          "<a href=\"/schedule?hourly=on\">ONにする</a> / <a href=\"/schedule?hourly=off\">OFFにする</a></p>";
+  html += "<p>側面LED（M5GO Bottom2ベースの SK6812）: <b>" + String(g_led_enable ? "ON" : "OFF") + "</b> "
+          "<a href=\"/schedule?led=on\">ONにする</a> / <a href=\"/schedule?led=off\">OFFにする</a></p>";
+  html += "<p>発話中など本機が忙しいときに発火時刻が来た場合、モーニング読み上げは最大約5分まで延期され、時報はその回をスキップします。設定は本体に保存され、再起動後も使われます。</p>";
+  html += "<p><a href=\"/voice\">声の切り替えはこちら</a> / <a href=\"/model\">AIモデルの切り替えはこちら</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
 AudioOutputM5Speaker out(&M5.Speaker, m5spk_virtual_channel);
 AudioGeneratorMP3 *mp3;
 AudioFileSourceBuffer *buff = nullptr;
@@ -1279,6 +1395,74 @@ void lipSync(void *args)
     avatar->getGaze(&gazeY, &gazeX);
     avatar->setRotation(gazeX * 5);
     delay(50);
+  }
+}
+
+// 側面LED（M5GO Bottom2 の SK6812×10）の状態表示タスク。
+// 録音・応答待ちなどのブロッキング処理中でも光り方を更新できるよう、
+// loop() から独立した専用タスクで駆動する。優先順位は
+// 音量ゲージ > ウェイクワード検出フラッシュ > 録音中 > 応答待ち >
+// 発話中（ニュースはカテゴリ色／通常発話は音量連動の暖色） > 待機（呼吸点滅）。
+// フレームが変化したときだけ FastLED.show() する（静止画中は RMT を止め、
+// 録音などへの割り込み影響を抑える）。
+void ledTask(void *args)
+{
+  (void)args;
+  static CRGB prev_frame[SIDE_LED_COUNT];
+  static bool prev_valid = false;
+  float smooth_level = 0.0f;   // 発話中の明滅用に平滑化した音声レベル
+  for (;;)
+  {
+    CRGB frame[SIDE_LED_COUNT];
+    for (int i = 0; i < SIDE_LED_COUNT; i++) frame[i] = CRGB::Black;
+    uint32_t now = millis();
+
+    if (g_led_enable) {
+      if (now < g_led_vol_until) {
+        // 音量ゲージ：レベル×2 個を緑で点灯（5段階→2/4/6/8/10個）
+        int lit = (int)g_vol_level * 2;
+        for (int i = 0; i < lit && i < SIDE_LED_COUNT; i++) frame[i] = CRGB::Green;
+      } else if (now < g_led_ww_until) {
+        // ウェイクワード検出：白で2回点滅（250ms周期×約1秒）
+        if ((now / 250) % 2 == 0) {
+          for (int i = 0; i < SIDE_LED_COUNT; i++) frame[i] = CRGB::White;
+        }
+      } else if (g_led_listening) {
+        // 録音中：青
+        for (int i = 0; i < SIDE_LED_COUNT; i++) frame[i] = CRGB(0, 70, 180);
+      } else if (g_led_thinking) {
+        // 応答待ち：紫のパルス
+        float ph = 0.5f + 0.5f * sinf(now * 0.008f);
+        CRGB c(150, 0, 255);
+        c.nscale8((uint8_t)(90 + 165 * ph));
+        for (int i = 0; i < SIDE_LED_COUNT; i++) frame[i] = c;
+      } else if (mp3 != nullptr && mp3->isRunning()) {
+        // 発話中：音声レベルに合わせて明滅（ニュースはカテゴリ色、通常発話は暖色）
+        int level = abs(*out.getBuffer());
+        if (level > 15000) level = 15000;
+        float target = 0.30f + 0.70f * ((float)level / 15000.0f);
+        smooth_level += (target - smooth_level) * 0.4f;
+        CRGB base = g_led_news_active ? g_led_news_color : CRGB(255, 170, 60);
+        CRGB c = base;
+        c.nscale8((uint8_t)(255 * smooth_level));
+        for (int i = 0; i < SIDE_LED_COUNT; i++) frame[i] = c;
+      } else {
+        // 待機：ゆっくり呼吸点滅（定期通知モードONの間はオレンジ、通常は暖色）
+        float ph = 0.5f + 0.5f * sinf(now * 0.0016f);
+        CRGB base = g_periodic_on ? CRGB(255, 110, 0) : CRGB(255, 160, 70);
+        CRGB c = base;
+        c.nscale8((uint8_t)(50 + 90 * ph));
+        for (int i = 0; i < SIDE_LED_COUNT; i++) frame[i] = c;
+      }
+    }
+
+    if (!prev_valid || memcmp(prev_frame, frame, sizeof(frame)) != 0) {
+      for (int i = 0; i < SIDE_LED_COUNT; i++) g_side_leds[i] = frame[i];
+      FastLED.show();
+      memcpy(prev_frame, frame, sizeof(frame));
+      prev_valid = true;
+    }
+    delay(30);
   }
 }
 
@@ -1414,6 +1598,7 @@ void Wifi_setup() {
 
 String SpeechToText(bool isGoogle){
   Serial.println("\r\nRecord start!\r\n");
+  g_led_listening = true;   // 側面LED：録音中（青）
 
   String ret = "";
   if( isGoogle) {
@@ -1437,6 +1622,7 @@ String SpeechToText(bool isGoogle){
     delete cloudSpeechClient;
     delete audio;
   }
+  g_led_listening = false;
   return ret;
 }
 
@@ -1505,7 +1691,7 @@ void setup()
     } else {
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
         size_t volume = 180;
-        uint8_t led_onoff = 0;
+        uint8_t led_onoff = 1;   // 側面LED（M5GO Bottom2）の既定は ON（第7弾）
         uint8_t speaker_no = 3;
         nvs_set_u32(nvs_handle, "volume", volume);
         nvs_set_u8(nvs_handle, "led", led_onoff);
@@ -1539,6 +1725,17 @@ void setup()
       nvs_close(nvs_handle);
     }
     applyVolLevel(false);
+  }
+
+  { // 第7弾：スケジュール項目と側面LEDの ON/OFF を NVS "setting" から読み込む（未保存なら既定ON）
+    uint32_t nvs_handle;
+    if (ESP_OK == nvs_open("setting", NVS_READONLY, &nvs_handle)) {
+      uint8_t v;
+      if (ESP_OK == nvs_get_u8(nvs_handle, "s_morning", &v)) g_sched_morning = (v != 0);
+      if (ESP_OK == nvs_get_u8(nvs_handle, "s_hourly", &v)) g_sched_hourly = (v != 0);
+      if (ESP_OK == nvs_get_u8(nvs_handle, "led", &v)) g_led_enable = (v != 0);
+      nvs_close(nvs_handle);
+    }
   }
 
   M5.Lcd.setTextSize(2);
@@ -1651,6 +1848,18 @@ void setup()
   Wifi_setup();
   M5.Lcd.println("\nConnected");
 
+  // 時刻同期（スケジューラ用、第7弾）。現行ファームには NTP 同期が無かったため追加。
+  // JST = UTC+9 固定、サーバは ntp.nict.jp と pool.ntp.org
+  configTime(9 * 3600, 0, "ntp.nict.jp", "pool.ntp.org");
+  {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) {
+      Serial.println("NTP time sync OK");
+    } else {
+      Serial.println("NTP time sync pending (scheduler waits until synced)");
+    }
+  }
+
 #ifdef ENABLE_MDNS
   if (MDNS.begin(MDNS_HOST)) {
     Serial.println("MDNS responder started");
@@ -1687,6 +1896,7 @@ void setup()
   server.on("/voice", handle_voice);
   server.on("/model", handle_model);
   server.on("/news", handle_news);
+  server.on("/schedule", handle_schedule);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
   server.on("/role", handle_role);
   server.on("/role_set", HTTP_POST, handle_role_set);
@@ -1729,6 +1939,15 @@ void setup()
   mp3 = new AudioGeneratorMP3();
 //  mp3->RegisterStatusCB(StatusCallback, (void*)"mp3");
   wakeword_init();
+
+  // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動
+  FastLED.addLeds<SK6812, SIDE_LED_PIN, GRB>(g_side_leds, SIDE_LED_COUNT);
+  FastLED.setBrightness(SIDE_LED_MAX_BRIGHTNESS);
+  FastLED.clear(true);
+  xTaskCreatePinnedToCore(ledTask, "ledTask", 4096, NULL, 1, NULL, 0);
+
+  // スケジューラ登録（毎朝7:00 モーニング読み上げ／時報 7〜23時）
+  init_schedule();
 
   avatar.setFace(new KinakoFace());  // きなこ写真の顔に変更（2026-10-31 本人希望）
   avatar.init(16);  // 写真をカラー表示するため 16bit カラーで初期化（従来は 1bit）
@@ -1858,6 +2077,7 @@ static void change_volume(int delta) {
   bool changed = (nl != (int)g_vol_level);
   g_vol_level = (uint8_t)nl;
   applyVolLevel(changed);
+  g_led_vol_until = millis() + 1200;   // 側面LEDにもゲージを表示（レベル×2個を緑で約1.2秒）
   if (!mp3->isRunning()) {
     sw_tone();
   } else {
@@ -1951,6 +2171,11 @@ void loop()
       g_periodic_next_ms = millis() + 30000UL;
     }
   }
+
+  // スケジューラ（毎朝7:00モーニング読み上げ／時報）。発火可否は scheduler_ready()
+  // で判定し、混雑時の延期・スキップは Scheduler 側で処理する。
+  // 定期通知モードとは独立に動作する
+  run_schedule();
 
   M5.update();
   if (M5.BtnA.wasPressed())
@@ -2128,6 +2353,7 @@ void loop()
     if (g_news_disp_armed && g_news_seg_count > 0) {
       g_news_disp_armed = false;
       g_news_disp_active = true;
+      g_led_news_active = true;   // 側面LED：ニュース再生中はカテゴリ色
       g_news_disp_idx = 0;
       g_news_disp_start_ms = millis();
       g_news_disp_clear_ms = 0;
@@ -2143,6 +2369,7 @@ void loop()
       Serial.println("mp3 stop");
       avatar.setExpression(Expression::Neutral);
       speech_text_buffer = "";
+      g_led_news_active = false;
       delay(200);
       M5.Speaker.end();
       M5.Mic.begin();
@@ -2197,6 +2424,7 @@ void loop()
     if( wakeword_compare()){
         Serial.println("wakeword_compare OK!");
         sw_tone();
+        g_led_ww_until = millis() + 1000;   // 側面LED：検出を白フラッシュで知らせる
         SST_ChatGPT();
     }
   }

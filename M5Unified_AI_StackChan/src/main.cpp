@@ -590,19 +590,27 @@ static void init_schedule() {
 // 従来は発話文全体を1回の合成リクエストで送り、合成が終わるまで再生が
 // 始まらなかった（tts.quest のキュー混雑時は長文で約60秒待ちの実測あり）。
 // 第8弾では文（。！？）単位に分割し、専用の合成タスクが最初の文から順に
-// 合成して、合成できた文から即座に再生する。再生中に次の文を先行合成する
-// （先行は1文分まで）。合成1文の上限は WebVoiceVoxTTS 側で 25 秒とし、
-// 超えた文はスキップして次へ進む。
+// 合成して、合成できた文から即座に再生する。合成1文の上限は
+// WebVoiceVoxTTS 側で 25 秒とし、超えた文はスキップして次へ進む。
 // 状態遷移は loop() 内の tts_drive()（実体は音声再生まわりの後方）が担う。
+// 第9.10弾: 先行合成の深さを1文から最大3文へ広げた（ready キュー化）。
+// 合成+ダウンロードに6〜12秒かかる一方で短い文の再生は2秒未満もあり、
+// 先行1文では文間の無音ギャップが避けられなかったため。さらにセッション
+// 先頭では2文目が揃うまで再生開始を最大5秒だけ待つ（プリバッファ）。
 struct TtsChunk {
   String text;   // 合成する文（チャンク）
   String parms;  // そのチャンクの話者パラメータ（&speaker=N）
 };
-static std::deque<TtsChunk> g_tts_queue;   // 合成待ちチャンク
-static String g_tts_ready_url = "";        // 合成済みの次文URL（有効な間だけ意味を持つ）
-static uint8_t *g_tts_ready_data = nullptr; // 合成済み次文のMP3データ（PSRAM。第9.6弾: メモリ再生用。所有権はスロット保持中は合成タスク側→消費時に再生側へ）
-static size_t g_tts_ready_len = 0;          // g_tts_ready_data のバイト数
-static bool g_tts_ready = false;           // ready_url がセットされた（空URL=合成失敗でスキップ）
+struct TtsReadyItem {
+  String url;         // ストリーム再生用URL（メモリ再生用データがある場合は空）
+  uint8_t *data;      // ダウンロード済みMP3（PSRAM。所有権はキュー保持中は合成タスク側→消費時に再生側へ）
+  size_t len;         // data のバイト数（末尾ガードパディング込み）
+};
+static std::deque<TtsChunk> g_tts_queue;        // 合成待ちチャンク
+static std::deque<TtsReadyItem> g_tts_ready_q;  // 合成済みチャンク（先行キュー）
+static constexpr size_t TTS_READY_MAX = 3;      // 先行合成の最大深さ（第9.10弾）
+static bool g_tts_played_in_session = false;    // このセッションで再生を開始したか（プリバッファ判定用）
+static uint32_t g_tts_prebuf_since = 0;         // 先頭チャンクが ready になってプリバッファ待ちに入った時刻（0=待ちでない）
 static bool g_tts_synth_busy = false;      // 合成タスクが1文を処理中
 static bool g_speech_session = false;      // 発話セッション中（投入〜全チャンク再生完了）
 static SemaphoreHandle_t g_tts_mutex = nullptr;
@@ -683,7 +691,11 @@ static void tts_enqueue(const String& text, const String& parms) {
   if (g_tts_mutex == nullptr) g_tts_mutex = xSemaphoreCreateMutex();
   xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
   for (auto& c : chunks) g_tts_queue.push_back(c);
-  if (!g_speech_session) g_speech_session = true;
+  if (!g_speech_session) {
+    g_speech_session = true;
+    g_tts_played_in_session = false;  // 第9.10弾: 新セッションではプリバッファ判定をリセット
+    g_tts_prebuf_since = 0;
+  }
   xSemaphoreGive(g_tts_mutex);
   Serial.printf("[TTS] enqueue %u chunk(s)\n", (unsigned)chunks.size());
 }
@@ -1740,6 +1752,69 @@ AudioFileSourceHTTPSStream *file = nullptr;
 AudioFileSourcePROGMEM *memfile = nullptr;   // メモリ再生用ソース（第9.6弾）
 static uint8_t *g_play_data = nullptr;       // 再生中のMP3データ（PSRAM。再生側が所有し、再生終了時に解放）
 
+// ==== 再生計測ログ（第9.10弾） ====
+// 「再生が実時間より遅いのか」「途中で止まっているのか」を実機ログから
+// 切り分けるため、再生開始時に想定音声長を出し、終了時に実所要時間と
+// 消費バイト数を出す。想定音声長は先頭フレームヘッダから求める
+// （tts.quest のMP3は CBR 固定: MPEG2 L3 160kbps/24kHz・480B/フレーム・
+// 24ms/フレームを実測で確認済み。一般の L3 ヘッダでも計算できる）。
+static uint32_t g_play_start_ms = 0;    // 再生開始 millis（0=計測中でない）
+static uint32_t g_play_data_len = 0;    // 再生中データの総バイト数（メモリ再生時）
+static int32_t  g_play_expect_ms = -1;  // 想定音声長ms（-1=不明／ストリーム再生）
+
+static int32_t mp3_expected_duration_ms(const uint8_t *d, size_t len) {
+  if (d == nullptr || len < 4) return -1;
+  size_t off = 0;
+  if (len >= 10 && d[0] == 'I' && d[1] == 'D' && d[2] == '3') {
+    off = 10 + (((size_t)(d[6] & 0x7F) << 21) | ((size_t)(d[7] & 0x7F) << 14) |
+                ((size_t)(d[8] & 0x7F) << 7) | (size_t)(d[9] & 0x7F));
+    if (off + 4 > len) return -1;
+  }
+  uint32_t h = ((uint32_t)d[off] << 24) | ((uint32_t)d[off + 1] << 16) |
+               ((uint32_t)d[off + 2] << 8) | (uint32_t)d[off + 3];
+  if ((h >> 21) != 0x7FF) return -1;              // 同期ワード
+  int ver = (h >> 19) & 3;                        // 3=MPEG1, 2=MPEG2, 0=MPEG2.5
+  int layer = (h >> 17) & 3;                      // 1=Layer III
+  int bri = (h >> 12) & 0xF;
+  int sri = (h >> 10) & 3;
+  int pad = (h >> 9) & 1;
+  if (layer != 1 || bri == 0 || bri == 0xF || sri == 3 || ver == 1) return -1;
+  static const int br_mpeg1[15] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320};
+  static const int br_mpeg2[15] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160};
+  static const int sr_base[3] = {44100, 48000, 32000};
+  int br = ((ver == 3) ? br_mpeg1[bri] : br_mpeg2[bri]) * 1000;
+  int sr = sr_base[sri] >> ((ver == 3) ? 0 : (ver == 2) ? 1 : 2);
+  if (br <= 0 || sr <= 0) return -1;
+  int frame_len = ((ver == 3) ? (144 * br / sr) : (72 * br / sr)) + pad;
+  int samples = (ver == 3) ? 1152 : 576;
+  if (frame_len <= 0) return -1;
+  size_t frames = (len - off) / (size_t)frame_len;  // 末尾ガード(64B)は1フレーム未満なので切り捨てで吸収
+  return (int32_t)(frames * (size_t)samples * 1000 / (size_t)sr);
+}
+
+// 再生終了時の計測ログ。ソース解放（tts_cleanup_playback_sources）の前に呼ぶこと。
+// reason: consumed が総量にほぼ達していれば natural（末尾まで再生）。
+// 大きく残っていれば early-stop（途中でデコードが止まった）。
+// elapsed と expect（話速を加味した expect_wall）を比べれば、再生が
+// 実時間より遅かったかどうかも分かる。
+static void tts_log_play_end() {
+  if (g_play_start_ms == 0) return;
+  uint32_t elapsed = millis() - g_play_start_ms;
+  uint32_t consumed = (memfile != nullptr) ? memfile->getPos() : 0;
+  int32_t wall = (g_play_expect_ms >= 0 && TTS_SPEED_RATE > 0.1f)
+                     ? (int32_t)(g_play_expect_ms / TTS_SPEED_RATE) : -1;
+  const char *reason = "stream";
+  if (g_play_data_len > 0) {
+    reason = (consumed >= g_play_data_len || g_play_data_len - consumed <= 8192) ? "natural" : "early-stop";
+  }
+  Serial.printf("[TTS] mp3 stop: elapsed=%ums expect=%dms expect_wall=%dms consumed=%u/%uB reason=%s\n",
+                (unsigned)elapsed, (int)g_play_expect_ms, (int)wall,
+                (unsigned)consumed, (unsigned)g_play_data_len, reason);
+  g_play_start_ms = 0;
+  g_play_data_len = 0;
+  g_play_expect_ms = -1;
+}
+
 bool playMP3(AudioFileSource *src){
   return mp3->begin(src, &out);
 }
@@ -1754,8 +1829,8 @@ static void tts_cleanup_playback_sources() {
 }
 
 // 文単位パイプラインTTS: 合成専用タスク（第8弾）。
-// キューから1文を取り出して合成し、結果URLを ready スロットへ置く。
-// ready スロットが埋まっている間は次の合成をしない（先行合成は1文分まで）。
+// キューから1文を取り出して合成し、結果を ready キューへ積む。
+// ready キューが上限（第9.10弾: 3文）に達している間は次の合成をしない。
 // 合成はブロッキング処理なので、再生デコードを行う loop とは別タスクにして
 // 再生中の音切れを防ぐ。TLS を使うためスタックは大きめに確保する。
 void ttsSynthTask(void *args)
@@ -1767,7 +1842,7 @@ void ttsSynthTask(void *args)
     bool have = false;
     uint32_t gen = 0;
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
-    if (!g_tts_ready && !g_tts_queue.empty()) {
+    if (g_tts_ready_q.size() < TTS_READY_MAX && !g_tts_queue.empty()) {
       chunk = g_tts_queue.front();
       g_tts_queue.pop_front();
       g_tts_synth_busy = true;
@@ -1808,11 +1883,13 @@ void ttsSynthTask(void *args)
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
     // 中断などで世代が進んでいたら、この合成結果は破棄する（再生させない）
     if (gen == g_tts_gen) {
-      g_tts_ready_url = readyUrl;
-      g_tts_ready_data = dlData;
-      g_tts_ready_len = dlLen;
-      g_tts_ready = true;
-      dlData = nullptr;  // 所有権は ready スロットへ移った
+      TtsReadyItem item;
+      item.url = readyUrl;
+      item.data = dlData;
+      item.len = dlLen;
+      g_tts_ready_q.push_back(item);
+      dlData = nullptr;  // 所有権は ready キューへ移った
+      Serial.printf("[TTS] ready queue: %u chunk(s) stocked\n", (unsigned)g_tts_ready_q.size());
     }
     g_tts_synth_busy = false;
     xSemaphoreGive(g_tts_mutex);
@@ -1843,25 +1920,55 @@ void tts_drive()
 {
   if (mp3 == nullptr || mp3->isRunning()) return;
 
-  if (g_tts_ready) {
+  // ready キューの状態をスナップショットする
+  bool has_ready;
+  bool more_coming;
+  size_t ready_n;
+  xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+  has_ready = !g_tts_ready_q.empty();
+  more_coming = !g_tts_queue.empty() || g_tts_synth_busy;
+  ready_n = g_tts_ready_q.size();
+  xSemaphoreGive(g_tts_mutex);
+
+  if (has_ready) {
+    // 第9.10弾: プリバッファ。セッション先頭では、後続チャンクがまだ
+    // 来る見込みがあり ready が1文だけなら、2文目が揃うまで再生開始を
+    // 最大5秒だけ待つ（短い文が続いたときの文間ギャップ対策）。
+    if (!g_tts_played_in_session && more_coming && ready_n < 2) {
+      uint32_t now = millis();
+      if (g_tts_prebuf_since == 0) {
+        g_tts_prebuf_since = now;
+        Serial.println("[TTS] prebuffer: hold first play until 2nd chunk is ready (max 5s)");
+      }
+      if (now - g_tts_prebuf_since < 5000) return;
+      Serial.println("[TTS] prebuffer: timeout, start with 1 chunk");
+    }
+    g_tts_prebuf_since = 0;
+
     String url;
     uint8_t *data = nullptr;
     size_t len = 0;
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
-    url = g_tts_ready_url;
-    data = g_tts_ready_data;
-    len = g_tts_ready_len;
-    g_tts_ready = false;
-    g_tts_ready_url = "";
-    g_tts_ready_data = nullptr;
-    g_tts_ready_len = 0;
+    TtsReadyItem item = g_tts_ready_q.front();
+    g_tts_ready_q.pop_front();
+    url = item.url;
+    data = item.data;
+    len = item.len;
     xSemaphoreGive(g_tts_mutex);
     if (data != nullptr) {
       // 第9.6弾: メモリ再生（再生用にTLSを張らない）
       tts_cleanup_playback_sources();
       g_play_data = data;  // 所有権は再生側へ（再生終了時に後片付けで解放）
       if (voicevox_play_memory(data, len)) {
-        Serial.println("[TTS] play start (memory)");
+        // 第9.10弾: 再生計測の開始（想定音声長は先頭フレームから算出）
+        g_play_start_ms = millis();
+        g_play_data_len = (uint32_t)len;
+        g_play_expect_ms = mp3_expected_duration_ms(data, len);
+        int32_t wall = (g_play_expect_ms >= 0 && TTS_SPEED_RATE > 0.1f)
+                           ? (int32_t)(g_play_expect_ms / TTS_SPEED_RATE) : -1;
+        Serial.printf("[TTS] play start (memory): %uB expect=%dms expect_wall=%dms\n",
+                      (unsigned)len, (int)g_play_expect_ms, (int)wall);
+        g_tts_played_in_session = true;
         tts_on_play_started();
         return;
       }
@@ -1875,7 +1982,11 @@ void tts_drive()
       // ストリーム再生（ダウンロード上限超過時のフォールバック）
       tts_cleanup_playback_sources();
       if (voicevox_play_url(url)) {
+        g_play_start_ms = millis();   // 第9.10弾: 所要時間だけ計測（想定長は不明）
+        g_play_data_len = 0;
+        g_play_expect_ms = -1;
         Serial.println("[TTS] play start");
+        g_tts_played_in_session = true;
         tts_on_play_started();
         return;
       }
@@ -1886,10 +1997,11 @@ void tts_drive()
     return;
   }
 
-  // セッション終了判定：投入済みチャンクが残っておらず合成も終わっている
+  // セッション終了判定：投入済みチャンクが残っておらず合成も終わっていて、
+  // ready キューにも残っていない
   bool pending;
   xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
-  pending = !g_tts_queue.empty() || g_tts_synth_busy;
+  pending = !g_tts_queue.empty() || g_tts_synth_busy || !g_tts_ready_q.empty();
   xSemaphoreGive(g_tts_mutex);
   if (g_speech_session && !pending) {
     g_speech_session = false;
@@ -1907,6 +2019,12 @@ void tts_drive()
     delay(200);
     M5.Speaker.end();
     M5.Mic.begin();
+    // 第9.10弾: I2S登録失敗ログの発生源を切り分けるためのマーカー。
+    // この直後に I2S エラーが1回出るのは M5Unified の仕様どおりの
+    // ハンドオーバ（Speaker.end はドライバを解放しないため、Mic.begin の
+    // 初回 install が競合→自動復旧する）。マーカー無しでエラーが頻発する
+    // 場合は、別の呼び出し元が begin/end を繰り返していることになる。
+    Serial.println("[AUDIO] handover spk->mic (session end)");
     if (wakeword_is_enable) mode = 1;
     else mode = 0;
   }
@@ -1921,14 +2039,15 @@ static void stop_news_speech() {
   xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
   g_tts_gen++;  // 合成中の文があっても、その結果は再生させない
   while (!g_tts_queue.empty()) g_tts_queue.pop_front();
-  g_tts_ready = false;
-  g_tts_ready_url = "";
-  if (g_tts_ready_data != nullptr) {  // ダウンロード済みMP3も破棄する（第9.6弾）
-    heap_caps_free(g_tts_ready_data);
-    g_tts_ready_data = nullptr;
-    g_tts_ready_len = 0;
+  // 先行合成済みチャンクも全て破棄する（第9.10弾: ready キュー化に追随。
+  // 所有権の一元管理は従来どおりここで解放する）
+  while (!g_tts_ready_q.empty()) {
+    TtsReadyItem item = g_tts_ready_q.front();
+    g_tts_ready_q.pop_front();
+    if (item.data != nullptr) heap_caps_free(item.data);
   }
   g_tts_synth_busy = false;
+  g_tts_prebuf_since = 0;
   xSemaphoreGive(g_tts_mutex);
   if (mp3 != nullptr && mp3->isRunning()) mp3->stop();
   g_tts_release_req = true;  // 第9.8弾: 中断時も TTS 接続ペアの解放を依頼する
@@ -2588,21 +2707,35 @@ void setup()
   delay(3000);
 
   audioLogger = &Serial;
-  // 第9.8弾: MP3デコーダの作業領域（約38KB。mad_frame 約21KB＋mad_synth
+  // MP3デコーダの作業領域（約38KB。mad_frame 約21KB＋mad_synth
   // 約13KB＋入力バッファ等）は、従来 begin() のたびに内蔵ヒープへ
   // malloc され stop() で free されており、大きな断片化要因になっていた。
-  // ライブラリの preallocation 経路で PSRAM 上の領域を使わせ、内蔵ヒープ
-  // から排除する（再生中に先行合成の TLS が内蔵ヒープを使えるようにもなる）。
+  // 第9.8弾ではライブラリの preallocation 経路で PSRAM に置いたが、
+  // 「PSRAM 上の作業領域ではデコードが実時間に追いつかず途切れる」
+  // 仮説が残ったため、第9.10弾では配置方針を変更する:
+  // 起動時（この時点では内蔵ヒープがほぼ空で最大連続ブロックが大きい）
+  // に内蔵ヒープから確保して常駐させ、確保できない場合のみ PSRAM へ
+  // フォールバックする。どちらに置いたかと確保前後の最大連続ブロックを
+  // 起動ログに残し、次回ログで仮説検証できるようにする。
+  // なお確保した領域はデバイスの寿命中ずっと保持する（解放しない）。
   {
     size_t mp3WsSize = (size_t)AudioGeneratorMP3::preAllocSize();
-    void *mp3Ws = ps_malloc(mp3WsSize);
+    size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    void *mp3Ws = heap_caps_malloc(mp3WsSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const char *mp3WsPlace = "internal heap";
+    if (mp3Ws == nullptr) {
+      mp3Ws = ps_malloc(mp3WsSize);
+      mp3WsPlace = "PSRAM (fallback)";
+    }
     if (mp3Ws != nullptr) {
       mp3 = new AudioGeneratorMP3(mp3Ws, (int)mp3WsSize);
-      Serial.printf("[BOOT] mp3 workspace: %u bytes in PSRAM\n", (unsigned)mp3WsSize);
+      Serial.printf("[BOOT] mp3 workspace: %u bytes in %s (boot-time, resident; largest internal block before=%u after=%u)\n",
+                    (unsigned)mp3WsSize, mp3WsPlace, (unsigned)largestBefore,
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     }
     if (mp3 == nullptr) {
       mp3 = new AudioGeneratorMP3();
-      Serial.printf("[BOOT] mp3 workspace: %u bytes in internal heap (fallback)\n", (unsigned)mp3WsSize);
+      Serial.printf("[BOOT] mp3 workspace: prealloc failed (%u bytes); default per-begin allocation\n", (unsigned)mp3WsSize);
     }
   }
 //  mp3->RegisterStatusCB(StatusCallback, (void*)"mp3");
@@ -2693,6 +2826,7 @@ void switch_monologue_mode(){
 }
 
 void sw_tone(){
+      Serial.println("[AUDIO] handover via sw_tone");  // 第9.10弾: I2S切り分け用マーカー
       M5.Mic.end();
         M5.Speaker.tone(1000, 100);
       delay(500);
@@ -3269,6 +3403,7 @@ void loop()
     speech_text = "";
     M5.Mic.end();
     M5.Speaker.begin();
+    Serial.println("[AUDIO] handover mic->spk (speech start)");  // 第9.10弾: I2S切り分け用マーカー
     mode = 0;
     // 第8弾: 文単位パイプラインへ投入する。合成は専用タスクが文ごとに非同期で
     // 行い、最初の文の合成が終わり次第 tts_drive() が再生を始める。
@@ -3293,8 +3428,8 @@ void loop()
   if (mp3->isRunning()) {
     if (!mp3->loop()) {
       mp3->stop();
+      tts_log_play_end();  // 第9.10弾: 再生計測ログ（ソース解放前に消費バイト数を読む）
       tts_cleanup_playback_sources();  // ストリーム/メモリ両対応の後片付け（第9.6弾）
-      Serial.println("mp3 stop");
       // 発話セッションの終了処理（表情・Mic・mode の復帰）は、続きの文が
       // 無いことを確認してから tts_drive() が行う（文ごとに繰り返さない）
     }

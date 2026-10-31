@@ -1,8 +1,7 @@
-// pose_img.h - ポーズ画像12種 (320x240 JPEG) の宣言（第9弾）
+// pose_img.h - ポーズ画像12種 (320x240 JPEG) の宣言（第9弾／第9.7弾で黒バック化）
 //
-// 素材は pose_assets/pose01..12.jpg。外周の水色フレームを除いた内側を
-// 240x240 にし、左右を背景クリーム色で埋めて 320x240 にしたものを
-// gen_v9_assets.py で変換・埋め込みした。実データは pose_img.cpp。
+// 素材は pose_assets/pose01..12.jpg。背景を黒に置き換えた版を
+// gen_black_assets.py で変換・埋め込みした。実データは pose_img.cpp。
 #ifndef POSE_IMG_H_
 #define POSE_IMG_H_
 

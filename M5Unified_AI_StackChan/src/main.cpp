@@ -9,6 +9,9 @@ static bool audioRunning();
 #include <M5Unified.h>
 #include <nvs.h>
 #include <Avatar.h>
+#if !defined(STACKCHAN_AVATAR_GFX_LOCKED) || STACKCHAN_AVATAR_GFX_LOCKED != 0x0913
+#error "Use the vendored M5Stack-Avatar with the shared graphics lock"
+#endif
 #include "KinakoFace.h"  // きなこ写真の顔（カスタムFace）※PenguinFace.h は残置
 #include "pose_img.h"    // ポーズ画像12種（第9弾）
 #include "dance_mjpeg.h" // ダンス動画（モーションJPEG、第9弾）
@@ -2425,6 +2428,11 @@ void setup()
 //cfg.external_spk_detail.omit_spk_hat    = true; // exclude SPK HAT
 //  cfg.output_power = true;
   M5.begin(cfg);
+  if (!g_gfx_mutex || stackchan_avatar_gfx_lock_revision() != STACKCHAN_AVATAR_GFX_LOCKED) {
+    Serial.println("[BOOT] FATAL: graphics lock unavailable");
+    for (;;) delay(1000);
+  }
+  Serial.println("[BOOT] Avatar gfx lock: vendored-v9.13 (shared mutex, draw stack=8192)");
 
   // 起動時診断（第8弾）: リセット要因と空きヒープを Serial と画面に出す。
   // 異常リセット（パニック/ウォッチドッグ/電圧低下）の切り分けを
@@ -2791,7 +2799,7 @@ void setup()
     Serial.println("[BOOT] FATAL: MP3 decoder task unavailable");
     for (;;) delay(1000);
   }
-  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 v9.12)");
+  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 v9.13)");
   wakeword_init();
 
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動

@@ -2710,23 +2710,19 @@ void setup()
   // MP3デコーダの作業領域（約38KB。mad_frame 約21KB＋mad_synth
   // 約13KB＋入力バッファ等）は、従来 begin() のたびに内蔵ヒープへ
   // malloc され stop() で free されており、大きな断片化要因になっていた。
-  // 第9.8弾ではライブラリの preallocation 経路で PSRAM に置いたが、
-  // 「PSRAM 上の作業領域ではデコードが実時間に追いつかず途切れる」
-  // 仮説が残ったため、第9.10弾では配置方針を変更する:
-  // 起動時（この時点では内蔵ヒープがほぼ空で最大連続ブロックが大きい）
-  // に内蔵ヒープから確保して常駐させ、確保できない場合のみ PSRAM へ
-  // フォールバックする。どちらに置いたかと確保前後の最大連続ブロックを
-  // 起動ログに残し、次回ログで仮説検証できるようにする。
+  // 第9.8弾ではライブラリの preallocation 経路で PSRAM に置いた。
+  // 第9.10弾では「PSRAM 上ではデコードが実時間に追いつかない」仮説の
+  // 検証として、起動時に内蔵ヒープから常駐確保する方式へ変更したが、
+  // 実機では内蔵ヒープの常時圧迫により TLS ハンドシェイクがメモリ不足
+  // （X509/SSL/PK の Allocation failed）で全滅し、音声が流れなくなった。
+  // 第9.11弾: 配置を第9.8弾の PSRAM へ戻す（回復優先）。確保は起動時に
+  // 行い常駐させる点と、配置先を起動ログに残す点は維持する。
   // なお確保した領域はデバイスの寿命中ずっと保持する（解放しない）。
   {
     size_t mp3WsSize = (size_t)AudioGeneratorMP3::preAllocSize();
     size_t largestBefore = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-    void *mp3Ws = heap_caps_malloc(mp3WsSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    const char *mp3WsPlace = "internal heap";
-    if (mp3Ws == nullptr) {
-      mp3Ws = ps_malloc(mp3WsSize);
-      mp3WsPlace = "PSRAM (fallback)";
-    }
+    void *mp3Ws = ps_malloc(mp3WsSize);
+    const char *mp3WsPlace = "PSRAM";
     if (mp3Ws != nullptr) {
       mp3 = new AudioGeneratorMP3(mp3Ws, (int)mp3WsSize);
       Serial.printf("[BOOT] mp3 workspace: %u bytes in %s (boot-time, resident; largest internal block before=%u after=%u)\n",

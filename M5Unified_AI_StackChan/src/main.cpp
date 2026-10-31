@@ -7,6 +7,8 @@
 #include <nvs.h>
 #include <Avatar.h>
 #include "KinakoFace.h"  // きなこ写真の顔（カスタムFace）※PenguinFace.h は残置
+#include "pose_img.h"    // ポーズ画像12種（第9弾）
+#include "dance_mjpeg.h" // ダンス動画（モーションJPEG、第9弾）
 
 #include <AudioOutput.h>
 #include <AudioFileSourceBuffer.h>
@@ -252,6 +254,14 @@ volatile bool g_caption_show = false;
 volatile uint8_t g_caption_front = 0;
 char g_caption_buf[2][2][128];
 
+// ==== ポーズ画像の切り替え状態（第9弾） ====
+// 優先順位と復帰先はここ（main.cpp 側）で一元管理し、描画側 (KinakoFace) は
+// 「一時ポーズ（期限内）> 状態ポーズ > 表情連動 > 待機（ピース）」の順で読む。
+volatile int g_pose_state = -1;             // 状態ポーズ（会話開始・発話セッション中）
+volatile int g_pose_timed = -1;             // 一時ポーズ（ウェイク検出のジャンプ等）
+volatile uint32_t g_pose_timed_until = 0;   // 一時ポーズの終了時刻 (millis)
+static int g_pending_pose = -1;             // 次の発話セッションで使うポーズ（発話のセット側が指定し、loop の発話開始時に消費）
+
 static void captionHide() { g_caption_show = false; }
 
 static void captionShowUnit(int idx) {
@@ -401,6 +411,7 @@ bool g_led_news_active = false;      // ニュース読み上げ中（カテゴ�
 CRGB g_led_news_color = CRGB::White; // 現在のニュースのカテゴリ色
 uint32_t g_led_vol_until = 0;        // 音量ゲージ表示の終了時刻
 uint32_t g_led_ww_until = 0;         // ウェイクワード検出フラッシュの終了時刻
+uint32_t g_led_dance_until = 0;      // ダンス動画再生中の色サイクル終了時刻（第9弾）
 
 // 字幕キューを破棄する（通常会話の開始時などに呼ぶ）
 void captionReset() {
@@ -477,6 +488,7 @@ bool g_sched_morning = true;         // モーニング読み上げ（NVS "setti
 bool g_sched_hourly = true;          // 時報（NVS "setting"/"s_hourly"）
 extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり）で定義
 String exec_news();                  // 実体は後方（ニュース読み上げの節）で定義
+static bool play_dance_video();      // 実体は後方（SST_ChatGPT の直前）で定義。第9弾
 
 // スケジューラの発火可否ゲート：発話中・ニュース表示中・メニュー操作中・
 // ウェイクワード登録中（mode<0）は発火しない。録音〜応答生成（SST_ChatGPT）は
@@ -495,6 +507,7 @@ static void sched_fn_morning() {
   char buf[96];
   snprintf(buf, sizeof(buf), "おはようございます。今日は%d月%d日（%s曜日）です。",
            t.tm_mon + 1, t.tm_mday, wday[t.tm_wday % 7]);
+  g_pending_pose = POSE_RUN;  // 第9弾: モーニングの発話中は「走る」ポーズ（ニュースのサムズアップより優先）
   exec_news();  // speech_text にニュース本文（失敗時はその旨の文）をセットする
   speech_text = String(buf) + speech_text;
 }
@@ -827,6 +840,7 @@ void handle_chat() {
   if(speech_text=="" && speech_text_buffer == "") {
     response = chatGpt(json_string);
     speech_text = response;
+    g_pending_pose = POSE_LAUGH;  // 第9弾: 会話応答の再生中は「笑う」ポーズ
     // 会話応答文も2行字幕の対象にする（発話の再生開始時に表示）
     capBuildFromText(response);
     g_led_news_color = CRGB::White;
@@ -883,6 +897,7 @@ void exec_chatGPT(String text) {
   if(speech_text=="" && speech_text_buffer == "") {
     response = chatGpt(json_string);
     speech_text = response;
+    g_pending_pose = POSE_LAUGH;  // 第9弾: 会話応答の再生中は「笑う」ポーズ
     // 会話応答文も2行字幕の対象にする（発話の再生開始時に表示）
     capBuildFromText(response);
     g_led_news_color = CRGB::White;
@@ -1711,6 +1726,7 @@ void tts_drive()
     avatar.setExpression(Expression::Neutral);
     speech_text_buffer = "";
     g_news_playing = false;
+    g_pose_state = -1;  // 第9弾: セッション終了でポーズを待機/表情連動へ戻す
     g_led_news_active = false;
     if (g_cap_armed) captionReset();  // 全文の合成失敗などで再生されなかった場合
     delay(200);
@@ -1740,6 +1756,7 @@ static void stop_news_speech() {
   speech_text = "";
   speech_text_buffer = "";
   g_news_playing = false;
+  g_pose_state = -1;  // 第9弾: 中断時もポーズを待機/表情連動へ戻す
   captionReset();  // 字幕キュー破棄・字幕パネル消去・LEDのニュース色解除
   // 中断フィードバック：確認音＋吹き出しに短く表示（loop 側で約1.5秒後に消す）
   M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level]);
@@ -1809,7 +1826,8 @@ void lipSync(void *args)
 // 側面LED（M5GO Bottom2 の SK6812×10）の状態表示タスク。
 // 録音・応答待ちなどのブロッキング処理中でも光り方を更新できるよう、
 // loop() から独立した専用タスクで駆動する。優先順位は
-// 音量ゲージ > ウェイクワード検出フラッシュ > 録音中 > 応答待ち >
+// ダンス動画再生中（色サイクル） > 音量ゲージ > ウェイクワード検出フラッシュ >
+// 録音中 > 応答待ち >
 // 発話中（ニュースはカテゴリ色／通常発話は音量連動の暖色） > 待機（呼吸点滅）。
 // フレームが変化したときだけ FastLED.show() する（静止画中は RMT を止め、
 // 録音などへの割り込み影響を抑える）。
@@ -1826,7 +1844,12 @@ void ledTask(void *args)
     uint32_t now = millis();
 
     if (g_led_enable) {
-      if (now < g_led_vol_until) {
+      if (now < g_led_dance_until) {
+        // ダンス動画再生中：色相を回しながら低輝度でサイクル（全体上限でさらに抑制）
+        for (int i = 0; i < SIDE_LED_COUNT; i++) {
+          frame[i] = CHSV((uint8_t)(now / 12 + i * 25), 210, 120);
+        }
+      } else if (now < g_led_vol_until) {
         // 音量ゲージ：レベル×2 個を緑で点灯（6段階→0/2/4/6/8/10個）
         int lit = (int)g_vol_level * 2;
         for (int i = 0; i < lit && i < SIDE_LED_COUNT; i++) frame[i] = CRGB::Green;
@@ -2410,6 +2433,13 @@ void setup()
   box_vol_down.setupBox(230, 170, 90, 70);
   box_cat_prev.setupBox(0, 0, 90, 70);
   box_cat_next.setupBox(0, 170, 90, 70);
+
+  // 第9弾: 起動時にダンス動画を1回だけ再生する（タップ/ボタンでスキップ可）。
+  // Wi-Fi 未設定の場合は Wifi_setup() の SmartConfig 待ち→再起動ループに
+  // なるため setup 自体がここまで到達せず、初期設定を妨げることはない。
+  if (WiFi.status() == WL_CONNECTED) {
+    play_dance_video();
+  }
 }
 
 String random_words[18] = {"あなたは誰","楽しい","怒った","可愛い","悲しい","眠い","ジョークを言って","泣きたい","怒ったぞ","こんにちは","お疲れ様","詩を書いて","疲れた","お腹空いた","嫌いだ","苦しい","俳句を作って","歌をうたって"};
@@ -2426,7 +2456,8 @@ void report_batt_level(){
   else
     sprintf(buff,"バッテリーのレベルは%d％です。",level);
   avatar.setExpression(Expression::Happy);
-  mode = 0; 
+  mode = 0;
+  g_pending_pose = POSE_THUMBSUP;  // 第9弾: バッテリー報告中は「サムズアップ」
   speech_text = String(buff);
   delay(1000);
   avatar.setExpression(Expression::Neutral);
@@ -2459,8 +2490,78 @@ void sw_tone(){
       M5.Mic.begin();
 }
 
+// ==== ダンス動画再生（第9弾） ====
+// 埋め込みモーションJPEG (dance_mjpeg.h、12fps/320x240/120フレーム) の
+// 連結 JPEG を順に LCD へ直接描画する。再生中は Avatar の描画タスクを
+// suspend して干渉を防ぎ、終了後に resume する（setExpression は呼ばない
+// こと。それ自体が suspend/resume を含むため）。
+// 中断条件：画面タップ（どこでも）または物理ボタン A/B/C の押下。
+// 1フレームも描けなかった場合（データ/デコード異常）は「踊る」ポーズ画像の
+// 一時表示で代替し false を返す。最後まで再生したら true。
+static bool play_dance_video() {
+  const uint8_t *data = dance_mjpeg;
+  const uint32_t len = dance_mjpeg_len;
+  if (data == nullptr || len < 1024) {
+    g_pose_timed = POSE_DANCE;
+    g_pose_timed_until = millis() + 9400;
+    return false;
+  }
+  avatar.suspend();
+  delay(40);  // 描画タスクが現在のフレームを描き終えるのを待つ
+  g_led_dance_until = millis() + 10500;  // 側面LED：再生中は色サイクル
+  const uint32_t frame_ms = 1000 / 12;   // 12fps
+  const uint32_t t0 = millis();
+  uint32_t pos = 0;
+  int frame_no = 0;
+  bool completed = true;
+  bool drew_any = false;
+  while (pos < len) {
+    // フレーム先頭 (SOI: FF D8) を探す
+    while (pos + 1 < len && !(data[pos] == 0xFF && data[pos + 1] == 0xD8)) pos++;
+    if (pos + 1 >= len) break;
+    uint32_t fstart = pos;
+    pos += 2;
+    // フレーム終端 (EOI: FF D9) を探す
+    while (pos + 1 < len && !(data[pos] == 0xFF && data[pos + 1] == 0xD9)) pos++;
+    if (pos + 1 >= len) { completed = false; break; }
+    uint32_t flen = (pos + 2) - fstart;
+    pos += 2;
+
+    // 中断チェック（タップ／物理ボタン）
+    M5.update();
+    bool interrupt = M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed();
+    if (!interrupt && M5.Touch.getCount() > 0) {
+      auto td = M5.Touch.getDetail();
+      interrupt = td.wasPressed();
+    }
+    if (interrupt) { completed = false; break; }
+
+    // 表示タイミング：経過時間から出すべきフレーム番号を求め、
+    // デコード遅延で遅れていたら中間のフレームを読み飛ばして追いつく
+    uint32_t elapsed = millis() - t0;
+    int should = (int)(elapsed / frame_ms);
+    if (frame_no < should) { frame_no++; continue; }  // コマ落とし
+    uint32_t target = (uint32_t)frame_no * frame_ms;
+    if (target > elapsed && target - elapsed <= frame_ms) delay(target - elapsed);
+    if (!M5.Lcd.drawJpg(&data[fstart], flen, 0, 0)) { completed = false; break; }
+    drew_any = true;
+    frame_no++;
+  }
+  g_led_dance_until = 0;
+  avatar.resume();
+  Serial.printf("[DANCE] frames=%d (%s)\n", frame_no, completed ? "complete" : "stopped");
+  if (!drew_any) {
+    // 再生できなかった場合はポーズ画像で代替表示する
+    g_pose_timed = POSE_DANCE;
+    g_pose_timed_until = millis() + 9400;
+    return false;
+  }
+  return completed;
+}
+
 void SST_ChatGPT() {
         captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する（ニュース分岐では exec_news が再構築する）
+        g_pose_state = POSE_WAVE;  // 第9弾: 会話開始（挨拶〜聞き取り中）は「手振り」
         bool prev_servo_home = servo_home;
         random_speak = true;
         random_time = -1;
@@ -2490,6 +2591,12 @@ void SST_ChatGPT() {
               avatar.setExpression(Expression::Happy);
               avatar.setSpeechText("ニュースです");
               exec_news();
+            } else if (ret.indexOf("踊") >= 0 || ret.indexOf("ダンス") >= 0) {
+              // ダンス動画も ChatGPT を経由しない特例（会話履歴には入れない）
+              Serial.println("[DANCE] voice trigger");
+              play_dance_video();
+              g_pending_pose = POSE_LAUGH;
+              speech_text = "踊ってみたよ。";
             } else {
               exec_chatGPT(ret);
             }
@@ -2502,7 +2609,10 @@ void SST_ChatGPT() {
           delay(2000);
           avatar.setSpeechText("");
           avatar.setExpression(Expression::Neutral);
-        } 
+        }
+        // 第9弾: 会話開始ポーズ（手振り）を解除する。発話が始まる場合は
+        // loop 側の発話開始処理がセッション用ポーズを改めて設定する
+        g_pose_state = -1;
 }
 
 // 音量ゲージ文字列（6マス表示。例「音量 ■■■□□□」、レベル0は全□）
@@ -2814,6 +2924,16 @@ void loop()
     // ニュース由来の発話なら、中断対象としてセッション中フラグを立てる。
     g_news_playing = g_pending_news_speech;
     g_pending_news_speech = false;
+    // 第9弾: 発話セッション中のポーズを決める
+    // （発話側の明示指定を優先し、無ければニュース=サムズアップ、それ以外は表情連動）
+    if (g_pending_pose >= 0) {
+      g_pose_state = g_pending_pose;
+      g_pending_pose = -1;
+    } else if (g_news_playing) {
+      g_pose_state = POSE_THUMBSUP;
+    } else {
+      g_pose_state = -1;
+    }
     tts_enqueue(speech_text_buffer, TTS_PARMS);
   }
 
@@ -2879,6 +2999,8 @@ void loop()
         Serial.println("wakeword_compare OK!");
         sw_tone();
         g_led_ww_until = millis() + 1000;   // 側面LED：検出を白フラッシュで知らせる
+        g_pose_timed = POSE_JUMP;           // 第9弾: 検出直後は約1秒「ジャンプ」ポーズ
+        g_pose_timed_until = millis() + 1000;
         SST_ChatGPT();
     }
   }

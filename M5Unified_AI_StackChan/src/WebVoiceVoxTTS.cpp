@@ -6,6 +6,7 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioFileSourceBuffer.h>
 #include <AudioFileSourcePROGMEM.h>
+#include "TrackedMemorySource.h"
 #include "AudioFileSourceHTTPSStream.h"
 //#include "AudioOutputM5Speaker.h"
 
@@ -275,6 +276,9 @@ String voicevox_synth_url(const char* text, const char* tts_parms) {
   if (!mp3url) return "";
   Serial.printf("[TTS] synth OK in %lu ms (isApiKeyValid: %s)\n",
                 (unsigned long)(millis() - t0), doc["isApiKeyValid"] ? "OK" : "NG");
+  if (!doc["isApiKeyValid"]) {
+    Serial.println("[TTS] warning: VOICEVOX key not accepted; free-tier limits may cause gaps (check /apikey)");
+  }
   return String(mp3url);
 }
 
@@ -651,7 +655,7 @@ void voicevox_release_connection() {
 // 再生終了まで呼び出し側（main.cpp の再生管理）が保持・解放する。
 bool voicevox_play_memory(const uint8_t* data, size_t len) {
   if (data == nullptr || len == 0) return false;
-  memfile = new AudioFileSourcePROGMEM(data, (uint32_t)len);
+  memfile = new TrackedMemorySource(data, (uint32_t)len);
   if (memfile == nullptr) return false;
   if (!playMP3(memfile)) {
     Serial.println("[TTS] play begin failed in generator (memory)");

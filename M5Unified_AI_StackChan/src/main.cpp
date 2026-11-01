@@ -30,6 +30,7 @@ static bool audioRunning();
 #include "rootCACertificate.h"
 #include "rootCAgoogle.h"
 #include "rootCANHK.h"
+#include "rootCAopenmeteo.h"
 #include <ArduinoJson.h>
 #include <ESP32WebServer.h>
 #define ENABLE_MDNS
@@ -626,7 +627,7 @@ uint32_t g_periodic_next_ms = 0;     // 次回ニュース読み上げの発火�
 bool g_sched_morning = true;         // モーニング読み上げ（NVS "setting"/"s_morning"）
 bool g_sched_hourly = true;          // 時報（NVS "setting"/"s_hourly"）
 extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり）で定義
-String exec_news();                  // 実体は後方（ニュース読み上げの節）で定義
+String exec_news(bool automatic = false);  // 実体は後方（ニュース読み上げの節）で定義
 static bool play_dance_video();      // 実体は後方（SST_ChatGPT の直前）で定義。第9弾
 static void dance_boot_check();      // 起動時1回だけの自動再生判定（loop から呼ぶ）。第9.1弾
 
@@ -648,7 +649,7 @@ static void sched_fn_morning() {
   snprintf(buf, sizeof(buf), "おはようございます。今日は%d月%d日（%s曜日）です。",
            t.tm_mon + 1, t.tm_mday, wday[t.tm_wday % 7]);
   g_pending_pose = POSE_RUN;  // 第9弾: モーニングの発話中は「走る」ポーズ（ニュースのサムズアップより優先）
-  exec_news();  // speech_text にニュース本文（失敗時はその旨の文）をセットする
+  exec_news(true);  // speech_text にニュース本文をセットする（自動読み上げ: 新しい記事がなければニュース部分は無言でスキップし、挨拶のみになる。第9.20弾）
   speech_text = String(buf) + speech_text;
 }
 
@@ -1332,6 +1333,196 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
   return v;
 }
 
+// ==== ニュースの鮮度・重複対策（第9.20弾） ====
+// 実機で古い台風ニュース（フィード先頭に残り続ける過去記事）を繰り返し
+// 読み上げる事象への対策。
+// (a) 鮮度: 記事の pubDate が48時間より古いものは読み上げ対象から外す。
+//     日付が取れない記事は除外しない（重複防止側で繰り返しを防ぐ）。
+//     未来日時の異常値（現在+24時間より先）は「日付なし」として扱う。
+// (b) 重複: 読み上げ済み記事のタイトルハッシュを SPIFFS に記録し、
+//     次回以降はスキップする。保持は最大60件・5日で自動的に掃除する。
+// (c) すべて古い/既読で新しい記事がなかった場合は g_news_nothing_new を立て、
+//     手動では「新しいニュースはありません」と読み上げ、自動読み上げ
+//     （定期通知・スケジューラ）では無言でスキップする（exec_news 側）。
+#define NEWS_OLD_LIMIT_SEC (48L * 3600L)
+#define NEWS_SEEN_MAX 60
+#define NEWS_SEEN_KEEP_SEC (5L * 24L * 3600L)
+#define NEWS_SEEN_PATH "/news_seen.txt"
+
+bool g_news_nothing_new = false;     // 直近の exec_news 系で「新しい記事がなかった」
+static bool g_news_feed_ok = false;  // いずれかのフィードの取得自体には成功した
+static int g_news_skip_old = 0;      // 直近の取得で古さにより除外した件数
+static int g_news_skip_seen = 0;     // 直近の取得で既読により除外した件数
+
+// 時刻が NTP 同期済みらしい値か（2026-01-01 UTC 以降）。未同期時は鮮度判定をしない
+static bool newsNowValid(time_t now) { return now > (time_t)1767225600L; }
+
+// civil 日付 → epoch 日数（days_from_civil）
+static int64_t newsDaysFromCivil(int y, int m, int d) {
+  y -= (m <= 2) ? 1 : 0;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = (int64_t)y - era * 400;
+  int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+// RSS の pubDate（RFC822: "Sun, 01 Nov 2026 06:30:00 +0900" / "... GMT"）を
+// epoch 秒に変換する。解釈できなければ 0（= 日付なし）を返す
+static time_t newsParseRssDate(const String& s) {
+  static const char* MONS[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  int monPos = -1, mon = 0;
+  for (int i = 0; i < 12; i++) {
+    int p = s.indexOf(MONS[i]);
+    if (p >= 0) { monPos = p; mon = i + 1; break; }
+  }
+  if (monPos < 0) return 0;
+  // 日: 月名の直前にある数値
+  int day = 0;
+  {
+    int i = monPos - 1;
+    while (i >= 0 && s[i] == ' ') i--;
+    int end = i + 1;
+    while (i >= 0 && isDigit(s[i])) i--;
+    if (end - (i + 1) <= 0) return 0;
+    day = s.substring(i + 1, end).toInt();
+  }
+  // 年: 月名の後ろにある4桁数値
+  int year = 0, yearEnd = -1;
+  for (int i = monPos + 3; i + 4 <= (int)s.length(); i++) {
+    if (isDigit(s[i]) && isDigit(s[i + 1]) && isDigit(s[i + 2]) && isDigit(s[i + 3])) {
+      year = s.substring(i, i + 4).toInt();
+      yearEnd = i + 4;
+      break;
+    }
+  }
+  if (day <= 0 || year < 2000) return 0;
+  // 時刻: 年の後ろの HH:MM:SS
+  int hh = 0, mm = 0, ss = 0;
+  int colon = (yearEnd > 0) ? s.indexOf(':', yearEnd) : -1;
+  if (colon >= 2) {
+    hh = s.substring(colon - 2, colon).toInt();
+    mm = s.substring(colon + 1, colon + 3).toInt();
+    if (colon + 3 < (int)s.length() && s[colon + 3] == ':') ss = s.substring(colon + 4, colon + 6).toInt();
+  }
+  // タイムゾーン: "+0900"/"-0500" 形式。無ければ GMT/UT は +0、JST は +9時間
+  long tzSec = 0;
+  bool tzFound = false;
+  for (int i = 0; i + 4 < (int)s.length(); i++) {
+    if ((s[i] == '+' || s[i] == '-') && isDigit(s[i + 1]) && isDigit(s[i + 2]) && isDigit(s[i + 3]) && isDigit(s[i + 4])) {
+      long th = s.substring(i + 1, i + 3).toInt();
+      long tm = s.substring(i + 3, i + 5).toInt();
+      tzSec = (th * 3600 + tm * 60) * (s[i] == '-' ? -1 : 1);
+      tzFound = true;
+      break;
+    }
+  }
+  if (!tzFound && s.indexOf("JST") >= 0) tzSec = 9 * 3600;
+  int64_t epoch = newsDaysFromCivil(year, mon, day) * 86400LL + hh * 3600LL + mm * 60LL + ss - tzSec;
+  return (time_t)epoch;
+}
+
+// 記事が「古い」（48時間超）かどうか。日付なし・時刻未同期・未来の異常値は古いとしない
+static bool newsIsOld(time_t pub, time_t now) {
+  if (pub == 0 || !newsNowValid(now)) return false;
+  if (pub > now + 24L * 3600L) return false;  // 未来日時の異常値は日付なし扱い
+  return (now - pub) > NEWS_OLD_LIMIT_SEC;
+}
+
+// タイトルの FNV-1a 32bit ハッシュ（重複判定用）
+static uint32_t newsTitleHash(const String& title) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < title.length(); i++) {
+    h ^= (uint8_t)title[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+struct NewsSeenEntry { uint32_t hash; uint32_t epoch; };
+static NewsSeenEntry g_news_seen[NEWS_SEEN_MAX];
+static int g_news_seen_count = 0;
+static bool g_news_seen_loaded = false;
+
+static void newsSeenLoad() {
+  if (g_news_seen_loaded) return;
+  g_news_seen_loaded = true;
+  g_news_seen_count = 0;
+  File f = SPIFFS.open(NEWS_SEEN_PATH, FILE_READ);
+  if (!f) return;
+  while (f.available() && g_news_seen_count < NEWS_SEEN_MAX) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    int sp = line.indexOf(' ');
+    if (sp <= 0) continue;
+    g_news_seen[g_news_seen_count].hash = (uint32_t)strtoul(line.substring(0, sp).c_str(), nullptr, 16);
+    g_news_seen[g_news_seen_count].epoch = (uint32_t)line.substring(sp + 1).toInt();
+    g_news_seen_count++;
+  }
+  f.close();
+  Serial.printf("[News] seen store loaded: %d entries\n", g_news_seen_count);
+}
+
+// 保持期間（5日）を過ぎた記録を掃除してから全件を書き戻す
+static void newsSeenSave() {
+  time_t now = time(nullptr);
+  bool nowOk = newsNowValid(now);
+  int w = 0;
+  for (int i = 0; i < g_news_seen_count; i++) {
+    uint32_t ep = g_news_seen[i].epoch;
+    // epoch 0 = 時刻未同期時の記録。日付では消さず、件数上限側で押し出す
+    if (nowOk && ep != 0 && (int64_t)now - (int64_t)ep > NEWS_SEEN_KEEP_SEC) continue;
+    g_news_seen[w++] = g_news_seen[i];
+  }
+  g_news_seen_count = w;
+  File f = SPIFFS.open(NEWS_SEEN_PATH, FILE_WRITE);
+  if (!f) { Serial.println("[News] seen store save failed"); return; }
+  for (int i = 0; i < g_news_seen_count; i++) {
+    f.printf("%08lx %lu\n", (unsigned long)g_news_seen[i].hash, (unsigned long)g_news_seen[i].epoch);
+  }
+  f.close();
+}
+
+static bool newsSeenContains(uint32_t h) {
+  newsSeenLoad();
+  for (int i = 0; i < g_news_seen_count; i++) if (g_news_seen[i].hash == h) return true;
+  return false;
+}
+
+// 読み上げ対象に決まった記事を記録する（満杯時は最も古い記録を押し出す）
+static void newsSeenAdd(uint32_t h) {
+  newsSeenLoad();
+  if (newsSeenContains(h)) return;
+  if (g_news_seen_count >= NEWS_SEEN_MAX) {
+    int oldest = 0;
+    for (int i = 1; i < g_news_seen_count; i++) if (g_news_seen[i].epoch < g_news_seen[oldest].epoch) oldest = i;
+    for (int i = oldest; i + 1 < g_news_seen_count; i++) g_news_seen[i] = g_news_seen[i + 1];
+    g_news_seen_count--;
+  }
+  time_t now = time(nullptr);
+  g_news_seen[g_news_seen_count].hash = h;
+  g_news_seen[g_news_seen_count].epoch = newsNowValid(now) ? (uint32_t)now : 0;
+  g_news_seen_count++;
+  newsSeenSave();
+}
+
+// 1記事分の鮮度・重複フィルタ。true = 読み上げ対象にする（その場合は既読に記録する）
+static bool newsAcceptArticle(const String& title, time_t pub) {
+  if (newsIsOld(pub, time(nullptr))) {
+    g_news_skip_old++;
+    Serial.printf("[News] skip old article: %s\n", title.c_str());
+    return false;
+  }
+  uint32_t h = newsTitleHash(title);
+  if (newsSeenContains(h)) {
+    g_news_skip_seen++;
+    Serial.printf("[News] skip already-read article: %s\n", title.c_str());
+    return false;
+  }
+  newsSeenAdd(h);
+  return true;
+}
+
 // NHKニュースRSS（カテゴリ nhkCat）の本文を取得する（第9.6弾で分離）。
 // 成否コードは g_nhk_http_code に残す（接続失敗時は負値）。
 static String fetchNhkRssBody(int nhkCat) {
@@ -1400,6 +1591,7 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
     payload = fetchNhkRssBody(nhkCat);
   }
   if (payload == "") return "";
+  g_news_feed_ok = true;  // フィード自体は取得できた（第9.20弾）
 
   String result = intro;
   int pos = 0;
@@ -1407,8 +1599,18 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
   while (count < 3) {
     int itemPos = payload.indexOf("<item>", pos);
     if (itemPos < 0) break;
+    pos = itemPos + 6;
     String title = xmlExtract(payload, "title", itemPos);
     if (title == "") break;
+    // pubDate は次の <item> の手前までで探す（他記事の日付を拾わない）
+    String pubStr = "";
+    {
+      int nextItem = payload.indexOf("<item>", pos);
+      int pubPos = payload.indexOf("<pubDate>", itemPos);
+      if (pubPos >= 0 && (nextItem < 0 || pubPos < nextItem)) pubStr = xmlExtract(payload, "pubDate", itemPos);
+    }
+    // 第9.20弾: 48時間より古い記事と既読記事は読み上げ対象から外す
+    if (!newsAcceptArticle(title, newsParseRssDate(pubStr))) continue;
     String desc = xmlExtract(payload, "description", itemPos);
     result += title + "。";
     if (desc != "") result += desc + "。";
@@ -1420,7 +1622,6 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
       if (dispDescs) dispDescs[dispCount] = desc;
       dispItems[dispCount++] = item;
     }
-    pos = itemPos + 6;
     count++;
   }
   if (count == 0) return "";
@@ -1470,9 +1671,24 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
         if (stream) {
           const char* patItem = "<item>";
           const char* patTitle = "<title>";
-          int state = 0;  // 0:<item>待ち 1:<title>待ち 2:見出し取得中
+          const char* patPub = "<pubDate>";
+          const char* patItemEnd = "</item>";
+          int state = 0;  // 0:<item>待ち 1:<title>待ち 2:見出し取得中 3:<pubDate>待ち 4:pubDate取得中
           int match = 0;
+          int matchEnd = 0;
           String title = "";
+          // 第9.20弾: 見出しは <pubDate>（または </item>）まで保留し、鮮度・重複
+          // フィルタを通ったものだけを outTitles へ出す（pubDate は title の後ろにある）
+          String pendingTitle = "";
+          String pubStr = "";
+          auto emitPending = [&]() {
+            if (pendingTitle == "") return;
+            if (outCount < want && newsAcceptArticle(pendingTitle, newsParseRssDate(pubStr))) {
+              outTitles[outCount++] = pendingTitle;
+            }
+            pendingTitle = "";
+            pubStr = "";
+          };
           const uint32_t MAX_SCAN = 120 * 1024;
           uint32_t scanned = 0;
           uint32_t startMs = millis();
@@ -1501,11 +1717,49 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
                   }
                   title = stripMediaSuffix(decodeEntities(title));
                   if (title != "") {
-                    outTitles[outCount++] = title;
+                    pendingTitle = title;  // 第9.20弾: pubDate を見てから確定する
+                    state = 3;
+                  } else {
+                    state = 0;
                   }
                   title = "";
+                  match = 0;
+                  matchEnd = 0;
+                }
+              } else if (state == 4) {
+                if (pubStr.length() < 64) pubStr += c;
+                if (pubStr.endsWith("</pubDate>")) {
+                  pubStr = pubStr.substring(0, pubStr.length() - 10);
+                  pubStr.trim();
+                  emitPending();
                   state = 0;
                   match = 0;
+                  matchEnd = 0;
+                }
+              } else if (state == 3) {
+                // <pubDate> と </item> の先に来た方で確定する（日付なし記事も拾う）
+                if (c == patPub[match]) {
+                  match++;
+                  if (patPub[match] == '\0') {
+                    state = 4;
+                    match = 0;
+                    pubStr = "";
+                  }
+                } else {
+                  match = (c == patPub[0]) ? 1 : 0;
+                }
+                if (state == 3) {
+                  if (c == patItemEnd[matchEnd]) {
+                    matchEnd++;
+                    if (patItemEnd[matchEnd] == '\0') {
+                      emitPending();
+                      state = 0;
+                      match = 0;
+                      matchEnd = 0;
+                    }
+                  } else {
+                    matchEnd = (c == patItemEnd[0]) ? 1 : 0;
+                  }
                 }
               } else {
                 const char* pat = (state == 0) ? patItem : patTitle;
@@ -1522,6 +1776,7 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
               }
             }
           }
+          emitPending();  // 第9.20弾: 走査打ち切り時に残った見出しを日付なしとして拾う
           Serial.printf("[Google RSS] headlines: %d (scanned %u bytes)\n", outCount, (unsigned)scanned);
         }
       }
@@ -1536,17 +1791,19 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
 // うえで1回だけ再試行するラッパー（第9.6弾）
 static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
   bool ok = fetchGoogleHeadlinesOnce(url, want, outTitles, outCount, httpCodeOut);
+  if (httpCodeOut == 200) g_news_feed_ok = true;  // フィード自体は取得できた（第9.20弾）
   if (!ok && httpCodeOut < 0) {
     Serial.printf("[Google RSS] retry after connection failure (code %d)\n", httpCodeOut);
     delay(1500);
     ok = fetchGoogleHeadlinesOnce(url, want, outTitles, outCount, httpCodeOut);
+    if (httpCodeOut == 200) g_news_feed_ok = true;
   }
   return ok;
 }
 
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
 // あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
-String exec_news() {
+String exec_news(bool automatic) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
   // 第9.8弾: ニュース取得（TLS）の前に、TTS接続ペアの解放を合成タスクへ
   // 依頼し、少し待って内蔵ヒープ（最大連続ブロック）を回復させてから
@@ -1554,6 +1811,11 @@ String exec_news() {
   // ハンドシェイクがメモリ確保失敗（-32512）になる事象への対策。
   g_tts_release_req = true;
   for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  // 第9.20弾: 鮮度・重複対策の状態を初期化する
+  g_news_nothing_new = false;
+  g_news_feed_ok = false;
+  g_news_skip_old = 0;
+  g_news_skip_seen = 0;
   captionReset();  // 前回の表示キューが残っていたら破棄する
   // 一般ニュース：NHK（見出し＋説明）→ 失敗時は Google トップニュースの見出しで代替
   String dispItems[5];
@@ -1608,13 +1870,26 @@ String exec_news() {
     g_led_news_color = CRGB::White;  // 通常ニュースのLED色は白
     if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
+  } else if (g_news_feed_ok) {
+    // 第9.20弾: 取得はできたが、古い記事と既読ばかりで新しい記事がなかった
+    g_news_nothing_new = true;
+    Serial.printf("[News] nothing new (skipped old=%d seen=%d, automatic=%d)\n",
+                  g_news_skip_old, g_news_skip_seen, automatic ? 1 : 0);
+    if (!automatic) {
+      speech_text = "新しいニュースはありません";
+      avatar.setSpeechText("新しいニュースはありません");
+      g_info_msg_until = millis() + 4000;
+      g_pending_news_speech = true;
+    }
+    // 自動読み上げ（定期通知・スケジューラ）の場合は無言でスキップする
   } else {
     speech_text = "ニュースを取得できませんでした";
     // 第9.6弾: 音声が出ない場合でも理由が分かるよう、吹き出しにも表示して残す
     avatar.setSpeechText("ニュースを取得できませんでした");
     g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
-  g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   return text;
 }
 
@@ -1629,6 +1904,11 @@ void exec_news_category(int cat) {
   // 第9.8弾: exec_news() と同様、取得前に TTS 接続ペアの解放を依頼する
   g_tts_release_req = true;
   for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  // 第9.20弾: 鮮度・重複対策の状態を初期化する
+  g_news_nothing_new = false;
+  g_news_feed_ok = false;
+  g_news_skip_old = 0;
+  g_news_skip_seen = 0;
   captionReset();  // 前回の表示キューが残っていたら破棄する
   String dispItems[5];
   String dispTitles[5];
@@ -1665,24 +1945,231 @@ void exec_news_category(int cat) {
     g_led_news_color = NEWS_CAT_COLORS[cat];  // カテゴリ色をLEDに使う
     if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
+  } else if (g_news_feed_ok) {
+    // 第9.20弾: 取得はできたが、古い記事と既読ばかりで新しい記事がなかった
+    // （カテゴリ読み上げは手動トリガーのため、その旨を短く読み上げる）
+    g_news_nothing_new = true;
+    Serial.printf("[News] nothing new in category (skipped old=%d seen=%d)\n",
+                  g_news_skip_old, g_news_skip_seen);
+    speech_text = "新しいニュースはありません";
+    avatar.setSpeechText("新しいニュースはありません");
+    g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;
   } else {
     speech_text = "ニュースを取得できませんでした";
     // 第9.6弾: 音声が出ない場合でも理由が分かるよう、吹き出しにも表示して残す
     avatar.setSpeechText("ニュースを取得できませんでした");
     g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
-  g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
 }
 
 void handle_news() {
   String news = exec_news();
   String diag = String("\n[diag] NHK httpCode=") + String(g_nhk_http_code)
               + " GoogleTop httpCode=" + String(g_google_top_http_code)
-              + " GoogleAI httpCode=" + String(g_google_ai_http_code);
+              + " GoogleAI httpCode=" + String(g_google_ai_http_code)
+              + " skippedOld=" + String(g_news_skip_old)
+              + " skippedSeen=" + String(g_news_skip_seen);
   if (news != "") {
     server.send(200, "text/plain", news + diag);
+  } else if (g_news_nothing_new) {
+    server.send(200, "text/plain", String("新しいニュースはありません") + diag);
   } else {
     server.send(200, "text/plain", String("ニュースを取得できませんでした") + diag);
+  }
+}
+
+// ==== 天気予報（Open-Meteo・第9.20弾） ====
+// ChatGPT はネットを見られないため、ニュースと同じ方式で本体が直接取得して
+// 読み上げる。取得先は Open-Meteo（APIキー不要）、対象は東京（35.68, 139.69）。
+// TLS は rootCAopenmeteo.h（ISRG Root X1 + X2。SSL Labs で両エンドポイントの
+// 実チェーン確認済み）をピン留めし、TlsGateGuard で他 TLS と直列化する。
+int g_weather_http_code = 0;  // 診断用（/weather のレスポンスで確認できる）
+
+static const char* WEATHER_API_URL =
+  "https://api.open-meteo.com/v1/forecast?latitude=35.68&longitude=139.69"
+  "&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+  "&timezone=Asia%2FTokyo";
+
+// Open-Meteo の JSON 本文を取得する（1回分）。HTTPコードは g_weather_http_code に残す
+static bool fetchWeatherJsonOnce(String& out) {
+  out = "";
+  g_weather_http_code = 0;
+  Serial.printf("[Weather] start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  TlsGateGuard tls_guard;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (!client) return false;
+  client->setCACert(root_ca_openmeteo);
+  client->setTimeout(10000);
+  bool ok = false;
+  {
+    HTTPClient https;
+    https.setTimeout(10000);
+    if (https.begin(*client, WEATHER_API_URL)) {
+      int code = https.GET();
+      g_weather_http_code = code;
+      Serial.printf("[Weather] GET... code: %d\n", code);
+      if (code == HTTP_CODE_OK) {
+        WiFiClient *stream = https.getStreamPtr();
+        if (stream) {
+          String payload;
+          payload.reserve(4096);
+          const uint32_t deadline = millis() + 12000;
+          const size_t MAX_BYTES = 32 * 1024;
+          uint8_t rbuf[512];
+          while ((int32_t)(millis() - deadline) < 0 && payload.length() < MAX_BYTES) {
+            size_t avail = stream->available();
+            if (avail == 0) {
+              if (!stream->connected()) break;
+              delay(1);
+              continue;
+            }
+            int n = stream->read(rbuf, avail < sizeof(rbuf) ? avail : sizeof(rbuf));
+            if (n > 0) payload.concat((const char*)rbuf, (unsigned int)n);
+            else delay(1);
+          }
+          Serial.printf("[Weather] body %u bytes\n", (unsigned)payload.length());
+          if (payload.length() > 0) { out = payload; ok = true; }
+        }
+      }
+      https.end();
+    }
+  }
+  delete client;
+  return ok;
+}
+
+// 接続失敗時は、全て解放したうえで1回だけ再試行する（ニュース取得と同じ方針）
+static bool fetchWeatherJson(String& out) {
+  bool ok = fetchWeatherJsonOnce(out);
+  if (!ok && g_weather_http_code < 0) {
+    Serial.printf("[Weather] retry after connection failure (code %d)\n", g_weather_http_code);
+    delay(1500);
+    ok = fetchWeatherJsonOnce(out);
+  }
+  return ok;
+}
+
+// WMO weather code → 日本語の天気表現
+static String weatherCodeJa(int code) {
+  switch (code) {
+    case 0: return "晴れ";
+    case 1: return "晴れ時々曇り";
+    case 2: return "曇り時々晴れ";
+    case 3: return "曇り";
+    case 45: case 48: return "霧";
+    case 51: case 53: case 55: case 56: case 57: return "小雨";
+    case 61: case 63: case 66: case 67: return "雨";
+    case 65: return "強い雨";
+    case 71: case 73: case 77: return "雪";
+    case 75: return "強い雪";
+    case 80: case 81: return "にわか雨";
+    case 82: return "激しいにわか雨";
+    case 85: case 86: return "にわか雪";
+    case 95: case 96: case 99: return "雷雨";
+    default: break;
+  }
+  if (code >= 95) return "雷雨";
+  if (code >= 85) return "にわか雪";
+  if (code >= 80) return "にわか雨";
+  if (code >= 70) return "雪";
+  if (code >= 60) return "雨";
+  if (code >= 50) return "小雨";
+  return "曇り";
+}
+
+// "2026-11-02" → 曜日（0=日 … 6=土）。Sakamoto の方法。解釈できなければ -1
+static int weatherWeekday(const String& dateStr) {
+  if (dateStr.length() < 10) return -1;
+  int y = dateStr.substring(0, 4).toInt();
+  int m = dateStr.substring(5, 7).toInt();
+  int d = dateStr.substring(8, 10).toInt();
+  if (y < 2000 || m < 1 || m > 12 || d < 1 || d > 31) return -1;
+  static const int T[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (m < 3) y -= 1;
+  return (y + y / 4 - y / 100 + y / 400 + T[m - 1] + d) % 7;
+}
+
+static const char* WEATHER_WDAYS[] = {"日曜日", "月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日"};
+
+// 天気の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）。
+// dayOffset >= 0: その日（0=今日 1=明日 2=明後日）／ dayOffset < 0: 週間（7日分）
+static String exec_weather_impl(int dayOffset) {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+  // ニュース取得と同様、TLS の前に TTS 接続ペアの解放を依頼してヒープを回復させる
+  g_tts_release_req = true;
+  for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  String text = "";
+  String payload;
+  if (fetchWeatherJson(payload)) {
+    DynamicJsonDocument doc(8192);
+    if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+      JsonArray times = doc["daily"]["time"];
+      JsonArray codes = doc["daily"]["weathercode"];
+      JsonArray tmaxs = doc["daily"]["temperature_2m_max"];
+      JsonArray tmins = doc["daily"]["temperature_2m_min"];
+      JsonArray pops  = doc["daily"]["precipitation_probability_max"];
+      size_t days = times.size();
+      if (days > 0 && codes.size() == days && tmaxs.size() == days && tmins.size() == days) {
+        if (dayOffset >= 0) {
+          if ((size_t)dayOffset < days) {
+            const char* label = (dayOffset == 0) ? "今日" : (dayOffset == 1) ? "明日" : "明後日";
+            text = String(label) + "の東京の天気は" + weatherCodeJa(codes[dayOffset].as<int>())
+                 + "、最高気温は" + String((int)lroundf(tmaxs[dayOffset].as<float>())) + "度"
+                 + "、最低気温は" + String((int)lroundf(tmins[dayOffset].as<float>())) + "度";
+            if (pops.size() == days && !pops[dayOffset].isNull()) {
+              text += "、降水確率は" + String(pops[dayOffset].as<int>()) + "パーセント";
+            }
+            text += "です。";
+          }
+        } else {
+          text = "東京の週間天気予報です。";
+          for (size_t i = 0; i < days && i < 7; i++) {
+            String dateStr = times[i].as<String>();
+            int wd = weatherWeekday(dateStr);
+            text += String(dateStr.substring(5, 7).toInt()) + "月"
+                  + String(dateStr.substring(8, 10).toInt()) + "日";
+            if (wd >= 0) text += String("（") + WEATHER_WDAYS[wd] + "）";
+            text += "は" + weatherCodeJa(codes[i].as<int>())
+                  + "、最高" + String((int)lroundf(tmaxs[i].as<float>())) + "度"
+                  + "、最低" + String((int)lroundf(tmins[i].as<float>())) + "度。";
+          }
+        }
+      }
+    } else {
+      Serial.println("[Weather] JSON parse failed");
+    }
+  }
+  if (text != "") {
+    // 会話応答と同じく、読み上げ文を2行字幕の対象にする
+    capBuildFromText(text);
+    g_led_news_color = CRGB::White;
+    if (g_cap_count > 0) g_cap_armed = true;
+    speech_text = text;
+  } else {
+    speech_text = "天気予報を取得できませんでした";
+    avatar.setSpeechText("天気予報を取得できませんでした");
+    g_info_msg_until = millis() + 4000;
+  }
+  g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
+  return text;
+}
+
+String exec_weather(int dayOffset) { return exec_weather_impl(dayOffset); }
+String exec_weather_weekly() { return exec_weather_impl(-1); }
+
+void handle_weather() {
+  String w = exec_weather(1);  // テスト用: 明日の予報を読み上げ開始する
+  String diag = String("\n[diag] Weather httpCode=") + String(g_weather_http_code);
+  if (w != "") {
+    server.send(200, "text/plain", w + diag);
+  } else {
+    server.send(200, "text/plain", String("天気予報を取得できませんでした") + diag);
   }
 }
 
@@ -2943,6 +3430,7 @@ void setup()
   server.on("/voice", handle_voice);
   server.on("/model", handle_model);
   server.on("/news", handle_news);
+  server.on("/weather", HTTP_GET, handle_weather);  // 第9.20弾: 天気テスト用（明日の予報）
   server.on("/schedule", handle_schedule);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
   server.on("/role", handle_role);
@@ -3343,7 +3831,20 @@ void SST_ChatGPT() {
         if(ret != "") {
           Serial.println(ret);
           if (!audioRunning() && speech_text=="" && speech_text_buffer == "") {
-            if (ret.indexOf("ニュース") >= 0) {
+            if (ret.indexOf("天気") >= 0 || ret.indexOf("予報") >= 0) {
+              // 天気は ChatGPT を経由せず Open-Meteo から取得して読み上げる（第9.20弾）
+              avatar.setExpression(Expression::Happy);
+              avatar.setSpeechText("天気予報です");
+              if (ret.indexOf("週間") >= 0) {
+                exec_weather_weekly();
+              } else if (ret.indexOf("明後日") >= 0) {
+                exec_weather(2);
+              } else if (ret.indexOf("今日") >= 0) {
+                exec_weather(0);
+              } else {
+                exec_weather(1);  // 「明日」を含む場合と、日付指定がない場合の既定
+              }
+            } else if (ret.indexOf("ニュース") >= 0) {
               // ニュースは ChatGPT を経由せず RSS を読み上げる（会話履歴には入れない）
               avatar.setExpression(Expression::Happy);
               avatar.setSpeechText("ニュースです");
@@ -3766,7 +4267,8 @@ void loop()
     if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "") {
       g_menu_open = false;
       avatar.setSpeechText("ニュースです");
-      exec_news();
+      exec_news(true);  // 自動読み上げ: 新しい記事がなければ無言でスキップ（第9.20弾）
+      if (g_news_nothing_new) avatar.setSpeechText("");
       g_periodic_next_ms = millis() + 300000UL;
     } else {
       g_periodic_next_ms = millis() + 30000UL;

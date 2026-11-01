@@ -31,6 +31,7 @@ static bool audioRunning();
 #include "rootCAgoogle.h"
 #include "rootCANHK.h"
 #include "rootCAopenmeteo.h"
+#include "rootCAtrain.h"
 #include <ArduinoJson.h>
 #include <ESP32WebServer.h>
 #define ENABLE_MDNS
@@ -2173,6 +2174,272 @@ void handle_weather() {
   }
 }
 
+// ==== 電車の運行情報（日テレ防災・第9.21弾） ====
+// ChatGPT はネットを見られないため、天気と同じ方式で本体が直接取得して
+// 読み上げる。取得元は日テレ気象・防災サイトの関東エリア鉄道情報ページ
+// （bosai.news.ntv.co.jp）。「現在運行情報のある路線」だけが
+// 会社名・路線名・状態（列車遅延／運転見合わせ等）とともに列挙される形式で、
+// 対象路線が載っていなければ平常と判断できる。無料の公式APIはなく、
+// かつて広く使われた RTI技研の delay.json は提供元解散で停止済みのため、
+// このページを採用した（2026-11-01 実データで形式を確認）。
+// TLS は rootCAtrain.h（ISRG Root X1 + X2）をピン留めし、TlsGateGuard で
+// 他 TLS と直列化する。ページ全体は保持せず、直近バイト列だけを残す
+// ストリーミング走査で対象路線名とその直後の状態語を探す（Transfer-Encoding:
+// chunked の場合は生ストリームをデコードしながら走査する）。
+int g_train_http_code = 0;  // 診断用（/train のレスポンスで確認できる）
+
+static const char* TRAIN_INFO_URL =
+  "https://bosai.news.ntv.co.jp/railway/area/%E9%96%A2%E6%9D%B1";  // 関東
+
+// 状態の重大度（大きいほど重い。同路線に複数エントリがあれば最大を採る）
+#define TRAIN_ST_NONE   0
+#define TRAIN_ST_RESUME 1  // 運転再開
+#define TRAIN_ST_DELAY  2  // 列車遅延
+#define TRAIN_ST_DISORDER 3  // ダイヤ乱れ
+#define TRAIN_ST_PLAN   4  // 運転計画
+#define TRAIN_ST_SUSPEND 5  // 運転見合わせ
+
+struct TrainLineState {
+  const char* pattern;    // ページ内で探す路線名（部分一致。東急/JR の接頭辞に依存しない）
+  const char* speakName;  // 読み上げ用路線名
+  int status;             // TRAIN_ST_*
+  int phase;              // 0=路線名を検索中, 1=状態語の窓を収集中, 2=確定
+  uint32_t nameEndAbs;    // 路線名一致の終了位置（コンテンツ絶対位置）
+  uint32_t minPos;        // 次に路線名を探す下限（コンテンツ絶対位置）
+};
+
+static int trainEvalStatus(const String& win) {
+  if (win.indexOf("運転見合わせ") >= 0 || win.indexOf("運休") >= 0) return TRAIN_ST_SUSPEND;
+  if (win.indexOf("運転計画") >= 0) return TRAIN_ST_PLAN;
+  if (win.indexOf("ダイヤ乱れ") >= 0 || win.indexOf("ダイヤの乱れ") >= 0 ||
+      win.indexOf("運転変更") >= 0) return TRAIN_ST_DISORDER;
+  if (win.indexOf("列車遅延") >= 0 || win.indexOf("遅延") >= 0) return TRAIN_ST_DELAY;
+  if (win.indexOf("運転再開") >= 0) return TRAIN_ST_RESUME;
+  return TRAIN_ST_NONE;
+}
+
+// 運行情報ページを1回取得し、対象路線の状態を lines[] に埋める
+static bool fetchTrainStatusOnce(TrainLineState* lines, int nLines) {
+  g_train_http_code = 0;
+  Serial.printf("[Train] start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  TlsGateGuard tls_guard;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (!client) return false;
+  client->setCACert(root_ca_train);
+  client->setTimeout(12000);
+  bool ok = false;
+  {
+    HTTPClient https;
+    https.setTimeout(12000);
+    const char* reqHeaders[] = {"Transfer-Encoding"};
+    https.collectHeaders(reqHeaders, 1);
+    if (https.begin(*client, TRAIN_INFO_URL)) {
+      int code = https.GET();
+      g_train_http_code = code;
+      Serial.printf("[Train] GET... code: %d\n", code);
+      if (code == HTTP_CODE_OK) {
+        WiFiClient *stream = https.getStreamPtr();
+        if (stream) {
+          bool chunked = String(https.header("Transfer-Encoding")).indexOf("chunked") >= 0;
+          // チャンク転送デコーダの状態
+          int chunkState = 0;          // 0=サイズ行, 1=データ, 2=データ直後の改行読み捨て
+          uint32_t chunkLeft = 0;
+          String sizeLine;
+          // ストリーミング走査の状態（recent は直近バイト列のみ保持）
+          String recent;
+          recent.reserve(1400);
+          uint32_t total = 0;          // コンテンツ総バイト数
+          uint32_t recentBase = 0;     // recent[0] のコンテンツ絶対位置
+          const uint32_t WINDOW = 400; // 路線名の直後で状態語を探す範囲
+          const uint32_t deadline = millis() + 25000;
+          const uint32_t MAX_CONTENT = 1024 * 1024;
+          uint8_t rbuf[512];
+          bool streamDone = false;
+          // コンテンツバイト列を走査へ流し込む（走査状態を前進させる）
+          auto feedContent = [&](const uint8_t* p, int n) {
+            recent.concat((const char*)p, (unsigned int)n);
+            total += (uint32_t)n;
+            if (recent.length() > 1200) {
+              int drop = (int)recent.length() - 1200;
+              recent.remove(0, drop);
+              recentBase += (uint32_t)drop;
+            }
+            for (int li = 0; li < nLines; li++) {
+              TrainLineState& L = lines[li];
+              if (L.phase == 0) {
+                int from = (L.minPos > recentBase) ? (int)(L.minPos - recentBase) : 0;
+                int idx = recent.indexOf(L.pattern, from);
+                if (idx >= 0) {
+                  L.nameEndAbs = recentBase + (uint32_t)idx + strlen(L.pattern);
+                  L.phase = 1;
+                }
+              }
+              if (L.phase == 1 && total - L.nameEndAbs >= WINDOW) {
+                int start = (int)(L.nameEndAbs - recentBase);
+                if (start < 0) start = 0;
+                String win = recent.substring(start, start + (int)WINDOW);
+                int cut = win.indexOf("</a>");
+                int cut2 = win.indexOf("<a");
+                if (cut < 0 || (cut2 >= 0 && cut2 < cut)) cut = cut2;
+                if (cut >= 0) win = win.substring(0, cut);
+                int st = trainEvalStatus(win);
+                if (st > L.status) L.status = st;
+                if (st > TRAIN_ST_NONE) {
+                  L.phase = 2;
+                } else {
+                  L.phase = 0;              // 名前だけの出現だったので後方で探し直す
+                  L.minPos = L.nameEndAbs;
+                }
+              }
+            }
+          };
+          while ((int32_t)(millis() - deadline) < 0 && total < MAX_CONTENT && !streamDone) {
+            bool allDone = true;
+            for (int li = 0; li < nLines; li++) if (lines[li].phase != 2) allDone = false;
+            if (allDone) break;  // 全路線が確定したら残りは読まない
+            size_t avail = stream->available();
+            if (avail == 0) {
+              if (!stream->connected()) break;
+              delay(1);
+              continue;
+            }
+            int n = stream->read(rbuf, avail < sizeof(rbuf) ? avail : sizeof(rbuf));
+            if (n <= 0) { delay(1); continue; }
+            if (!chunked) {
+              feedContent(rbuf, n);
+            } else {
+              // チャンク転送をデコードしながら feedContent へ渡す
+              int i = 0;
+              while (i < n && !streamDone) {
+                if (chunkState == 0) {
+                  char c = (char)rbuf[i++];
+                  if (c == '\n') {
+                    long sz = strtol(sizeLine.c_str(), nullptr, 16);
+                    sizeLine = "";
+                    if (sz <= 0) { streamDone = true; break; }
+                    chunkLeft = (uint32_t)sz;
+                    chunkState = 1;
+                  } else if (c != '\r') {
+                    sizeLine += c;
+                    if (sizeLine.length() > 10) sizeLine = "";  // 異常な行は捨てる
+                  }
+                } else if (chunkState == 1) {
+                  int take = (int)((uint32_t)(n - i) < chunkLeft ? (uint32_t)(n - i) : chunkLeft);
+                  feedContent(rbuf + i, take);
+                  i += take;
+                  chunkLeft -= (uint32_t)take;
+                  if (chunkLeft == 0) chunkState = 2;
+                } else {
+                  // チャンク直後の CRLF を読み捨てる（LF まで）
+                  char c = (char)rbuf[i++];
+                  if (c == '\n') chunkState = 0;
+                }
+              }
+            }
+          }
+          // 窓が WINDOW に満たないまま終わった路線は、残りの窓で最終判定する
+          for (int li = 0; li < nLines; li++) {
+            TrainLineState& L = lines[li];
+            if (L.phase == 1) {
+              int start = (int)(L.nameEndAbs - recentBase);
+              if (start >= 0 && start < (int)recent.length()) {
+                String win = recent.substring(start);
+                int cut = win.indexOf("</a>");
+                int cut2 = win.indexOf("<a");
+                if (cut < 0 || (cut2 >= 0 && cut2 < cut)) cut = cut2;
+                if (cut >= 0) win = win.substring(0, cut);
+                int st = trainEvalStatus(win);
+                if (st > L.status) L.status = st;
+              }
+              L.phase = 2;
+            }
+          }
+          Serial.printf("[Train] scanned %u bytes\n", (unsigned)total);
+          ok = true;  // HTTP 200 で本文を読めた（路線が無ければ平常扱い）
+        }
+      }
+      https.end();
+    }
+  }
+  delete client;
+  return ok;
+}
+
+static bool fetchTrainStatus(TrainLineState* lines, int nLines) {
+  bool ok = fetchTrainStatusOnce(lines, nLines);
+  if (!ok && g_train_http_code < 0) {
+    Serial.printf("[Train] retry after connection failure (code %d)\n", g_train_http_code);
+    for (int li = 0; li < nLines; li++) {  // 再試行前に走査状態を初期化する
+      lines[li].status = TRAIN_ST_NONE;
+      lines[li].phase = 0;
+      lines[li].nameEndAbs = 0;
+      lines[li].minPos = 0;
+    }
+    delay(1500);
+    ok = fetchTrainStatusOnce(lines, nLines);
+  }
+  return ok;
+}
+
+// 運行情報の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）
+static String exec_train() {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+  // ニュース取得と同様、TLS の前に TTS 接続ペアの解放を依頼してヒープを回復させる
+  g_tts_release_req = true;
+  for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  TrainLineState lines[] = {
+    {"田園都市線", "田園都市線", TRAIN_ST_NONE, 0, 0, 0},
+    {"大井町線",   "大井町線",   TRAIN_ST_NONE, 0, 0, 0},
+    {"南武線",     "南武線",     TRAIN_ST_NONE, 0, 0, 0},
+  };
+  const int nLines = 3;
+  String text = "";
+  if (fetchTrainStatus(lines, nLines)) {
+    for (int li = 0; li < nLines; li++) {
+      Serial.printf("[Train] %s status=%d\n", lines[li].speakName, lines[li].status);
+      if (lines[li].status == TRAIN_ST_NONE) continue;
+      text += String(lines[li].speakName) + "は";
+      switch (lines[li].status) {
+        case TRAIN_ST_SUSPEND:  text += "運転を見合わせています。"; break;
+        case TRAIN_ST_PLAN:     text += "運転計画の変更が予定されています。"; break;
+        case TRAIN_ST_DISORDER: text += "ダイヤが乱れています。"; break;
+        case TRAIN_ST_DELAY:    text += "列車に遅れが出ています。"; break;
+        case TRAIN_ST_RESUME:   text += "運転を再開しています。"; break;
+        default: break;
+      }
+    }
+    if (text == "") {
+      text = "田園都市線、大井町線、南武線に遅れはありません。";
+    }
+  }
+  if (text != "") {
+    // 会話応答と同じく、読み上げ文を2行字幕の対象にする
+    capBuildFromText(text);
+    g_led_news_color = CRGB::White;
+    if (g_cap_count > 0) g_cap_armed = true;
+    speech_text = text;
+  } else {
+    speech_text = "運行情報を取得できませんでした";
+    avatar.setSpeechText("運行情報を取得できませんでした");
+    g_info_msg_until = millis() + 4000;
+  }
+  g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
+  return text;
+}
+
+void handle_train() {
+  String t = exec_train();  // テスト用: 対象3路線の運行情報を読み上げ開始する
+  String diag = String("\n[diag] Train httpCode=") + String(g_train_http_code);
+  if (t != "") {
+    server.send(200, "text/plain", t + diag);
+  } else {
+    server.send(200, "text/plain", String("運行情報を取得できませんでした") + diag);
+  }
+}
+
 void handle_voice() {
   String set = server.arg("set");
   String message = "";
@@ -3431,6 +3698,7 @@ void setup()
   server.on("/model", handle_model);
   server.on("/news", handle_news);
   server.on("/weather", HTTP_GET, handle_weather);  // 第9.20弾: 天気テスト用（明日の予報）
+  server.on("/train", HTTP_GET, handle_train);      // 第9.21弾: 運行情報テスト用（対象3路線）
   server.on("/schedule", handle_schedule);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
   server.on("/role", handle_role);
@@ -3844,6 +4112,12 @@ void SST_ChatGPT() {
               } else {
                 exec_weather(1);  // 「明日」を含む場合と、日付指定がない場合の既定
               }
+            } else if (ret.indexOf("遅延") >= 0 || ret.indexOf("遅れ") >= 0 ||
+                       ret.indexOf("運行") >= 0 || ret.indexOf("電車") >= 0) {
+              // 運行情報は ChatGPT を経由せず日テレ防災から取得して読み上げる（第9.21弾）
+              avatar.setExpression(Expression::Happy);
+              avatar.setSpeechText("運行情報です");
+              exec_train();
             } else if (ret.indexOf("ニュース") >= 0) {
               // ニュースは ChatGPT を経由せず RSS を読み上げる（会話履歴には入れない）
               avatar.setExpression(Expression::Happy);

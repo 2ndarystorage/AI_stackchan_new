@@ -1,0 +1,107 @@
+{
+  "firmware": "v9.18",
+  "date_jst": "2026-11-01",
+  "firmware_sha256": "86ca79a8a8884e7d45e164e676f5b7ba09b179756a3c0fcc47474d033f170163",
+  "news_sessions_requested": 1,
+  "news_chunks": [
+    {
+      "elapsed_ms": 13301,
+      "expected_ms": 16008,
+      "expected_wall_ms": 13339,
+      "consumed_bytes": 320269,
+      "buffer_bytes": 320269,
+      "reason": "natural",
+      "max_decode_gap_ms": 18,
+      "pcm_samples": 768386,
+      "peak": 31493,
+      "output_fault": 0
+    },
+    {
+      "elapsed_ms": 13132,
+      "expected_ms": 15744,
+      "expected_wall_ms": 13119,
+      "consumed_bytes": 314989,
+      "buffer_bytes": 314989,
+      "reason": "natural",
+      "max_decode_gap_ms": 18,
+      "pcm_samples": 755714,
+      "peak": 31183,
+      "output_fault": 0
+    },
+    {
+      "elapsed_ms": 12952,
+      "expected_ms": 15600,
+      "expected_wall_ms": 12999,
+      "consumed_bytes": 312109,
+      "buffer_bytes": 312109,
+      "reason": "natural",
+      "max_decode_gap_ms": 18,
+      "pcm_samples": 748802,
+      "peak": 31405,
+      "output_fault": 0
+    },
+    {
+      "elapsed_ms": 16858,
+      "expected_ms": 20280,
+      "expected_wall_ms": 16900,
+      "consumed_bytes": 405709,
+      "buffer_bytes": 405709,
+      "reason": "natural",
+      "max_decode_gap_ms": 18,
+      "pcm_samples": 973442,
+      "peak": 31302,
+      "output_fault": 0
+    },
+    {
+      "elapsed_ms": 14432,
+      "expected_ms": 17376,
+      "expected_wall_ms": 14479,
+      "consumed_bytes": 347629,
+      "buffer_bytes": 347629,
+      "reason": "natural",
+      "max_decode_gap_ms": 17,
+      "pcm_samples": 834050,
+      "peak": 31324,
+      "output_fault": 0
+    }
+  ],
+  "failed_chunks": 0,
+  "verified_tls_connections_logged": 30,
+  "rate_limit_backoff_ms": [
+    10000,
+    2000,
+    2000,
+    2000
+  ],
+  "offline_tone_completed_requests": 3,
+  "user_feedback": {
+    "first_tone_pair_heard": true,
+    "news_heard": true,
+    "news_smooth_during_check": true,
+    "additional_tone_pairs_heard": "not yet confirmed"
+  },
+  "status_after_news": {
+    "firmware": "v9.18",
+    "volume_level": 2,
+    "master": 102,
+    "channel0": 255,
+    "muted": false,
+    "speaker_running": false,
+    "speaker_task_ready": false,
+    "mic_running": true,
+    "pcm_submitted_samples": 834050,
+    "pcm_peak": 31324,
+    "output_fault": false,
+    "decoding": false,
+    "tls_memory_policy": true,
+    "tls_external_allocations": 64,
+    "tls_allocation_failures": 0,
+    "tls_last_failed_bytes": 0
+  },
+  "limitations": [
+    "One news session only; service key rejected and HTTP 429 recovered by bounded retries.",
+    "HTTP status unavailable during decoding: existing loop suppresses server.handleClient().",
+    "Rapid consecutive HTTP requests produced connection resets; cause not yet isolated.",
+    "Opening the USB serial port coincided with a POWERON boot; no explicit reset command was sent."
+  ]
+}

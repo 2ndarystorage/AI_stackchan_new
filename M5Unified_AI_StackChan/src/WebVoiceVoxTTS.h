@@ -7,6 +7,16 @@ void voicevox_cancel();
 void voicevox_reset_cancel();
 bool voicevox_certificate_error();
 
+struct VoicevoxTlsProbe {
+  bool connected;
+  int error;
+  uint32_t flags;
+  bool allocationFailure;
+  uint32_t externalAllocations;
+  uint32_t failedAllocations;
+};
+VoicevoxTlsProbe voicevox_probe_tls();
+
 // 第8弾: 文単位パイプラインTTS 用のAPI。
 // voicevox_synth_url() は tts.quest へ1文（チャンク）を合成依頼し、
 // 完成版MP3のURLを優先して返す。失敗/タイムアウト時は空文字を返す。

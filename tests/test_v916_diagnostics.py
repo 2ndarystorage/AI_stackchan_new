@@ -156,13 +156,20 @@ class WiFiClientSecure {
 '''
         self.compile_run(r'''
 #include "CheckedTlsClient.h"
+#include "TlsMemory.h"
 bool stopped=false,dnsFail=false,insecureUsed=false;
 int outcome=-9984;
 Wifi WiFi; SerialStub Serial;
+TlsMemoryStats memoryStats={true,0,0,0,0,0,0};
+TlsMemoryStats tlsMemorySnapshot() { return memoryStats; }
+uintptr_t tlsCurrentTaskTag() { return 77; }
+bool injectAllocationFailure=false;
 int start_ssl_client(sslclient_context*,IPAddress,uint16_t,const char* host,int timeout,
   const char* ca,bool bundle,const char*,const char*,const char*,const char*,bool insecure,const char**) {
   assert(std::string(host)=="api.tts.quest" && timeout==25000 && ca && !bundle && !insecure);
-  insecureUsed=insecure; return outcome;
+  insecureUsed=insecure;
+  if(injectAllocationFailure) { ++memoryStats.failures; memoryStats.lastFailedTask=77; memoryStats.lastFailedBytes=512; }
+  return outcome;
 }
 uint32_t mbedtls_ssl_get_verify_result(Context*) { assert(!stopped); return 8; }
 const mbedtls_x509_crt* mbedtls_ssl_get_peer_cert(Context*) { assert(!stopped); return nullptr; }
@@ -171,8 +178,13 @@ void mbedtls_x509_dn_gets(char*,size_t,const int*) {}
 int main() {
  CheckedTlsClient client;
  assert(!client.connect("api.tts.quest",443,25000) && stopped && !insecureUsed);
+ assert(!client.allocationFailureInHandshake());
+ stopped=false; injectAllocationFailure=true;
+ assert(!client.connect("api.tts.quest",443,25000) && client.allocationFailureInHandshake());
+ injectAllocationFailure=false;
  stopped=false; outcome=1;
  assert(client.connect("api.tts.quest",443,25000)==1 && !stopped);
+ assert(!client.allocationFailureInHandshake());
  dnsFail=true; assert(!client.connect("api.tts.quest",443,25000));
 }
 ''', {'WiFiClientSecure.h': tls_stub, 'mbedtls/x509_crt.h': '#pragma once\n'})

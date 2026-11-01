@@ -46,6 +46,7 @@ static bool audioRunning();
 #include <FastLED.h>
 #include "Scheduler.h"
 #include "TlsGate.h"
+#include "TlsMemory.h"
 #include "VersionBadge.h"
 #include "AudioHandover.h"
 #include "SpeakerVolume.h"
@@ -2147,9 +2148,36 @@ static void handle_audio_status() {
   doc["pcm_peak"] = out.peak();
   doc["output_fault"] = out.hasFault();
   doc["decoding"] = audioRunning();
+  const auto tls = tlsMemorySnapshot();
+  doc["tls_memory_policy"] = tls.installed;
+  doc["tls_external_allocations"] = tls.externalAllocations;
+  doc["tls_allocation_failures"] = tls.failures;
+  doc["tls_last_failed_bytes"] = (unsigned)tls.lastFailedBytes;
   xSemaphoreGive(g_decoder_mutex);
   String json;
   serializeJson(doc, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+static void handle_tls_test() {
+  if (server.method() != HTTP_POST || server.header("X-Stackchan-TLS-Test") != "1") {
+    server.send(403, "application/json", "{\"error\":\"Use /audio\"}"); return;
+  }
+  if (tts_processing() || audioRunning() || speech_text != "" || speech_text_buffer != "") {
+    server.send(409, "application/json", "{\"busy\":true}"); return;
+  }
+  const auto result = voicevox_probe_tls();
+  StaticJsonDocument<384> doc;
+  doc["firmware"] = STACKCHAN_FIRMWARE_LABEL;
+  doc["connected"] = result.connected;
+  doc["error"] = result.error;
+  doc["verify_flags"] = result.flags;
+  doc["allocation_failure"] = result.allocationFailure;
+  doc["external_allocations"] = result.externalAllocations;
+  doc["failed_allocations"] = result.failedAllocations;
+  doc["http_requests_sent"] = 0;
+  String json; serializeJson(doc, json);
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
 }
@@ -2539,6 +2567,11 @@ void setup()
     Serial.println("[BOOT] FATAL: graphics/TLS lock unavailable");
     for (;;) delay(1000);
   }
+  if (!installTlsMemoryPolicy()) {
+    Serial.println("[BOOT] FATAL: TLS memory policy unavailable");
+    for (;;) delay(1000);
+  }
+  Serial.println("[BOOT] TLS memory: PSRAM >=4096B, internal small allocations");
   Serial.println("[BOOT] Firmware " STACKCHAN_FIRMWARE_LABEL);
   Serial.println("[BOOT] Avatar gfx lock: vendored-v9.13 (shared mutex, draw stack=8192)");
   voicevox_log_ca();
@@ -2821,11 +2854,12 @@ void setup()
 
   delay(1000);
 
-  const char* diagnosticHeaders[] = {"X-Stackchan-Audio-Test"};
-  server.collectHeaders(diagnosticHeaders, 1);
+  const char* diagnosticHeaders[] = {"X-Stackchan-Audio-Test", "X-Stackchan-TLS-Test"};
+  server.collectHeaders(diagnosticHeaders, 2);
   server.on("/audio", []() { server.send_P(200, "text/html; charset=utf-8", AUDIO_DIAGNOSTICS_HTML); });
   server.on("/audio_status", HTTP_GET, handle_audio_status);
   server.on("/audio_test", HTTP_POST, handle_audio_test);
+  server.on("/tls_test", HTTP_POST, handle_tls_test);
   server.on("/", handleRoot);
 
   server.on("/inline", [](){

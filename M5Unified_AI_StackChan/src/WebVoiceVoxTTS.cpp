@@ -4,6 +4,7 @@
 #include "TlsGate.h"
 #include "CheckedTlsClient.h"
 #include "FirmwareVersion.h"
+#include "WebVoiceVoxTTS.h"
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>  // 最大連続ブロック計測（第9.6弾）
@@ -26,6 +27,24 @@ extern uint8_t *preallocateBuffer;
 
 void voicevox_log_ca() {
   Serial.println("[BOOT] TTS CA: ISRG Root X1 + Root YR (" STACKCHAN_FIRMWARE_LABEL ")");
+}
+
+// Handshake only: never sends HTTP, text or an API credential.
+VoicevoxTlsProbe voicevox_probe_tls() {
+  TlsGateGuard guard;
+  CheckedTlsClient client;
+  client.setCACert(root_ca);
+  client.setHandshakeTimeout(10);
+  const auto before = tlsMemorySnapshot();
+  const bool connected = client.connect("api.tts.quest", 443, 5000);
+  char error[160] = {};
+  const int code = client.lastError(error, sizeof(error));
+  const auto after = tlsMemorySnapshot();
+  VoicevoxTlsProbe result{connected, connected ? 0 : (code < 0 ? code : -1), client.verificationFlags(),
+      client.allocationFailureInHandshake(), after.externalAllocations - before.externalAllocations,
+      after.failures - before.failures};
+  client.stop();
+  return result;
 }
 //extern AudioOutputM5Speaker out;
 void StatusCallback(void *cbData, int code, const char *string);
@@ -182,14 +201,15 @@ static void tts_log_request(const char* stage, const String& url) {
                 (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
 }
 
-static WiFiClientSecure *tts_client = nullptr;
+static CheckedTlsClient *tts_client = nullptr;
 static HTTPClient *tts_https = nullptr;
 
 static void tts_log_tls_error(const char* stage) {
   if (!tts_client) return;
   char message[160] = {};
   int code = tts_client->lastError(message, sizeof(message));
-  if (code == -0x2700) tts_certificate_failed = true;
+  if (code == -0x2700 && !tts_client->allocationFailureInHandshake()) tts_certificate_failed = true;
+  if (tts_client->allocationFailureInHandshake()) Serial.println("[TLS] cause=memory-allocation-failure; keep certificate checks enabled");
   Serial.printf("[TLS] %s last_error=%d (%s)\n", stage, code, message);
 }
 

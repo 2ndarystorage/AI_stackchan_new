@@ -27,6 +27,7 @@ static bool audioRunning();
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include "HttpBody.h"  // chunked デコード付き本文読み取り（第9.22弾）
 #include "rootCACertificate.h"
 #include "rootCAgoogle.h"
 #include "rootCANHK.h"
@@ -1995,6 +1996,11 @@ static const char* WEATHER_API_URL =
   "&timezone=Asia%2FTokyo";
 
 // Open-Meteo の JSON 本文を取得する（1回分）。HTTPコードは g_weather_http_code に残す
+// 第9.22弾: 本文は HttpBody.h の ChunkReader で読む。Open-Meteo は
+// Transfer-Encoding: chunked で返すため、生ストリームをそのまま String に
+// 入れると先頭にチャンクサイズ行（実測で本文638バイトに対し+12バイト）が
+// 混ざり、deserializeJson が失敗していた（v9.21 実機で確認）。
+// Content-Length 形式の応答でも同じ経路で読める。
 static bool fetchWeatherJsonOnce(String& out) {
   out = "";
   g_weather_http_code = 0;
@@ -2010,31 +2016,30 @@ static bool fetchWeatherJsonOnce(String& out) {
   {
     HTTPClient https;
     https.setTimeout(10000);
+    const char* reqHeaders[] = {"Content-Length", "Transfer-Encoding"};
+    https.collectHeaders(reqHeaders, 2);
     if (https.begin(*client, WEATHER_API_URL)) {
       int code = https.GET();
       g_weather_http_code = code;
       Serial.printf("[Weather] GET... code: %d\n", code);
       if (code == HTTP_CODE_OK) {
+        int size = https.getSize();  // Content-Length（無ければ -1）
+        String te = https.header("Transfer-Encoding");
+        te.toLowerCase();
+        bool chunked = te.indexOf("chunked") >= 0;
+        Serial.printf("[Weather] headers: content-length=%d transfer-encoding=%s (mode=%s)\n",
+                      size, te.c_str(), chunked ? "chunked" : (size > 0 ? "identity" : "close"));
         WiFiClient *stream = https.getStreamPtr();
         if (stream) {
+          ChunkReader reader;
+          reader.begin(stream, chunked, 12000);
           String payload;
-          payload.reserve(4096);
-          const uint32_t deadline = millis() + 12000;
-          const size_t MAX_BYTES = 32 * 1024;
-          uint8_t rbuf[512];
-          while ((int32_t)(millis() - deadline) < 0 && payload.length() < MAX_BYTES) {
-            size_t avail = stream->available();
-            if (avail == 0) {
-              if (!stream->connected()) break;
-              delay(1);
-              continue;
-            }
-            int n = stream->read(rbuf, avail < sizeof(rbuf) ? avail : sizeof(rbuf));
-            if (n > 0) payload.concat((const char*)rbuf, (unsigned int)n);
-            else delay(1);
-          }
-          Serial.printf("[Weather] body %u bytes\n", (unsigned)payload.length());
-          if (payload.length() > 0) { out = payload; ok = true; }
+          int readStatus = 1;
+          bool complete = httpReadBody(reader, payload, 32 * 1024,
+                                       size > 0 ? size : -1, &readStatus);
+          Serial.printf("[Weather] body %u bytes (complete=%d, status=%d)\n",
+                        (unsigned)payload.length(), (int)complete, readStatus);
+          if (complete && payload.length() > 0) { out = payload; ok = true; }
         }
       }
       https.end();
@@ -2109,7 +2114,8 @@ static String exec_weather_impl(int dayOffset) {
   String payload;
   if (fetchWeatherJson(payload)) {
     DynamicJsonDocument doc(8192);
-    if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+    DeserializationError jerr = deserializeJson(doc, payload);
+    if (jerr == DeserializationError::Ok) {
       JsonArray times = doc["daily"]["time"];
       JsonArray codes = doc["daily"]["weathercode"];
       JsonArray tmaxs = doc["daily"]["temperature_2m_max"];
@@ -2143,7 +2149,9 @@ static String exec_weather_impl(int dayOffset) {
         }
       }
     } else {
-      Serial.println("[Weather] JSON parse failed");
+      // 第9.22弾: 失敗理由（InvalidInput / NoMemory 等）と本文先頭を残す
+      Serial.printf("[Weather] JSON parse failed: %s (body %u bytes, head=\"%.24s\")\n",
+                    jerr.c_str(), (unsigned)payload.length(), payload.c_str());
     }
   }
   if (text != "") {

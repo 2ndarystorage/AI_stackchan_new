@@ -49,3 +49,15 @@ After drawing the face, `Avatar::draw()` calls the application-owned
 `stackchan_draw_version_badge()` before releasing GfxLockGuard. This keeps
 the top-left firmware label visible above the balloon, with no extra task
 or out-of-lock display access. Keep this hook when updating the library.
+
+## v9.19 balloon position and font size
+
+`src/Balloon.h`: the speech balloon overlapped the two-line caption panel
+that the application's KinakoFace draws at the bottom of the screen
+(panel y196–240, glyphs from y200). The balloon center was moved up
+(`cy` 220 → 170), so its bottom edge (cy + textHeight*2+2 = 196) now sits
+exactly at the caption panel's top edge, and the balloon text size was
+reduced (`TEXT_SIZE` 2 → 1.5, changed to a float constant; about 32px →
+24px glyphs with the efontJA_16 speech font). The caption font is drawn
+by the application and is unchanged. Keep both values when updating the
+library.

@@ -42,3 +42,10 @@ application calls at boot. A registry header fails compilation; a registry
 implementation fails linking. `setExpression()` takes the shared recursive
 graphics lock rather than suspending drawLoop mid-transaction. The draw stack
 remains 8192 bytes and `Avatar::draw()` holds the same lock as dance playback.
+
+## v9.16 version overlay
+
+After drawing the face, `Avatar::draw()` calls the application-owned
+`stackchan_draw_version_badge()` before releasing GfxLockGuard. This keeps
+the top-left firmware label visible above the balloon, with no extra task
+or out-of-lock display access. Keep this hook when updating the library.

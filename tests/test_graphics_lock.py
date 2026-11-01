@@ -35,6 +35,11 @@ class GraphicsLockTests(unittest.TestCase):
 std::recursive_mutex graphicsMutex;
 SemaphoreHandle_t g_gfx_mutex = &graphicsMutex;
 std::atomic<int> active{0};
+void stackchan_draw_version_badge() {
+  assert(active.fetch_add(1)==0);
+  std::this_thread::yield();
+  assert(active.fetch_sub(1)==1);
+}
 struct Gaze { Gaze(float,float) {} };
 struct DrawContext { template<class... T> DrawContext(T...) {} };
 struct Face {

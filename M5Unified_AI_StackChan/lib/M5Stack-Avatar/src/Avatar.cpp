@@ -17,6 +17,8 @@ extern "C" unsigned stackchan_avatar_gfx_lock_revision() {
 #define PI 3.1415926535897932384626433832795
 #endif
 
+extern void stackchan_draw_version_badge();
+
 namespace m5avatar {
 
 unsigned int seed = 0;
@@ -212,6 +214,7 @@ void Avatar::draw() {
                                      this->mouthOpenRatio, this->speechText,
                                      this->rotation, this->scale, this->colorDepth, this->batteryIconStatus, this->batteryLevel, this->speechFont);
   face->draw(ctx);
+  ::stackchan_draw_version_badge();
   delete ctx;
 }
 

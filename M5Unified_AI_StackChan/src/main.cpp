@@ -46,6 +46,10 @@ static bool audioRunning();
 #include <FastLED.h>
 #include "Scheduler.h"
 #include "TlsGate.h"
+#include "VersionBadge.h"
+#include "AudioHandover.h"
+#include "Mp3DiagnosticLogger.h"
+#include <driver/i2s.h>
 #include "GfxLock.h"  // グラフィックス直列化ロック（第9.3弾）
 
 // グラフィックス直列化ロックの実体（第9.3弾、GfxLock.h）。
@@ -53,6 +57,13 @@ static bool audioRunning();
 // 同じ LGFX オブジェクトを同時に触らないよう直列化する。
 SemaphoreHandle_t g_gfx_mutex = nullptr;
 SemaphoreHandle_t g_tls_mutex = nullptr;
+
+// Called by the vendored Avatar while the shared graphics mutex is held.
+void stackchan_draw_version_badge() { drawFirmwareVersionBadge(M5.Display); }
+static bool audioBeginMicrophone() {
+  return handoverToMicrophone(M5.Speaker, M5.Mic,
+      [](i2s_port_t port) { i2s_driver_uninstall(port); });
+}
 
 // 保存する質問と回答の最大数
 const int MAX_HISTORY = 5;
@@ -621,11 +632,12 @@ static bool g_tts_synth_busy = false;      // 合成タスクが1文を処理中
 static bool g_speech_session = false;      // 発話セッション中（投入〜全チャンク再生完了）
 static SemaphoreHandle_t g_tts_mutex = nullptr;
 static uint32_t g_tts_gen = 0;             // 発話セッションの世代（中断時に進めて合成結果を無効化）
-static bool g_tts_release_req = false;     // 接続ペア解放の依頼（第9.8弾: 合成タスク自身がアイドル時に実行する）
+static std::atomic<bool> g_tts_release_req{false};     // 接続ペア解放の依頼（第9.8弾: 合成タスク自身がアイドル時に実行する）
 static uint32_t g_stop_msg_until = 0;      // 「中断しました」吹き出しを消す時刻（0=非表示）
 static uint32_t g_info_msg_until = 0;      // 通知吹き出し（ニュース取得失敗など）を消す時刻（0=非表示。第9.6弾）
 
 static unsigned g_tts_failed_chunks = 0;
+static bool g_tts_certificate_failed = false;
 static bool tts_processing() {
   if (!g_tts_mutex) return false;
   xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
@@ -714,6 +726,7 @@ static void tts_enqueue(const String& text, const String& parms) {
   if (!g_speech_session) {
     g_speech_session = true;
     g_tts_failed_chunks = 0;
+    g_tts_certificate_failed = false;
     g_tts_played_in_session = false;  // 第9.10弾: 新セッションではプリバッファ判定をリセット
     g_tts_prebuf_since = 0;
   }
@@ -1815,8 +1828,13 @@ static void audioDecodeTask(void*) {
 }
 
 static uint32_t g_play_start_ms = 0;    // 再生開始 millis（0=計測中でない）
-static uint32_t g_play_data_len = 0;    // 再生中データの総バイト数（メモリ再生時）
+static std::atomic<uint32_t> g_play_data_len{0};    // 再生中データの総バイト数（メモリ再生時）
 static int32_t  g_play_expect_ms = -1;  // 想定音声長ms（-1=不明／ストリーム再生）
+
+static bool mp3SourceAtEnd() {
+  return memfile && g_play_data_len && memfile->getPos() >= g_play_data_len;
+}
+static Mp3DiagnosticLogger g_mp3_logger(Serial, mp3SourceAtEnd);
 
 static int32_t mp3_expected_duration_ms(const uint8_t *d, size_t len) {
   if (d == nullptr || len < 4) return -1;
@@ -1951,6 +1969,12 @@ void ttsSynthTask(void *args)
       ++g_tts_failed_chunks;
       Serial.println("[TTS] chunk failed; no empty ready item queued");
     }
+    if (gen == g_tts_gen && voicevox_certificate_error()) {
+      g_tts_certificate_failed = true;
+      g_tts_failed_chunks += g_tts_queue.size();
+      g_tts_queue.clear();
+      Serial.println("[TTS] session halted: certificate verification failed; inspect [TLS] flags");
+    }
     g_tts_synth_busy = false;
     xSemaphoreGive(g_tts_mutex);
     if (dlData != nullptr) heap_caps_free(dlData);  // 世代が進んでいた場合は破棄
@@ -2049,8 +2073,10 @@ void tts_drive()
   if (g_speech_session && !pending) {
     g_speech_session = false;
     Serial.printf("[TTS] session end: failed_chunks=%u\n", g_tts_failed_chunks);
-    if (g_tts_failed_chunks && !g_tts_played_in_session) {
-      avatar.setSpeechText("音声取得に失敗しました。ログを確認してください");
+    if (g_tts_certificate_failed || (g_tts_failed_chunks && !g_tts_played_in_session)) {
+      avatar.setSpeechText(g_tts_certificate_failed
+          ? "TLS証明書エラー。診断ログを確認"
+          : "音声取得に失敗しました。ログを確認してください");
       g_info_msg_until = millis() + 5000;
     }
     // 第9.8弾: セッション終了後は TTS 接続ペアを解放し、TLSバッファ等を
@@ -2064,13 +2090,8 @@ void tts_drive()
     g_led_news_active = false;
     if (g_cap_armed) captionReset();  // 全文の合成失敗などで再生されなかった場合
     delay(200);
-    M5.Speaker.end();
-    M5.Mic.begin();
-    // 第9.10弾: I2S登録失敗ログの発生源を切り分けるためのマーカー。
-    // この直後に I2S エラーが1回出るのは M5Unified の仕様どおりの
-    // ハンドオーバ（Speaker.end はドライバを解放しないため、Mic.begin の
-    // 初回 install が競合→自動復旧する）。マーカー無しでエラーが頻発する
-    // 場合は、別の呼び出し元が begin/end を繰り返していることになる。
+    audioBeginMicrophone();
+    // v9.16: Speaker.end() leaves I2S installed; audioBeginMicrophone releases it first.
     Serial.println("[AUDIO] handover spk->mic (session end)");
     if (wakeword_is_enable) mode = 1;
     else mode = 0;
@@ -2434,8 +2455,11 @@ void setup()
     Serial.println("[BOOT] FATAL: graphics/TLS lock unavailable");
     for (;;) delay(1000);
   }
+  Serial.println("[BOOT] Firmware " STACKCHAN_FIRMWARE_LABEL);
   Serial.println("[BOOT] Avatar gfx lock: vendored-v9.13 (shared mutex, draw stack=8192)");
   voicevox_log_ca();
+  drawFirmwareVersionBadge(M5.Display);
+  M5.Display.setCursor(0, 22);
 
   // 起動時診断（第8弾）: リセット要因と空きヒープを Serial と画面に出す。
   // 異常リセット（パニック/ウォッチドッグ/電圧低下）の切り分けを
@@ -2480,7 +2504,7 @@ void setup()
   micConfig.sample_rate = 16000;
   M5.Mic.config(micConfig);
 }
-  M5.Mic.begin();
+  audioBeginMicrophone();
 
   { /// custom setting
     auto spk_cfg = M5.Speaker.config();
@@ -2767,7 +2791,7 @@ void setup()
   M5.Lcd.print("/ to control the chatGpt Server.\n");
   delay(3000);
 
-  audioLogger = &Serial;
+  audioLogger = &g_mp3_logger;
   // MP3デコーダの作業領域（約38KB。mad_frame 約21KB＋mad_synth
   // 約13KB＋入力バッファ等）は、従来 begin() のたびに内蔵ヒープへ
   // malloc され stop() で free されており、大きな断片化要因になっていた。
@@ -2802,7 +2826,7 @@ void setup()
     Serial.println("[BOOT] FATAL: MP3 decoder task unavailable");
     for (;;) delay(1000);
   }
-  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 v9.15)");
+  Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 " STACKCHAN_FIRMWARE_LABEL ")");
   wakeword_init();
 
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動
@@ -2900,8 +2924,7 @@ void sw_tone(){
       M5.Mic.end();
         M5.Speaker.tone(1000, 100);
       delay(500);
-        M5.Speaker.end();
-      M5.Mic.begin();
+        audioBeginMicrophone();
 }
 
 // ==== ダンス動画再生（第9弾／第9.1弾で安全化） ====
@@ -3041,6 +3064,7 @@ static bool play_dance_video() {
       }
       continue;  // 1フレームの失敗では止めず次へ
     }
+    drawFirmwareVersionBadge(M5.Lcd);
     consec_errors = 0;
     drawn++;
   }
@@ -3207,6 +3231,7 @@ static void drawMenuList() {
     M5.Lcd.print((i == g_menu_sel) ? "▶ " : "  ");
     M5.Lcd.print(NEWS_CATS[i].label);
   }
+  drawFirmwareVersionBadge(M5.Lcd);
 }
 
 // 左上/左下タップ：メニューを開く／前後のカテゴリへ移動する
@@ -3308,15 +3333,14 @@ void loop()
     btnB_long_fired = false;
   }
 
-  if (M5.BtnB.pressedFor(2000)) {
+  if (!tts_processing() && M5.BtnB.pressedFor(2000)) {
      btnB_long_fired = true;  // 長押し（ウェイクワード登録）が発動したら短押し扱いしない
      M5.Mic.end();
      M5.Speaker.tone(1000, 100);
      delay(500);
      M5.Speaker.tone(600, 100);
      delay(1000);
-    M5.Speaker.end();
-    M5.Mic.begin();
+    audioBeginMicrophone();
     random_time = -1;           //独り言停止
     random_speak = true;
     wakeword_is_enable = false; //wakeword 無効
@@ -3409,7 +3433,7 @@ void loop()
       if (box_servo.contain(t.x, t.y))
       {
         servo_home = !servo_home;
-        M5.Speaker.tone(1000, 100);
+        sw_tone();
       }
 #endif
       if (box_BtnA.contain(t.x, t.y))

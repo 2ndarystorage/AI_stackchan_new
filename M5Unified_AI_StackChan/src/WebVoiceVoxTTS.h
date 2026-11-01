@@ -5,6 +5,7 @@
 void voicevox_log_ca();
 void voicevox_cancel();
 void voicevox_reset_cancel();
+bool voicevox_certificate_error();
 
 // 第8弾: 文単位パイプラインTTS 用のAPI。
 // voicevox_synth_url() は tts.quest へ1文（チャンク）を合成依頼し、

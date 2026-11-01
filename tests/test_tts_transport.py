@@ -84,6 +84,7 @@ bool tts_ensure_connection() { assert(live==0); ++live; ++opened; return true; }
 void tts_forget_connection() { live=0; }
 void tts_log_request(const char*,const String&) {}
 void tts_log_tls_error(const char*) {}
+bool tts_certificate_failed=false;
 '''
         code += body(tts, 'static bool tts_wait(uint32_t ms)')
         code += body(tts, 'static bool tts_wait_until_ready()')
@@ -127,9 +128,11 @@ std::deque<TtsChunk> g_tts_queue;
 std::deque<TtsReadyItem> g_tts_ready_q;
 const unsigned TTS_READY_MAX=3;
 bool g_tts_synth_busy=false, g_tts_release_req=false;
+bool g_tts_certificate_failed=false;
 uint32_t g_tts_gen=0;
 unsigned g_tts_failed_chunks=0, freed=0, released=0;
 int scenario=0;
+bool voicevox_certificate_error() { return scenario==3; }
 uint8_t data[8];
 struct SerialStub { template<class... T> void printf(T...) {} void println(const char*) {} } Serial;
 const int WL_CONNECTED=1;
@@ -138,7 +141,7 @@ void voicevox_reset_cancel() {}
 String voicevox_synth_url(const char*, const char*) { assert(g_tts_synth_busy); return "url"; }
 int voicevox_download_mp3(const String&,uint8_t** out,size_t* len) {
   assert(g_tts_synth_busy);
-  if(scenario==1) return -1;
+  if(scenario==1 || scenario==3) return -1;
   *out=data; *len=sizeof(data);
   if(scenario==2) { ++g_tts_gen; assert(g_tts_synth_busy); }
   return 0;
@@ -150,14 +153,16 @@ void delay(unsigned) { throw Done{}; }
 '''
         checks = r'''
 int main() {
-  for(scenario=0;scenario<3;++scenario) {
+  for(scenario=0;scenario<4;++scenario) {
     g_tts_queue.push_back({"text","parms"});
+    if(scenario==3) { g_tts_queue.push_back({"later",""}); g_tts_queue.push_back({"last",""}); }
     try { ttsSynthTask(nullptr); } catch(Done&) {}
     assert(!g_tts_synth_busy && g_tts_queue.empty());
     if(scenario==0) { assert(g_tts_ready_q.size()==1); assert(g_tts_ready_q.front().data==data); g_tts_ready_q.clear(); }
     else assert(g_tts_ready_q.empty());
   }
-  assert(g_tts_failed_chunks==1 && freed==1 && released==3);
+  assert(g_tts_failed_chunks==4 && freed==1 && released==4);
+  assert(g_tts_certificate_failed);
 }
 '''
         self.compile_run(prefix + worker + checks)

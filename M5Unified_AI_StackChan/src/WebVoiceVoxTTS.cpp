@@ -2,6 +2,8 @@
 #include <atomic>
 #include <time.h>
 #include "TlsGate.h"
+#include "CheckedTlsClient.h"
+#include "FirmwareVersion.h"
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <esp_heap_caps.h>  // 最大連続ブロック計測（第9.6弾）
@@ -23,7 +25,7 @@ extern int preallocateBufferSize;
 extern uint8_t *preallocateBuffer;
 
 void voicevox_log_ca() {
-  Serial.println("[BOOT] TTS CA: ISRG Root X1 + Root YR (v9.15)");
+  Serial.println("[BOOT] TTS CA: ISRG Root X1 + Root YR (" STACKCHAN_FIRMWARE_LABEL ")");
 }
 //extern AudioOutputM5Speaker out;
 void StatusCallback(void *cbData, int code, const char *string);
@@ -157,8 +159,10 @@ static const int TTS_MAX_RETRY = 2;
 static const uint32_t TTS_ERR_RETRY_WAIT_MS = 2000;
 static std::atomic<bool> tts_cancel_requested{false};
 static String tts_status_url;
+static std::atomic<bool> tts_certificate_failed{false};
+bool voicevox_certificate_error() { return tts_certificate_failed; }
 void voicevox_cancel() { tts_cancel_requested = true; }
-void voicevox_reset_cancel() { tts_cancel_requested = false; }
+void voicevox_reset_cancel() { tts_cancel_requested = false; tts_certificate_failed = false; }
 static bool tts_wait(uint32_t ms) {
   uint32_t start = millis();
   while (millis() - start < ms) {
@@ -185,6 +189,7 @@ static void tts_log_tls_error(const char* stage) {
   if (!tts_client) return;
   char message[160] = {};
   int code = tts_client->lastError(message, sizeof(message));
+  if (code == -0x2700) tts_certificate_failed = true;
   Serial.printf("[TLS] %s last_error=%d (%s)\n", stage, code, message);
 }
 
@@ -210,7 +215,7 @@ static void tts_forget_connection() {
 static bool tts_ensure_connection() {
   if (tts_client && tts_https) return true;
   tts_forget_connection();
-  tts_client = new WiFiClientSecure;
+  tts_client = new CheckedTlsClient;
   if (!tts_client) return false;
   tts_client->setCACert(root_ca);
   tts_client->setTimeout(TTS_SYNTH_TIMEOUT_MS);
@@ -300,6 +305,7 @@ String voicevox_synth_url(const char* text, const char* tts_parms) {
                   tts_https->errorToString(httpCode).c_str(),
                   (unsigned long)(millis() - t0), (unsigned)ESP.getFreeHeap());
     tts_forget_connection();
+    if (tts_certificate_failed) return "";
     if (attempt < TTS_MAX_RETRY) { if (!tts_wait(TTS_ERR_RETRY_WAIT_MS)) return ""; continue; }
     return "";
   }
@@ -683,6 +689,7 @@ static bool tts_wait_until_ready() {
     if (code < 0) tts_log_tls_error("status");
     String payload = code == HTTP_CODE_OK ? tts_https->getString() : "";
     tts_forget_connection();
+    if (tts_certificate_failed) return false;
     if (code == HTTP_CODE_OK) {
       DynamicJsonDocument status(2048);
       if (deserializeJson(status, payload)) return false;
@@ -711,7 +718,7 @@ int voicevox_download_mp3(const String& url, uint8_t** outData, size_t* outLen) 
     if (rc == DL_TOO_LARGE) return 1;
     // 失敗時は接続まわりを完全に解放してから作り直す（第9.4弾の対管理）
     tts_forget_connection();
-    if (rc == DL_FAIL_NORETRY) return -1;
+    if (rc == DL_FAIL_NORETRY || tts_certificate_failed) return -1;
     if (attempt < 1) { if (!tts_wait(TTS_DL_RETRY_WAIT_MS)) return -1; continue; }
     return -1;
   }

@@ -78,7 +78,9 @@
     "first_tone_pair_heard": true,
     "news_heard": true,
     "news_smooth_during_check": true,
-    "additional_tone_pairs_heard": "not yet confirmed"
+    "latest_additional_tone_pair_heard": true,
+    "latest_additional_tone_pair_feedback": "テスト音を確認しました。",
+    "intermediate_tone_pair_heard": "not separately confirmed"
   },
   "status_after_news": {
     "firmware": "v9.18",

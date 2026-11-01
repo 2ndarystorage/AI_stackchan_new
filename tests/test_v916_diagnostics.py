@@ -87,7 +87,7 @@ struct Display {
   void setTextSize(int n) { style.size=n; }
   void setTextColor(int c,int) { style.color=c; }
   void drawString(const char* label,int x,int y,const int* f) {
-    assert(!strcmp(label,"v9.16") && x==6 && y==4 && f==&fonts::Font0);
+    assert(!strcmp(label,STACKCHAN_FIRMWARE_LABEL) && x==6 && y==4 && f==&fonts::Font0);
     assert(style.datum==lgfx::textdatum_t::top_left && style.size==1); font=f; drew=true;
   }
 };

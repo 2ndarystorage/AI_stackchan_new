@@ -48,6 +48,8 @@ static bool audioRunning();
 #include "TlsGate.h"
 #include "VersionBadge.h"
 #include "AudioHandover.h"
+#include "SpeakerVolume.h"
+#include "AudioDiagnosticsPage.h"
 #include "Mp3DiagnosticLogger.h"
 #include <driver/i2s.h>
 #include "GfxLock.h"  // グラフィックス直列化ロック（第9.3弾）
@@ -516,14 +518,14 @@ uint32_t g_vol_gauge_until = 0;      // ゲージを消す時刻
 // 音量レベルをスピーカーへ適用する（save=true で NVS "setting"/"vol" へ保存）
 static void applyVolLevel(bool save) {
   uint8_t v = VOL_VALUES[g_vol_level];
-  // MP3再生は AudioOutputM5Speaker が仮想チャンネル0へ playRaw するため、
-  // マスター音量とチャンネル音量の両方へ設定する（既存の /setting や起動時適用と同じ経路）
-  M5.Speaker.setVolume(v);
-  M5.Speaker.setChannelVolume(m5spk_virtual_channel, v);
+  // Apply user gain only once; keep speech and tone channels at unity.
+  setSpeechVolume(M5.Speaker, v);
   if (save) {
     uint32_t nvs_handle;
     if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
       nvs_set_u8(nvs_handle, "vol", g_vol_level);
+      nvs_set_u32(nvs_handle, "volume", v);
+      nvs_commit(nvs_handle);
       nvs_close(nvs_handle);
     }
   }
@@ -638,6 +640,7 @@ static uint32_t g_info_msg_until = 0;      // 通知吹き出し（ニュース�
 
 static unsigned g_tts_failed_chunks = 0;
 static bool g_tts_certificate_failed = false;
+static bool g_tts_output_failed = false;
 static bool tts_processing() {
   if (!g_tts_mutex) return false;
   xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
@@ -727,6 +730,7 @@ static void tts_enqueue(const String& text, const String& parms) {
     g_speech_session = true;
     g_tts_failed_chunks = 0;
     g_tts_certificate_failed = false;
+    g_tts_output_failed = false;
     g_tts_played_in_session = false;  // 第9.10弾: 新セッションではプリバッファ判定をリセット
     g_tts_prebuf_since = 0;
   }
@@ -1195,8 +1199,8 @@ void handle_setting() {
     TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
   }
 
-  if(value == "") value = "180";
-  size_t volume = value.toInt();
+  long requestedVolume = value == "" ? M5.Speaker.getVolume() : value.toInt();
+  size_t volume = requestedVolume < 0 ? 0 : (requestedVolume > 255 ? 255 : requestedVolume);
   uint8_t led_onoff = 0;
   uint32_t nvs_handle;
   if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
@@ -1208,11 +1212,11 @@ void handle_setting() {
       nvs_set_u8(nvs_handle, "led", led_onoff);
     }
     if(speaker != "") nvs_set_u8(nvs_handle, "speaker", speaker_no);
-
+    nvs_commit(nvs_handle);
     nvs_close(nvs_handle);
   }
-  M5.Speaker.setVolume(volume);
-  M5.Speaker.setChannelVolume(m5spk_virtual_channel, volume);
+  g_vol_level = volumeToLevel((uint8_t)volume);
+  applyVolLevel(true);
   server.send(200, "text/plain", String("OK"));
 }
 
@@ -1815,7 +1819,8 @@ static void audioDecodeTask(void*) {
         if (gap > g_decoder_max_gap_ms) g_decoder_max_gap_ms = gap;
       }
       g_decoder_last_ms = now;
-      if (!mp3->loop()) {
+      const bool decoding = mp3->loop();
+      if (!decoding || out.hasFault()) {
         mp3->stop();
         g_decoder_end_ms = millis();
         g_decoder_running = false;
@@ -1879,22 +1884,37 @@ static void tts_log_play_end() {
                      ? (int32_t)(g_play_expect_ms / TTS_SPEED_RATE) : -1;
   const char *reason = "stream";
   if (g_play_data_len > 0) {
-    reason = (consumed >= g_play_data_len || g_play_data_len - consumed <= 8192) ? "natural" : "early-stop";
+    reason = out.hasFault() ? "output-error"
+        : (consumed >= g_play_data_len || g_play_data_len - consumed <= 8192) ? "natural" : "early-stop";
   }
   Serial.printf("[TTS] mp3 stop: elapsed=%ums expect=%dms expect_wall=%dms consumed=%u/%uB reason=%s max_decode_gap=%ums\n",
                 (unsigned)elapsed, (int)g_play_expect_ms, (int)wall,
                 (unsigned)consumed, (unsigned)g_play_data_len, reason, (unsigned)g_decoder_max_gap_ms);
+  if (out.hasFault()) {
+    g_tts_output_failed = true;
+    xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+    ++g_tts_failed_chunks;
+    xSemaphoreGive(g_tts_mutex);
+  }
+  Serial.printf("[AUDIO] PCM submitted=%u peak=%u output_fault=%d master=%u channel0=%u\n",
+      (unsigned)out.submittedSamples(), (unsigned)out.peak(), out.hasFault(),
+      (unsigned)M5.Speaker.getVolume(), (unsigned)M5.Speaker.getChannelVolume(0));
   g_play_start_ms = 0;
   g_play_data_len = 0;
   g_play_expect_ms = -1;
 }
 
 bool playMP3(AudioFileSource *src){
+  const auto spk = M5.Speaker.config();
+  Serial.printf("[AUDIO] begin firmware=%s board=%d bck=%d ws=%d data=%d port=%d master=%u channel0=%u mute=%d\n",
+      STACKCHAN_FIRMWARE_LABEL, (int)M5.getBoard(), (int)spk.pin_bck, (int)spk.pin_ws, (int)spk.pin_data_out,
+      (int)spk.i2s_port, (unsigned)M5.Speaker.getVolume(), (unsigned)M5.Speaker.getChannelVolume(0), M5.Speaker.getVolume()==0);
   xSemaphoreTake(g_decoder_mutex, portMAX_DELAY);
   g_decoder_finished = false;
   g_decoder_end_ms = g_decoder_last_ms = g_decoder_max_gap_ms = 0;
   out.setAbort(false);
   bool ok = mp3->begin(src, &out);
+  if (!ok) Serial.println("[AUDIO] output begin failed; playback was not started");
   g_decoder_running = ok;
   xSemaphoreGive(g_decoder_mutex);
   return ok;
@@ -2057,6 +2077,10 @@ void tts_drive()
       // begin 失敗時はソースとデータをここで解放する
       if (memfile != nullptr) { delete memfile; memfile = nullptr; }
       if (g_play_data != nullptr) { heap_caps_free(g_play_data); g_play_data = nullptr; }
+      g_tts_output_failed = true;
+      xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
+      ++g_tts_failed_chunks;
+      xSemaphoreGive(g_tts_mutex);
       Serial.println("[TTS] play begin failed (memory); skip sentence");
       return;
     }
@@ -2073,9 +2097,9 @@ void tts_drive()
   if (g_speech_session && !pending) {
     g_speech_session = false;
     Serial.printf("[TTS] session end: failed_chunks=%u\n", g_tts_failed_chunks);
-    if (g_tts_certificate_failed || (g_tts_failed_chunks && !g_tts_played_in_session)) {
-      avatar.setSpeechText(g_tts_certificate_failed
-          ? "TLS証明書エラー。診断ログを確認"
+    if (g_tts_output_failed || g_tts_certificate_failed || (g_tts_failed_chunks && !g_tts_played_in_session)) {
+      avatar.setSpeechText(g_tts_output_failed ? "スピーカー出力エラー。/audioで確認"
+          : g_tts_certificate_failed ? "TLS証明書エラー。診断ログを確認"
           : "音声取得に失敗しました。ログを確認してください");
       g_info_msg_until = millis() + 5000;
     }
@@ -2096,6 +2120,66 @@ void tts_drive()
     if (wakeword_is_enable) mode = 1;
     else mode = 0;
   }
+}
+
+static void handle_audio_status() {
+  if (xSemaphoreTake(g_decoder_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+    server.send(503, "application/json", "{\"busy\":true}");
+    return;
+  }
+  StaticJsonDocument<768> doc;
+  const auto cfg = M5.Speaker.config();
+  doc["firmware"] = STACKCHAN_FIRMWARE_LABEL;
+  doc["board"] = (int)M5.getBoard();
+  doc["pmic"] = (int)M5.Power.getType();
+  doc["volume_level"] = g_vol_level;
+  doc["master"] = M5.Speaker.getVolume();
+  doc["channel0"] = M5.Speaker.getChannelVolume(0);
+  doc["muted"] = M5.Speaker.getVolume() == 0;
+  doc["speaker_running"] = M5.Speaker.isRunning();
+  doc["speaker_task_ready"] = speakerBackendReady(M5.Speaker);
+  doc["mic_running"] = M5.Mic.isRunning();
+  doc["bck"] = cfg.pin_bck;
+  doc["ws"] = cfg.pin_ws;
+  doc["data"] = cfg.pin_data_out;
+  doc["i2s_port"] = (int)cfg.i2s_port;
+  doc["pcm_submitted_samples"] = out.submittedSamples();
+  doc["pcm_peak"] = out.peak();
+  doc["output_fault"] = out.hasFault();
+  doc["decoding"] = audioRunning();
+  xSemaphoreGive(g_decoder_mutex);
+  String json;
+  serializeJson(doc, json);
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
+
+static void handle_audio_test() {
+  // A custom header prevents cross-origin HTML forms from sounding the test.
+  if (server.method() != HTTP_POST || server.header("X-Stackchan-Audio-Test") != "1") {
+    server.send(403, "text/plain", "Use the test button on /audio"); return;
+  }
+  if (tts_processing() || audioRunning() || speech_text != "" || speech_text_buffer != "") {
+    server.send(409, "text/plain", "音声処理の終了後に実行してください"); return;
+  }
+  const uint8_t master = M5.Speaker.getVolume();
+  const uint8_t channel = M5.Speaker.getChannelVolume(7);
+  M5.Mic.end();
+  setSpeechVolume(M5.Speaker, 102);
+  bool queued = M5.Speaker.begin() && speakerBackendReady(M5.Speaker);
+  if (queued) {
+    queued = M5.Speaker.tone(660, 150, 7, true);
+    delay(200);
+    queued = M5.Speaker.tone(880, 150, 7, true) && queued;
+    delay(200);
+  }
+  audioBeginMicrophone();
+  setSpeechVolume(M5.Speaker, master);
+  M5.Speaker.setChannelVolume(7, channel);
+  Serial.printf("[AUDIO] offline test queued=%d restored_master=%u\n", queued, (unsigned)master);
+  server.send(queued ? 200 : 500, "text/plain", queued
+      ? "2音の出力を要求しました。聞こえたか確認してください。元の音量に戻しました。"
+      : "スピーカーの開始に失敗しました。診断状態とログを確認してください。");
 }
 
 // ニュース読み上げの中断（追加D）。中央タップから呼ばれる。
@@ -2132,7 +2216,7 @@ static void stop_news_speech() {
   g_pose_state = -1;  // 第9弾: 中断時もポーズを待機/表情連動へ戻す
   captionReset();  // 字幕キュー破棄・字幕パネル消去・LEDのニュース色解除
   // 中断フィードバック：確認音＋吹き出しに短く表示（loop 側で約1.5秒後に消す）
-  M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level]);
+  M5.Speaker.setChannelVolume(7, 255);
   M5.Speaker.tone(1046.5f, 60, 7, false);
   avatar.setSpeechText("中断しました");
   g_stop_msg_until = millis() + 1500;
@@ -2446,9 +2530,9 @@ void setup()
 
   auto cfg = M5.config();
 
-  cfg.external_spk = true;    /// use external speaker (SPK HAT / ATOMIC SPK)
-//cfg.external_spk_detail.omit_atomic_spk = true; // exclude ATOMIC SPK
-//cfg.external_spk_detail.omit_spk_hat    = true; // exclude SPK HAT
+  cfg.internal_spk = true;
+  cfg.external_spk = false;
+  cfg.external_speaker_value = 0;  // This build targets the built-in Core2 speaker.
 //  cfg.output_power = true;
   M5.begin(cfg);
   if (!g_gfx_mutex || !g_tls_mutex || stackchan_avatar_gfx_lock_revision() != STACKCHAN_AVATAR_GFX_LOCKED) {
@@ -2509,7 +2593,7 @@ void setup()
   { /// custom setting
     auto spk_cfg = M5.Speaker.config();
     /// Increasing the sample_rate will improve the sound quality instead of increasing the CPU load.
-    spk_cfg.sample_rate = 96000; // default:64000 (64kHz)  e.g. 48000 , 50000 , 80000 , 96000 , 100000 , 128000 , 144000 , 192000 , 200000
+    spk_cfg.sample_rate = 48000; // default:64000 (64kHz)  e.g. 48000 , 50000 , 80000 , 96000 , 100000 , 128000 , 144000 , 192000 , 200000
     spk_cfg.task_pinned_core = APP_CPU_NUM;
     M5.Speaker.config(spk_cfg);
   }
@@ -2521,13 +2605,13 @@ void setup()
   {
     uint32_t nvs_handle;
     if (ESP_OK == nvs_open("setting", NVS_READONLY, &nvs_handle)) {
-      size_t volume;
-      uint8_t led_onoff;
-      uint8_t speaker_no;
+      size_t volume = 153;
+      uint8_t led_onoff = 1;
+      uint8_t speaker_no = 3;
       nvs_get_u32(nvs_handle, "volume", &volume);
       if(volume > 255) volume = 255;
       M5.Speaker.setVolume(volume);
-      M5.Speaker.setChannelVolume(m5spk_virtual_channel, volume);
+      M5.Speaker.setChannelVolume(m5spk_virtual_channel, 255);
       nvs_get_u8(nvs_handle, "led", &led_onoff);
       // if(led_onoff == 1) Use_LED = true;
       // else  Use_LED = false;
@@ -2555,7 +2639,7 @@ void setup()
         nvs_set_u8(nvs_handle, "speaker", speaker_no);
         nvs_close(nvs_handle);
         M5.Speaker.setVolume(volume);
-        M5.Speaker.setChannelVolume(m5spk_virtual_channel, volume);
+        M5.Speaker.setChannelVolume(m5spk_virtual_channel, 255);
         // Use_LED = false;
         TTS_SPEAKER_NO = String(speaker_no);
         TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
@@ -2572,16 +2656,16 @@ void setup()
       } else {
         // "vol" 未保存なら既存の "volume"（/setting の音量）から近いレベルを初期値にする
         size_t volume = 0;
-        if (ESP_OK == nvs_get_u32(nvs_handle, "volume", &volume) && volume > 0) {
-          int derived = (int)((volume * 5 + 127) / 255);
-          if (derived < 1) derived = 1;
-          if (derived > 5) derived = 5;
-          g_vol_level = (uint8_t)derived;
+        if (ESP_OK == nvs_get_u32(nvs_handle, "volume", &volume)) {
+          g_vol_level = volumeToLevel((uint8_t)(volume > 255 ? 255 : volume));
         }
       }
       nvs_close(nvs_handle);
     }
     applyVolLevel(false);
+    Serial.printf("[AUDIO] volume level=%u master=%u channel0=%u muted=%d\n",
+        (unsigned)g_vol_level, (unsigned)M5.Speaker.getVolume(),
+        (unsigned)M5.Speaker.getChannelVolume(0), M5.Speaker.getVolume()==0);
   }
 
   { // 第7弾：スケジュール項目と側面LEDの ON/OFF を NVS "setting" から読み込む（未保存なら既定ON）
@@ -2737,6 +2821,11 @@ void setup()
 
   delay(1000);
 
+  const char* diagnosticHeaders[] = {"X-Stackchan-Audio-Test"};
+  server.collectHeaders(diagnosticHeaders, 1);
+  server.on("/audio", []() { server.send_P(200, "text/html; charset=utf-8", AUDIO_DIAGNOSTICS_HTML); });
+  server.on("/audio_status", HTTP_GET, handle_audio_status);
+  server.on("/audio_test", HTTP_POST, handle_audio_test);
   server.on("/", handleRoot);
 
   server.on("/inline", [](){
@@ -2785,6 +2874,7 @@ void setup()
 
   server.begin();
   Serial.println("HTTP server started");
+  Serial.println("[AUDIO] LAN status and offline speaker test: /audio");
   M5.Lcd.println("HTTP server started");  
   
   Serial.printf_P(PSTR("/ to control the chatGpt Server.\n"));
@@ -2916,7 +3006,7 @@ void switch_monologue_mode(){
 void sw_tone(){
       if (tts_processing() || audioRunning()) {
         // A confirmation sound must not switch I2S back to the microphone.
-        M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level]);
+        M5.Speaker.setChannelVolume(7, 255);
         M5.Speaker.tone(1000, 60, 7, false);
         return;
       }
@@ -3198,7 +3288,7 @@ static void change_volume(int delta) {
   } else {
     // 再生中は sw_tone（Speaker.end を伴う）で再生を止めないよう、
     // 別チャンネル(7)へ短い確認音だけを重ねる
-    M5.Speaker.setChannelVolume(7, VOL_VALUES[g_vol_level]);
+    M5.Speaker.setChannelVolume(7, 255);
     M5.Speaker.tone(1320.0f, 70, 7, false);
   }
   // 吹き出しが空いているときだけゲージを表示し、約2秒で消す（loop 側で消去）
@@ -3497,7 +3587,16 @@ void loop()
     speech_text_buffer = speech_text;
     speech_text = "";
     M5.Mic.end();
-    M5.Speaker.begin();
+    if (!M5.Speaker.begin() || !speakerBackendReady(M5.Speaker)) {
+      Serial.println("[AUDIO] speaker start failed; speech not queued");
+      speech_text_buffer = "";
+      g_pending_news_speech = false;
+      captionReset();
+      avatar.setSpeechText("スピーカー開始失敗。/audioで確認");
+      g_info_msg_until = millis() + 5000;
+      audioBeginMicrophone();
+      return;
+    }
     Serial.println("[AUDIO] handover mic->spk (speech start)");  // 第9.10弾: I2S切り分け用マーカー
     mode = 0;
     // 第8弾: 文単位パイプラインへ投入する。合成は専用タスクが文ごとに非同期で

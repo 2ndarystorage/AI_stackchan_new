@@ -485,6 +485,25 @@ static void capBuildFromText(const String& text) {
 #define SIDE_LED_MAX_BRIGHTNESS 6   // 全体の明るさ上限（第9.5弾：48→16、第9.6弾：16→6、省電力化）
 CRGB g_side_leds[SIDE_LED_COUNT];
 bool g_led_enable = true;            // 全体の有効/無効（NVS "setting"/"led"、既定ON）
+
+// ==== LED輝度の段階設定（第9.19弾） ====
+// レベル0〜5 → FastLED の全体輝度。既定レベル4 = 従来の固定上限
+// SIDE_LED_MAX_BRIGHTNESS(6) と同じ見え方になるよう対応付けている。
+// 設定ダイアログ（右上タップ）で変更し、NVS "setting"/"ledlevel" に保存する。
+// 既存の ON/OFF（g_led_enable、/schedule ページ）とは独立で矛盾しない。
+static const uint8_t LED_LEVEL_VALUES[6] = {0, 1, 2, 3, 6, 12};
+uint8_t g_led_level = 4;             // LED輝度レベル（0〜5、既定4。KinakoFace.h から参照）
+static void applyLedLevel(bool save) {
+  FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);
+  if (save) {
+    nvs_handle_t h;
+    if (nvs_open("setting", NVS_READWRITE, &h) == ESP_OK) {
+      nvs_set_u8(h, "ledlevel", g_led_level);
+      nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+}
 bool g_led_listening = false;        // 録音中（青）
 bool g_led_thinking = false;         // ChatGPT 応答待ち（紫パルス）
 bool g_led_news_active = false;      // ニュース読み上げ中（カテゴリ色）
@@ -553,6 +572,46 @@ static const CRGB NEWS_CAT_COLORS[5] = {
 bool g_menu_open = false;        // カテゴリ選択メニュー表示中
 int g_menu_sel = 0;              // 選択中のカテゴリ（0〜4）
 uint32_t g_menu_deadline = 0;    // 最後のタップから約2.5秒後に確定する時刻
+
+// ==== 画面消灯・設定ダイアログ（第9.19弾） ====
+#define DISPLAY_IDLE_OFF_MS 300000UL     // 無操作で自動消灯するまでの時間（5分）
+#define CENTER_TAP_WINDOW_MS 300         // 中央ダブルタップの判定窓（ms）。シングルタップ（会話開始）の発火はこの分だけ遅れる
+#define BTNC_TAP_WINDOW_MS 300           // BtnC ダブルタップの判定窓（ms）。短押し（定期通知トグル）の発火はこの分だけ遅れる
+#define SETTINGS_DIALOG_TIMEOUT_MS 5000  // 設定ダイアログの無操作自動クローズ（ms）
+bool g_settings_open = false;            // 設定ダイアログ表示中（KinakoFace.h から参照）
+uint32_t g_settings_deadline = 0;        // ダイアログの自動クローズ時刻
+static bool g_display_off = false;       // 画面が消灯中か
+static uint32_t g_last_activity_ms = 0;  // 最終操作時刻（タッチ/物理ボタン/発話開始で更新）
+static bool g_center_tap_pending = false;  // 中央シングルタップの発火待ち（ダブルタップ判定中）
+static uint32_t g_center_tap_ms = 0;       // 中央タップを受け付けた時刻
+
+static void note_activity() { g_last_activity_ms = millis(); }
+
+// 画面を消灯する。描画タスクと同じ GfxLock の中でパネルを操作し、描画と競合させない
+static void display_sleep() {
+  if (g_display_off) return;
+  g_display_off = true;
+  g_settings_open = false;
+  g_menu_open = false;
+  g_center_tap_pending = false;
+  {
+    GfxLockGuard gfx_guard;
+    M5.Display.sleep();  // バックライトOFF＋パネルスリープ（M5GFX）
+  }
+  Serial.println("[DISPLAY] sleep");
+}
+
+// 画面を点灯する。復帰に使った入力そのものは呼び出し側で消費し、他の機能に回さない
+static void display_wake() {
+  if (!g_display_off) return;
+  g_display_off = false;
+  note_activity();
+  {
+    GfxLockGuard gfx_guard;
+    M5.Display.wakeup();  // スリープ解除＋バックライトを元の輝度へ復帰
+  }
+  Serial.println("[DISPLAY] wake");
+}
 
 // ==== 定期通知モード（BtnC短押しトグル、5分おきニュース） ====
 // 状態は RAM のみ（再起動で OFF に戻る）
@@ -2549,6 +2608,11 @@ String SpeechToText(bool isGoogle){
   return ret;
 }
 
+// 画面キャプチャ HTTP ハンドラの前方宣言（実体はキャプチャ処理の後方、第9.19弾）
+static void handle_shots_list();
+static void handle_shot_download();
+static void handle_shot_delete();
+
 void setup()
 {
   // 第9.3弾: グラフィックス直列化ロックを最初に生成する
@@ -2708,6 +2772,7 @@ void setup()
       if (ESP_OK == nvs_get_u8(nvs_handle, "s_morning", &v)) g_sched_morning = (v != 0);
       if (ESP_OK == nvs_get_u8(nvs_handle, "s_hourly", &v)) g_sched_hourly = (v != 0);
       if (ESP_OK == nvs_get_u8(nvs_handle, "led", &v)) g_led_enable = (v != 0);
+      if (ESP_OK == nvs_get_u8(nvs_handle, "ledlevel", &v) && v <= 5) g_led_level = v;  // 第9.19弾: LED輝度レベル
       nvs_close(nvs_handle);
     }
   }
@@ -2860,6 +2925,9 @@ void setup()
   server.on("/audio_status", HTTP_GET, handle_audio_status);
   server.on("/audio_test", HTTP_POST, handle_audio_test);
   server.on("/tls_test", HTTP_POST, handle_tls_test);
+  server.on("/shots", HTTP_GET, handle_shots_list);    // 第9.19弾: キャプチャ一覧
+  server.on("/shot", HTTP_GET, handle_shot_download);  // 第9.19弾: キャプチャ取得
+  server.on("/shotdel", handle_shot_delete);           // 第9.19弾: キャプチャ削除（GET/POST）
   server.on("/", handleRoot);
 
   server.on("/inline", [](){
@@ -2955,7 +3023,7 @@ void setup()
 
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動
   FastLED.addLeds<SK6812, SIDE_LED_PIN, GRB>(g_side_leds, SIDE_LED_COUNT);
-  FastLED.setBrightness(SIDE_LED_MAX_BRIGHTNESS);
+  FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);  // 第9.19弾: 段階設定（既定レベル4＝従来上限6と同じ）
   FastLED.clear(true);
   xTaskCreatePinnedToCore(ledTask, "ledTask", 4096, NULL, 1, NULL, 0);
 
@@ -2977,7 +3045,8 @@ void setup()
   avatar.setSpeechFont(&fonts::efontJA_16);
 
 //  M5.Speaker.setVolume(200);
-  // タッチレイアウト：四隅＝音量（右上/右下）とニュースカテゴリ選択（左上/左下）、
+  // タッチレイアウト：右上＝設定ダイアログ（第9.19弾。表示中は四隅が音量/LED調整）、
+  // 左上/左下＝ニュースカテゴリ選択、右下＝単独では無効（旧・音量ダウンは廃止）、
   // 中央＝会話開始(STT)、左右の帯＝独り言切替(box_BtnA)/定期通知トグル(box_BtnC)、
   // 下部中央＝サーボ切替。四隅・中央・帯が重ならないよう配置している
   box_servo.setupBox(130, 185, 60, 50);
@@ -2995,6 +3064,8 @@ void setup()
   // 回り始めた状態）に dance_boot_check() 経由で1回だけ再生する方式へ移した。
   // Wi-Fi 未設定の場合は Wifi_setup() の SmartConfig 待ち→再起動ループに
   // なるため、従来どおり初期設定を妨げることもない。
+
+  g_last_activity_ms = millis();  // 画面自動消灯タイマーの起点（第9.19弾）
 }
 
 String random_words[18] = {"あなたは誰","楽しい","怒った","可愛い","悲しい","眠い","ジョークを言って","泣きたい","怒ったぞ","こんにちは","お疲れ様","詩を書いて","疲れた","お腹空いた","嫌いだ","苦しい","俳句を作って","歌をうたって"};
@@ -3301,6 +3372,283 @@ void SST_ChatGPT() {
         g_pose_state = -1;
 }
 
+// LED輝度レベルを delta 段階変える（第9.19弾、設定ダイアログの右下/左下）。
+// 変更は即時に FastLED へ反映され（ledTask が次フレームで表示）、NVS に保存される
+static void change_led_level(int delta) {
+  int nl = (int)g_led_level + delta;
+  if (nl < 0) nl = 0;
+  if (nl > 5) nl = 5;
+  if (nl == (int)g_led_level) return;
+  g_led_level = (uint8_t)nl;
+  applyLedLevel(true);
+  Serial.printf("[LED] brightness level=%u (FastLED=%u)\n",
+                (unsigned)g_led_level, (unsigned)LED_LEVEL_VALUES[g_led_level]);
+  if (!audioRunning()) {
+    sw_tone();
+  } else {
+    M5.Speaker.setChannelVolume(7, 255);
+    M5.Speaker.tone(1320.0f, 70, 7, false);
+  }
+}
+
+// ==== 画面キャプチャ（第9.19弾） ====
+// BtnC ダブルタップで LCD の内容を読み出し、24bit BMP(320x240) で保存する。
+// 保存先は microSD の /shots/ を優先し、カードが使えない場合は SPIFFS の
+// /shots/（名前の接頭辞による仮想フォルダ）へフォールバックする。
+// 暴走防止: 保存先ごとにファイル数の上限を持ち、超えたら古い順に削除する。
+#define SHOTS_DIR "/shots"
+#define SHOTS_MAX_SD 100     // microSD 側の最大保持数
+#define SHOTS_MAX_SPIFFS 3   // SPIFFS 側の最大保持数（1枚約230KBのため少なめ）
+
+// キャプチャ保存先のファイルシステムを選ぶ。SD が使える場合は SD を開いた
+// 状態で返し、呼び出し側は使い終わったら shots_close() で閉じること
+static fs::FS *shots_open(bool &use_sd) {
+  use_sd = false;
+  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+    use_sd = true;
+    if (!SD.exists(SHOTS_DIR)) SD.mkdir(SHOTS_DIR);
+    return &SD;
+  }
+  return &SPIFFS;
+}
+static void shots_close(bool use_sd) {
+  if (use_sd) SD.end();
+}
+
+// ファイル名が shot_NNNN.bmp 形式なら連番を返す（それ以外は -1）
+static int shots_parse_index(const String &name) {
+  int slash = name.lastIndexOf('/');
+  String base = (slash >= 0) ? name.substring(slash + 1) : name;
+  if (!base.startsWith("shot_") || !base.endsWith(".bmp")) return -1;
+  String num = base.substring(5, base.length() - 4);
+  if (num.length() == 0) return -1;
+  for (size_t i = 0; i < num.length(); i++) if (!isDigit(num[i])) return -1;
+  return num.toInt();
+}
+
+// 保存先にあるキャプチャを走査する。count=件数、max_index=最大の連番、
+// oldest_path=最も古い（連番が最小の）ファイルのフルパス
+static void shots_scan(fs::FS &fsys, bool use_sd, int &count, int &max_index, String &oldest_path) {
+  count = 0;
+  max_index = 0;
+  int min_index = -1;
+  oldest_path = "";
+  File dir = use_sd ? fsys.open(SHOTS_DIR) : fsys.open("/");
+  if (!dir) return;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    String fname = f.name();
+    int idx = shots_parse_index(fname);
+    if (idx >= 0) {
+      count++;
+      if (idx > max_index) max_index = idx;
+      if (min_index < 0 || idx < min_index) {
+        min_index = idx;
+        oldest_path = use_sd ? (fname.startsWith("/") ? fname : String(SHOTS_DIR) + "/" + fname)
+                             : fname;
+      }
+    }
+    f.close();
+  }
+  dir.close();
+}
+
+// ファイル名の検証（HTTP 経由の取得/削除用）。shot_NNNN.bmp の形だけを許可し、
+// パス区切りや ".." を含むものは弾く（パストラバーサル対策）
+static bool shots_valid_name(const String &name) {
+  if (name.length() == 0 || name.length() > 32) return false;
+  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf("..") >= 0) return false;
+  return shots_parse_index(name) >= 0;
+}
+
+// 画面キャプチャを実行する。成功したら保存先とファイル名を返す
+static bool capture_screen(String &out_where, String &out_name) {
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  int count, max_index;
+  String oldest;
+  shots_scan(*fsys, use_sd, count, max_index, oldest);
+  const int max_files = use_sd ? SHOTS_MAX_SD : SHOTS_MAX_SPIFFS;
+  // 上限を超えないよう、古いものから削除する（保存後に max_files 以下に収める）
+  while (count >= max_files && oldest.length() > 0) {
+    Serial.printf("[SHOT] remove old: %s\n", oldest.c_str());
+    String prev = oldest;
+    fsys->remove(oldest);
+    shots_scan(*fsys, use_sd, count, max_index, oldest);
+    if (oldest == prev) break;  // 削除できなかったら諦める（無限ループ防止）
+  }
+  char name[24];
+  snprintf(name, sizeof(name), "shot_%04d.bmp", max_index + 1);
+  String path = String(SHOTS_DIR) + "/" + name;
+
+  // フレーム全体を PSRAM へ読み出してから書き込む（描画ロックの保持を読み出し中だけにする）
+  const int W = 320, H = 240;
+  // 空き容量の確認（不足する場合はファイルを作らずに失敗として返す）
+  {
+    const uint32_t need = 54 + (uint32_t)W * 3 * (uint32_t)H;
+    uint64_t total = use_sd ? SD.totalBytes() : SPIFFS.totalBytes();
+    uint64_t used = use_sd ? SD.usedBytes() : SPIFFS.usedBytes();
+    if (total < used || total - used < need) {
+      Serial.println("[SHOT] not enough free space");
+      shots_close(use_sd);
+      return false;
+    }
+  }
+  uint16_t *frame = (uint16_t *)ps_malloc((size_t)W * H * sizeof(uint16_t));
+  if (!frame) { shots_close(use_sd); return false; }
+  {
+    GfxLockGuard gfx_guard;
+    M5.Display.readRect(0, 0, W, H, frame);
+  }
+
+  File out = fsys->open(path, FILE_WRITE);
+  if (!out) {
+    free(frame);
+    shots_close(use_sd);
+    return false;
+  }
+  // BMP ヘッダ（BITMAPFILEHEADER 14 + BITMAPINFOHEADER 40、24bit 非圧縮）
+  const uint32_t row_bytes = (uint32_t)W * 3;  // 960（4の倍数なので行パディング不要）
+  const uint32_t img_bytes = row_bytes * (uint32_t)H;
+  const uint32_t file_bytes = 54 + img_bytes;
+  uint8_t hdr[54] = {0};
+  hdr[0] = 'B'; hdr[1] = 'M';
+  memcpy(hdr + 2, &file_bytes, 4);
+  uint32_t data_off = 54;
+  memcpy(hdr + 10, &data_off, 4);
+  uint32_t dib = 40;
+  memcpy(hdr + 14, &dib, 4);
+  int32_t w32 = W, h32 = H;
+  memcpy(hdr + 18, &w32, 4);
+  memcpy(hdr + 22, &h32, 4);  // 正の値＝ボトムアップ
+  uint16_t planes = 1, bpp = 24;
+  memcpy(hdr + 26, &planes, 2);
+  memcpy(hdr + 28, &bpp, 2);
+  memcpy(hdr + 34, &img_bytes, 4);
+  out.write(hdr, sizeof(hdr));
+  // 画素: ボトムアップ（最下行から）、RGB565 → BGR888 へ変換しながら書く
+  uint8_t *row = (uint8_t *)malloc(row_bytes);
+  bool ok = (row != nullptr);
+  if (ok) {
+    for (int y = H - 1; y >= 0 && ok; y--) {
+      const uint16_t *src = frame + (size_t)y * W;
+      for (int x = 0; x < W; x++) {
+        uint16_t c = src[x];
+        uint8_t r = (uint8_t)(((c >> 11) & 0x1F) << 3) | (uint8_t)(((c >> 11) & 0x1F) >> 2);
+        uint8_t g = (uint8_t)(((c >> 5) & 0x3F) << 2) | (uint8_t)(((c >> 5) & 0x3F) >> 4);
+        uint8_t b = (uint8_t)((c & 0x1F) << 3) | (uint8_t)((c & 0x1F) >> 2);
+        row[x * 3 + 0] = b;
+        row[x * 3 + 1] = g;
+        row[x * 3 + 2] = r;
+      }
+      ok = (out.write(row, row_bytes) == row_bytes);
+    }
+    free(row);
+  }
+  out.close();
+  free(frame);
+  shots_close(use_sd);
+  if (!ok) return false;
+  out_where = use_sd ? "SD" : "SPIFFS";
+  out_name = name;
+  Serial.printf("[SHOT] saved %s to %s (%u bytes)\n", path.c_str(), out_where.c_str(), (unsigned)file_bytes);
+  return true;
+}
+
+// BtnC ダブルタップ時の処理：キャプチャして結果をトーンと吹き出しで知らせる
+static void do_screen_capture() {
+  if (g_display_off) display_wake();
+  note_activity();
+  String where, name;
+  if (capture_screen(where, name)) {
+    sw_tone();
+    delay(120);
+    sw_tone();
+    if (!audioRunning()) {
+      avatar.setSpeechText(("キャプチャ保存 " + where).c_str());
+      g_info_msg_until = millis() + 3000;
+    }
+  } else {
+    // 失敗時は画面表示で知らせる（保存先なし・容量不足など）
+    avatar.setSpeechText("キャプチャ失敗");
+    g_info_msg_until = millis() + 4000;
+    Serial.println("[SHOT] capture failed");
+  }
+}
+
+// ==== 画面キャプチャの HTTP 連携（第9.19弾） ====
+// 一覧: GET /shots → {"storage":"SD"|"SPIFFS","files":[{"name","size"},...]} の JSON
+// 取得: GET /shot?name=shot_0001.bmp → BMP を attachment で返す
+// 削除: GET/POST /shotdel?name=shot_0001.bmp → 削除して JSON で結果を返す
+// いずれも CORS ヘッダ（Access-Control-Allow-Origin: *）を付ける。
+// 保存先の優先順位はキャプチャ時と同じ（microSD があれば SD、無ければ SPIFFS）。
+static void shots_send_error(int code, const char *msg) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(code, "application/json", String("{\"error\":\"") + msg + "\"}");
+}
+
+static void handle_shots_list() {
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  String json = String("{\"storage\":\"") + (use_sd ? "SD" : "SPIFFS") + "\",\"files\":[";
+  File dir = use_sd ? fsys->open(SHOTS_DIR) : fsys->open("/");
+  if (dir) {
+    bool first = true;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+      String fname = f.name();
+      if (shots_parse_index(fname) >= 0) {
+        int slash = fname.lastIndexOf('/');
+        String base = (slash >= 0) ? fname.substring(slash + 1) : fname;
+        if (!first) json += ",";
+        first = false;
+        json += "{\"name\":\"" + base + "\",\"size\":" + String((unsigned)f.size()) + "}";
+      }
+      f.close();
+    }
+    dir.close();
+  }
+  json += "]}";
+  shots_close(use_sd);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+static void handle_shot_download() {
+  if (!server.hasArg("name")) { shots_send_error(400, "name required"); return; }
+  String name = server.arg("name");
+  if (!shots_valid_name(name)) { shots_send_error(400, "invalid name"); return; }
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  String path = String(SHOTS_DIR) + "/" + name;
+  File f = fsys->open(path, FILE_READ);
+  if (!f) {
+    shots_close(use_sd);
+    shots_send_error(404, "not found");
+    return;
+  }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+  server.streamFile(f, "image/bmp");
+  f.close();
+  shots_close(use_sd);
+}
+
+static void handle_shot_delete() {
+  if (!server.hasArg("name")) { shots_send_error(400, "name required"); return; }
+  String name = server.arg("name");
+  if (!shots_valid_name(name)) { shots_send_error(400, "invalid name"); return; }
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  String path = String(SHOTS_DIR) + "/" + name;
+  bool ok = fsys->exists(path) && fsys->remove(path);
+  shots_close(use_sd);
+  if (ok) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", "{\"deleted\":\"" + name + "\"}");
+  } else {
+    shots_send_error(404, "not found");
+  }
+}
+
 // 音量ゲージ文字列（6マス表示。例「音量 ■■■□□□」、レベル0は全□）
 static String volGaugeText() {
   String s = "音量 ";
@@ -3431,8 +3779,23 @@ void loop()
   run_schedule();
 
   M5.update();
-  if (M5.BtnA.wasPressed())
+
+  // 画面消灯中は、最初のタッチ/物理ボタンを「復帰」専用として消費する（第9.19弾）。
+  // 復帰に使った入力で会話開始・カテゴリ変更・ボタン機能が誤作動しないようにする
+  bool input_swallow = false;
+  if (g_display_off) {
+    bool wake_input = M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed();
+    if (!wake_input && M5.Touch.getCount() > 0) {
+      auto td = M5.Touch.getDetail();
+      wake_input = td.wasPressed();
+    }
+    if (wake_input) display_wake();
+    input_swallow = true;
+  }
+
+  if (!input_swallow && M5.BtnA.wasPressed())
   {
+    note_activity();
     if(mode >= 0){
       sw_tone();
       if(mode == 0){
@@ -3452,7 +3815,8 @@ void loop()
   // BtnB短押し（ニュース読み上げ）検出用：押下時刻を記録する
   static uint32_t btnB_press_start = 0;
   static bool btnB_long_fired = false;
-  if (M5.BtnB.wasPressed()) {
+  if (!input_swallow && M5.BtnB.wasPressed()) {
+    note_activity();
     btnB_press_start = millis();
     btnB_long_fired = false;
   }
@@ -3489,48 +3853,86 @@ void loop()
     btnB_press_start = 0;
   }
 
-  // BtnC短押し＝定期通知モードのトグル、長押し(2秒)＝バッテリー残量読み上げ
+  // BtnC短押し＝定期通知モードのトグル、ダブルタップ＝画面キャプチャ、
+  // 長押し(2秒)＝バッテリー残量読み上げ（第9.19弾でダブルタップを追加）。
+  // ダブル判定のため、短押し（定期通知トグル）の発火は最大 BTNC_TAP_WINDOW_MS(300ms) 遅れる
   static uint32_t btnC_press_start = 0;
   static bool btnC_long_fired = false;
-  if (M5.BtnC.wasPressed()) {
+  static uint32_t btnC_tap_deadline = 0;  // 保留中の短押し（定期通知トグル）の確定時刻（0=なし）
+  if (!input_swallow && M5.BtnC.wasPressed()) {
+    note_activity();
     btnC_press_start = millis();
     btnC_long_fired = false;
   }
   if (M5.BtnC.pressedFor(2000) && !btnC_long_fired) {
     btnC_long_fired = true;  // 長押しが発動したら短押し扱いしない
+    btnC_tap_deadline = 0;   // 保留中の単押しも取り消す
     sw_tone();
     report_batt_level();
   }
   if (M5.BtnC.wasReleased()) {
     if (!btnC_long_fired && btnC_press_start != 0 && (millis() - btnC_press_start) < 1500 && mode >= 0) {
-      toggle_periodic();
+      if (btnC_tap_deadline != 0) {
+        // 判定窓内の2回目のタップ＝ダブルタップ → 画面キャプチャ
+        btnC_tap_deadline = 0;
+        do_screen_capture();
+      } else {
+        // 1回目のタップは保留し、窓内に2回目がなければ定期通知トグルとして確定する
+        btnC_tap_deadline = millis() + BTNC_TAP_WINDOW_MS;
+      }
     }
     btnC_press_start = 0;
+  }
+  // 保留中の BtnC 短押しの確定（ダブルタップにならなかった場合）
+  if (btnC_tap_deadline != 0 && (int32_t)(millis() - btnC_tap_deadline) >= 0) {
+    btnC_tap_deadline = 0;
+    if (mode >= 0) toggle_periodic();
   }
 
 #if defined(ARDUINO_M5STACK_Core2) || defined( ARDUINO_M5STACK_CORES3 )
   auto count = M5.Touch.getCount();
-  if (count)
+  if (count && !input_swallow)
   {
     auto t = M5.Touch.getDetail();
     if (t.wasPressed())
     {          
-      // 右上＝音量アップ、右下＝音量ダウン（6段階・レベル0は無音）
+      note_activity();
+      if (g_settings_open)
+      {
+        // 設定ダイアログ表示中はモーダル（第9.19弾）：四隅＝音量/LED輝度調整、
+        // 中央＝閉じる。それ以外のタップと四隅の本来の機能（カテゴリ切替等）は無効
+        g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
+        if (box_vol_up.contain(t.x, t.y)) change_volume(+1);            // 右上＝音量＋
+        else if (box_cat_prev.contain(t.x, t.y)) change_volume(-1);     // 左上＝音量－
+        else if (box_vol_down.contain(t.x, t.y)) change_led_level(+1);  // 右下＝LED輝度＋
+        else if (box_cat_next.contain(t.x, t.y)) change_led_level(-1);  // 左下＝LED輝度－
+        else if (box_stt.contain(t.x, t.y))
+        {
+          g_settings_open = false;
+          sw_tone();
+        }
+      }
+      else
+      {
+      // 右上＝設定ダイアログを開く（第9.19弾）。従来の右上＝音量アップ／
+      // 右下＝音量ダウンのタッチ割り当ては廃止し、右下単独のタップは無効。
+      // 音量・LED輝度の調整はダイアログ表示中の四隅タップで行う
       if (box_vol_up.contain(t.x, t.y))
       {
-        change_volume(+1);
-      }
-      if (box_vol_down.contain(t.x, t.y))
-      {
-        change_volume(-1);
+        g_center_tap_pending = false;
+        g_settings_open = true;
+        g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
+        sw_tone();
       }
       // 左上＝前のカテゴリ、左下＝次のカテゴリ（ニュース選択メニュー）
       if (box_cat_prev.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         menu_step(-1);
       }
       if (box_cat_next.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         menu_step(+1);
       }
       // 中央タップの優先順位：ニュース読み上げ中＝中断（追加D）／
@@ -3539,37 +3941,55 @@ void loop()
       {
         if (g_news_playing || g_pending_news_speech)
         {
+          g_center_tap_pending = false;
           stop_news_speech();
         }
         else if (g_menu_open)
         {
+          g_center_tap_pending = false;
           g_menu_open = false;
           sw_tone();
           if (!audioRunning()) avatar.setSpeechText("");
         }
         else if (!audioRunning())
         {
-          sw_tone();
-          SST_ChatGPT();
+          // 中央ダブルタップで即消灯（第9.19弾）。1回目のタップは保留し、
+          // 判定窓（300ms）内の2回目で消灯する。窓を過ぎたらシングルタップ
+          // として loop 側で会話開始する（発火は最大300ms遅れる）
+          if (g_center_tap_pending &&
+              (int32_t)(millis() - g_center_tap_ms) <= (int32_t)CENTER_TAP_WINDOW_MS)
+          {
+            g_center_tap_pending = false;
+            display_sleep();
+          }
+          else
+          {
+            g_center_tap_pending = true;
+            g_center_tap_ms = millis();
+          }
         }
       }
 #ifdef USE_SERVO
       if (box_servo.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         servo_home = !servo_home;
         sw_tone();
       }
 #endif
       if (box_BtnA.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         sw_tone();
         switch_monologue_mode();
       }
       // 右の帯＝定期通知モードのトグル（物理 BtnC 短押しと同じ挙動）
       if (box_BtnC.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         toggle_periodic();
       }
+      }  // 設定ダイアログでない場合の通常タッチ処理ここまで（第9.19弾）
     }
   }
 #endif
@@ -3587,6 +4007,31 @@ void loop()
         g_menu_deadline = millis() + 2500;  // 混んでいる間は確定を少し延ばす
       }
     }
+  }
+
+  // ==== 画面まわり（第9.19弾）: ダイアログ自動クローズ／中央タップ確定／自動消灯 ====
+  if (g_settings_open && (int32_t)(millis() - g_settings_deadline) >= 0) {
+    g_settings_open = false;
+  }
+  // 中央シングルタップの確定（ダブルタップにならなかった場合に会話開始）
+  if (g_center_tap_pending &&
+      (int32_t)(millis() - g_center_tap_ms) > (int32_t)CENTER_TAP_WINDOW_MS) {
+    g_center_tap_pending = false;
+    if (!g_display_off && !g_settings_open && !g_menu_open &&
+        !g_news_playing && !g_pending_news_speech && !audioRunning() &&
+        speech_text == "" && speech_text_buffer == "") {
+      sw_tone();
+      SST_ChatGPT();
+    }
+  }
+  // 発話・合成中は無操作タイマーを進めない（終わってから5分で消灯する）
+  if (audioRunning() || tts_processing()) note_activity();
+  // 自動消灯: 発話系がすべて止まっている状態で5分間無操作なら消灯する。
+  // ダンス再生中は loop が play_dance_video() の中で回るため、ここへは来ない
+  if (!g_display_off && mode >= 0 && !audioRunning() && !tts_processing() &&
+      speech_text == "" && speech_text_buffer == "" && !g_cap_active &&
+      (int32_t)(millis() - g_last_activity_ms) >= (int32_t)DISPLAY_IDLE_OFF_MS) {
+    display_sleep();
   }
 
   // 音量ゲージの吹き出しを約2秒で消す（発話やニュース表示・メニューが始まっていたら触らない）
@@ -3617,6 +4062,10 @@ void loop()
   }
 
   if(speech_text != ""){
+    // 第9.19弾: 発話セッション開始は「操作」として扱い、消灯中なら点灯する
+    note_activity();
+    g_center_tap_pending = false;
+    if (g_display_off) display_wake();
     avatar.setExpression(Expression::Happy);
     speech_text_buffer = speech_text;
     speech_text = "";

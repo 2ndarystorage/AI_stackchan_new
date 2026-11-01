@@ -61,6 +61,8 @@ extern char g_caption_buf[2][2][128];
 extern volatile int g_batt_pct;        // 残量 %（-1=未取得・アイコンを出さない）
 extern volatile bool g_batt_charging;  // 充電中か
 extern uint8_t g_vol_level;            // 音量レベル（0〜5、第8弾の6段階）
+extern bool g_settings_open;           // 設定ダイアログ表示中（第9.19弾）
+extern uint8_t g_led_level;            // LED輝度レベル（0〜5、第9.19弾）
 
 // ポーズ切り替えの共有状態（実体は main.cpp、優先順位管理も main.cpp 側）
 extern volatile int g_pose_state;            // 状態ポーズ (-1=なし)
@@ -225,6 +227,37 @@ class KinakoImage : public Drawable {
       spi->print(line1);
       spi->setCursor(8, 218);
       spi->print(line2);
+    }
+    // 設定ダイアログ（第9.19弾）：右上タップで開き、音量（上段）と
+    // LED輝度（下段）の現在値と四隅タップの操作案内を表示する。
+    // HUD と同じく顔合成のキャンバスへ描くため、閉じれば跡形なく消える。
+    // 操作の割り当て（右上=音量+／左上=音量-／右下=LED+／左下=LED-／中央=閉じる）は main.cpp 側
+    if (g_settings_open) {
+      spi->fillRoundRect(10, 52, 300, 136, 8, 0x000000);
+      spi->drawRoundRect(10, 52, 300, 136, 8, 0xFFFFFF);
+      spi->setFont(&fonts::efontJA_16);
+      spi->setTextSize(1);
+      spi->setTextColor(0xFFFFFF);
+      spi->setCursor(22, 58);
+      spi->print("設定");
+      // 上段：音量（6段階マス）
+      spi->setCursor(22, 84);
+      spi->print("音量");
+      for (int i = 0; i < 6; i++) {
+        spi->fillRect(72 + i * 16, 86, 11, 11, (i < (int)g_vol_level) ? 0xFFFFFFu : 0x404040u);
+      }
+      spi->setCursor(180, 84);
+      spi->print("左上-/右上+");
+      // 下段：LED輝度（6段階マス）
+      spi->setCursor(22, 124);
+      spi->print("LED");
+      for (int i = 0; i < 6; i++) {
+        spi->fillRect(72 + i * 16, 126, 11, 11, (i < (int)g_led_level) ? 0xFFFFFFu : 0x404040u);
+      }
+      spi->setCursor(180, 124);
+      spi->print("左下-/右下+");
+      spi->setCursor(22, 162);
+      spi->print("閉じる: 中央タップ");
     }
   }
 };

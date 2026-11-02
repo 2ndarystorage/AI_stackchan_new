@@ -1,0 +1,236 @@
+{
+  "date_jst": "2026-11-02",
+  "download": {
+    "version": "9.23",
+    "parts": [
+      {
+        "name": "bootloader.bin",
+        "address": 4096,
+        "size": 17488,
+        "sha256": "5207eba5680d5a268736fbe6df2261d325cb57dc1d14309b4ee091780e0b5a5d"
+      },
+      {
+        "name": "partitions.bin",
+        "address": 32768,
+        "size": 3072,
+        "sha256": "722ce27b9b35292725b42444fd96eb8e130c7c4c34e37df010ca731c7b6b1281"
+      },
+      {
+        "name": "boot_app0.bin",
+        "address": 57344,
+        "size": 8192,
+        "sha256": "f94c5d786a7a8fab06ac5d10e33bf37711a6697636dc037559ea19cc410a17f0"
+      },
+      {
+        "name": "firmware.bin",
+        "address": 65536,
+        "size": 3535568,
+        "sha256": "4ed098e399b63b0330dfcfc4e6d09df4083ae5ac2d1905aeb6367a27e9b97646"
+      }
+    ]
+  },
+  "firmware_before": "v9.21",
+  "flash_scope": "app0 only at 0x10000; existing partition table confirmed; no NVS/SPIFFS writes",
+  "flash_hash_verified": true,
+  "previous_app_backup_private": true,
+  "status_after_boot": {
+    "firmware": "v9.23",
+    "board": 2,
+    "pmic": 2,
+    "volume_level": 0,
+    "master": 0,
+    "channel0": 255,
+    "muted": true,
+    "speaker_running": false,
+    "speaker_task_ready": false,
+    "mic_running": true,
+    "bck": 12,
+    "ws": 0,
+    "data": 2,
+    "i2s_port": 1,
+    "pcm_submitted_samples": 0,
+    "pcm_peak": 0,
+    "output_fault": false,
+    "decoding": false,
+    "tls_memory_policy": true,
+    "tls_external_allocations": 0,
+    "tls_allocation_failures": 0,
+    "tls_last_failed_bytes": 0
+  },
+  "smoke_tests": [
+    {
+      "test": "tls_test",
+      "status": 200,
+      "body": {
+        "firmware": "v9.23",
+        "connected": false,
+        "error": -16256,
+        "verify_flags": 0,
+        "allocation_failure": true,
+        "external_allocations": 2,
+        "failed_allocations": 1,
+        "http_requests_sent": 0
+      }
+    },
+    {
+      "test": "audio_test",
+      "status": 200,
+      "body": "2音の出力を要求しました。聞こえたか確認してください。元の音量に戻しました。"
+    }
+  ],
+  "ble_start": {
+    "error": "timed out",
+    "seconds": 30.06
+  },
+  "status_after_ble_attempt": {
+    "error": "timed out",
+    "seconds": 5.03
+  },
+  "news_api_requests_sent_by_test": 0,
+  "ble_gatt_transfer_attempted": false,
+  "display_user_confirmation": "v9.23が見えて、ちらつかない",
+  "rollback_user_decision": "元のv9.21へ戻す",
+  "events": [
+    {
+      "line": "[BOOT] TLS memory: PSRAM >=4096B, internal small allocations"
+    },
+    {
+      "line": "[BOOT] Firmware v9.23"
+    },
+    {
+      "line": "[BOOT] Avatar gfx lock: vendored-v9.13 (shared mutex, draw stack=8192)"
+    },
+    {
+      "line": "[BOOT] TTS CA: ISRG Root X1 + Root YR (v9.23)"
+    },
+    {
+      "line": "[BOOT] reset reason: POWERON (1)"
+    },
+    {
+      "line": "[BOOT] free heap: 163984 bytes, free PSRAM: 4191847 bytes"
+    },
+    {
+      "line": "[AUDIO] volume level=0 master=0 channel0=255 muted=1"
+    },
+    {
+      "line": "[AUDIO] LAN status and offline speaker test: /audio"
+    },
+    {
+      "line": "[BOOT] mp3 workspace: 29192 bytes in PSRAM (boot-time, resident; largest internal block before=94196 after=94196)"
+    },
+    {
+      "line": "[BOOT] MP3 decoder task ready (core=1 priority=2 v9.23)"
+    },
+    {
+      "line": "[DANCE] boot autoplay"
+    },
+    {
+      "line": "[DANCE] start: data=832174 bytes, free heap=21504"
+    },
+    {
+      "line": "[DANCE] skipped: low heap"
+    },
+    {
+      "line": "[TLS] memory policy=1 external_allocs=2 failures=1 last_failed_bytes=172 this_task_failure=1"
+    },
+    {
+      "line": "[TLS] verify_failed host=api.tts.quest ip=164.70.91.214 error=-16256 flags=0x00000000"
+    },
+    {
+      "line": "[AUDIO] offline test queued=1 restored_master=0"
+    },
+    {
+      "line": "[BLE] start receive mode heap=19556 largest=12788"
+    }
+  ],
+  "rollback": {
+    "restored_firmware": "v9.21",
+    "write_scope": "full saved app0 only; hash verified",
+    "status": {
+      "firmware": "v9.21",
+      "board": 2,
+      "pmic": 2,
+      "volume_level": 0,
+      "master": 0,
+      "channel0": 255,
+      "muted": true,
+      "speaker_running": false,
+      "speaker_task_ready": false,
+      "mic_running": true,
+      "bck": 12,
+      "ws": 0,
+      "data": 2,
+      "i2s_port": 1,
+      "pcm_submitted_samples": 0,
+      "pcm_peak": 0,
+      "output_fault": false,
+      "decoding": false,
+      "tls_memory_policy": true,
+      "tls_external_allocations": 0,
+      "tls_allocation_failures": 0,
+      "tls_last_failed_bytes": 0
+    },
+    "tls_probe": {
+      "firmware": "v9.21",
+      "connected": true,
+      "error": 0,
+      "verify_flags": 0,
+      "allocation_failure": false,
+      "external_allocations": 2,
+      "failed_allocations": 0,
+      "http_requests_sent": 0
+    },
+    "events": [
+      {
+        "line": "[BOOT] TLS memory: PSRAM >=4096B, internal small allocations"
+      },
+      {
+        "line": "[BOOT] Firmware v9.21"
+      },
+      {
+        "line": "[BOOT] Avatar gfx lock: vendored-v9.13 (shared mutex, draw stack=8192)"
+      },
+      {
+        "line": "[BOOT] TTS CA: ISRG Root X1 + Root YR (v9.21)"
+      },
+      {
+        "line": "[BOOT] reset reason: POWERON (1)"
+      },
+      {
+        "line": "[BOOT] free heap: 239520 bytes, free PSRAM: 4192123 bytes"
+      },
+      {
+        "line": "[AUDIO] volume level=0 master=0 channel0=255 muted=1"
+      },
+      {
+        "line": "[AUDIO] LAN status and offline speaker test: /audio"
+      },
+      {
+        "line": "[BOOT] mp3 workspace: 29192 bytes in PSRAM (boot-time, resident; largest internal block before=110580 after=110580)"
+      },
+      {
+        "line": "[BOOT] MP3 decoder task ready (core=1 priority=2 v9.21)"
+      },
+      {
+        "line": "[DANCE] boot autoplay"
+      },
+      {
+        "line": "[DANCE] start: data=832174 bytes, free heap=97148"
+      },
+      {
+        "line": "[DANCE] done: drawn=100 skipped=0 errors=0, heap 97148 -> 94516 (complete)"
+      },
+      {
+        "line": "[DANCE] guard cleared (stable after playback)"
+      },
+      {
+        "line": "[TLS] memory policy=1 external_allocs=2 failures=0 last_failed_bytes=0 this_task_failure=0"
+      },
+      {
+        "line": "[TLS] verified host=api.tts.quest ip=164.70.91.214"
+      }
+    ]
+  },
+  "final_device_firmware": "v9.21",
+  "periodic_automation_recreated": false
+}

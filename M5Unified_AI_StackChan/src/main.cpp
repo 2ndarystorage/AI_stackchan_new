@@ -8,6 +8,10 @@ static bool audioRunning();
 #include <SPIFFS.h>
 #include <M5Unified.h>
 #include <nvs.h>
+#include <nvs_flash.h>
+#include <esp_bt.h>
+#include "OperatingMode.h"
+#include "OperatingModePage.h"
 #include <Avatar.h>
 #if !defined(STACKCHAN_AVATAR_GFX_LOCKED) || STACKCHAN_AVATAR_GFX_LOCKED != 0x0913
 #error "Use the vendored M5Stack-Avatar with the shared graphics lock"
@@ -63,6 +67,9 @@ static bool audioRunning();
 // 同じ LGFX オブジェクトを同時に触らないよう直列化する。
 SemaphoreHandle_t g_gfx_mutex = nullptr;
 SemaphoreHandle_t g_tls_mutex = nullptr;
+static OperatingMode g_operating_mode = OperatingMode::Normal;
+static bool g_mode_switch_pending = false;
+static uint32_t g_mode_restart_at = 0;
 
 // Called by the vendored Avatar while the shared graphics mutex is held.
 // 第9.23弾: バッジは Face::draw から合成キャンバスを受け取って描く（点滅対策で
@@ -856,7 +863,7 @@ bool init_chat_doc(const char *data)
 }
 
 void handleRoot() {
-  server.send(200, "text/html", "<html><head><meta charset=\"UTF-8\"/></head><body><pre>hello from m5stack!\n&boxdr;&boxh;&boxh;&boxh;&boxdl;\n&boxv;&#729;_&#729;&boxv;\n&boxur;&boxh;&boxh;&boxh;&boxul;</pre></body></html>");
+  server.send(200, "text/html", "<html><head><meta charset=\"UTF-8\"/></head><body><pre>hello from m5stack!\n&boxdr;&boxh;&boxh;&boxh;&boxdl;\n&boxv;&#729;_&#729;&boxv;\n&boxur;&boxh;&boxh;&boxh;&boxul;</pre><p><a href=\"/mode\">動作モード設定（通常 / BLE転送専用）</a></p></body></html>");
 }
 
 void handleNotFound(){
@@ -2468,10 +2475,10 @@ void handle_train() {
 // 転送して保存し、ニュースの1カテゴリとして読み上げる。
 //
 // 設計方針:
-// - メモリ節約のため BLE(NimBLE) は常時ONにせず、GET /ble で開始する
-//   受信モードの間だけ初期化する（待ち受け最大3分、完了後は自動OFF）。
-// - 音声処理中は受信モードを開始しない。受信モード中は定期通知・
-//   スケジューラ・中央タップ会話開始を止め、転送に専念する。
+// - v9.24: POST /ble で次回だけBLE専用起動を予約し、再起動で通常動作から分離する
+//   BLE専用起動ではWi-Fi・音声・Avatar・スケジューラ自体を初期化しない。
+//   待ち受け最大3分、完了後は通常モードへ再起動する。
+// - 音声処理中は切替予約を受け付けない。
 // - GATT（128bit カスタムUUID）:
 //     Service : e8f5a001-b7d3-4c1e-9a2b-3d4c5e6f7081
 //     CTRL    : e8f5a002-… (Write) "BEGIN:<総バイト数>" / "END" / "ABORT"
@@ -2508,6 +2515,7 @@ static fs::FS *digest_open(bool &use_sd) {
     if (!SD.exists(DIGEST_DIR)) SD.mkdir(DIGEST_DIR);
     return &SD;
   }
+  if (!SPIFFS.begin(false)) return nullptr;
   return &SPIFFS;
 }
 static void digest_close(bool use_sd) { if (use_sd) SD.end(); }
@@ -2554,6 +2562,7 @@ static int digest_scan(fs::FS &fsys, bool use_sd, DigestEntry *out, int max_out,
 static bool digest_store(const uint8_t *data, size_t len, String &out_name) {
   bool use_sd;
   fs::FS *fsys = digest_open(use_sd);
+  if (!fsys) return false;
   DigestEntry entries[24];
   int max_index = 0;
   int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
@@ -2584,6 +2593,7 @@ static bool digest_store(const uint8_t *data, size_t len, String &out_name) {
 static bool digest_load_latest(String &out_text, int &out_index) {
   bool use_sd;
   fs::FS *fsys = digest_open(use_sd);
+  if (!fsys) return false;
   DigestEntry entries[24];
   int max_index = 0;
   int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
@@ -2710,9 +2720,9 @@ static void append_unread_digest() {
 
 // ---- BLE 受信モード ----
 enum BleDgState : uint8_t { DG_OFF = 0, DG_WAIT, DG_RECV, DG_COMMIT, DG_DONE, DG_ERROR };
-static volatile uint8_t g_ble_dg_state = DG_OFF;
-static volatile uint32_t g_ble_dg_expect = 0;    // BEGIN で申告された総バイト数
-static volatile uint32_t g_ble_dg_received = 0;  // 受信済みバイト数
+static std::atomic<uint8_t> g_ble_dg_state{DG_OFF};
+static std::atomic<uint32_t> g_ble_dg_expect{0};    // BEGIN で申告された総バイト数
+static std::atomic<uint32_t> g_ble_dg_received{0};  // 受信済みバイト数
 static uint8_t *g_ble_dg_buf = nullptr;          // PSRAM 上の組み立てバッファ（初回に確保して使い回す）
 static SemaphoreHandle_t g_ble_dg_mutex = nullptr;
 static uint32_t g_ble_dg_deadline = 0;           // 受信窓の終了時刻（WAIT/RECV）
@@ -2751,11 +2761,13 @@ class BleDgCtrlCallbacks : public NimBLECharacteristicCallbacks {
         ble_dg_set_status("ERR begin");
       }
     } else if (cmd == "END") {
+      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
       if (g_ble_dg_state == DG_RECV) {
         g_ble_dg_state = DG_COMMIT;  // 検証と保存は loop 側（ble_digest_tick）で行う
         Serial.printf("[BLE] END received=%u expect=%u\n",
                       (unsigned)g_ble_dg_received, (unsigned)g_ble_dg_expect);
       }
+      xSemaphoreGive(g_ble_dg_mutex);
     } else if (cmd == "ABORT") {
       bool was = false;
       xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
@@ -2794,27 +2806,25 @@ class BleDgDataCallbacks : public NimBLECharacteristicCallbacks {
     }
     xSemaphoreGive(g_ble_dg_mutex);
     if (progress) ble_dg_set_status("RECV " + String(got) + "/" + String(exp));
-    note_activity();  // 転送中は画面の自動消灯タイマーを進めない
+    // BLE-only boot has no display auto-off or normal activity tasks.
   }
 };
 
 class BleDgServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
     Serial.println("[BLE] connected");
-    note_activity();
   }
   void onDisconnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
     Serial.println("[BLE] disconnected");
+    xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
     if (g_ble_dg_state == DG_RECV) {
-      // 転送途中の切断：受信済みデータは破棄し、受付待ちに戻る
-      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+      // Do not discard a buffer already frozen for a commit by END.
       g_ble_dg_received = 0;
       g_ble_dg_expect = 0;
       g_ble_dg_state = DG_WAIT;
-      xSemaphoreGive(g_ble_dg_mutex);
-      ble_dg_set_status("WAIT");
       Serial.println("[BLE] partial data discarded (disconnect)");
     }
+    xSemaphoreGive(g_ble_dg_mutex);
     // NimBLE は切断後に広告を自動再開しないため、受信窓の間は再開する
     if (g_ble_dg_state == DG_WAIT) NimBLEDevice::startAdvertising();
   }
@@ -2824,122 +2834,161 @@ static BleDgCtrlCallbacks g_ble_dg_ctrl_cb;
 static BleDgDataCallbacks g_ble_dg_data_cb;
 static BleDgServerCallbacks g_ble_dg_server_cb;
 
-// 受信モードを開始する。音声処理中は開始しない（BLE と TLS/音声の競合回避）
-static bool ble_digest_start(String &err) {
-  if (g_ble_dg_state != DG_OFF) { err = "すでに受信モードです"; return false; }
-  if (audioRunning() || tts_processing() || speech_text != "" || speech_text_buffer != "") {
-    err = "音声処理中です";
-    return false;
+// BLE initialization may wait indefinitely inside NimBLE 1.4.3. Keep the UI and
+// a bounded recovery timer on the main task; recover by reboot, not task deletion.
+static std::atomic<int> g_ble_boot_result{0}; // 0 starting, 1 ready, -1 failed
+static uint32_t g_ble_boot_deadline = 0;
+static constexpr uint32_t BLE_BOOT_TIMEOUT_MS = 15000;
+
+static void ble_mode_screen(const char *status) {
+  M5.Display.fillScreen(TFT_BLACK);
+  drawFirmwareVersionBadge(M5.Display);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.setTextSize(1);
+  M5.Display.setCursor(8, 36);
+  M5.Display.println("BLE transfer only");
+  M5.Display.println("Wi-Fi / voice: OFF");
+  M5.Display.println(status);
+  M5.Display.println("C: reboot to normal mode");
+}
+
+static void ble_digest_stop(const char *reason) {
+  Serial.printf("[MODE] BLE -> normal reboot (%s)\n", reason);
+  // The one-shot boot token was cleared before BLE initialization. Reboot also
+  // handles an unresponsive host safely, without freeing live callback buffers.
+  ESP.restart();
+}
+
+static void ble_boot_task(void *) {
+  // Fail closed before NimBLE's NVS recovery path; never request an NVS erase.
+  if (nvs_flash_init() != ESP_OK) {
+    g_ble_boot_result.store(-1);
+    vTaskDelete(nullptr);
+    return;
   }
-  if (!g_ble_dg_mutex) g_ble_dg_mutex = xSemaphoreCreateMutex();
-  if (!g_ble_dg_buf) g_ble_dg_buf = (uint8_t *)ps_malloc(DIGEST_MAX_BYTES);
-  if (!g_ble_dg_buf) { err = "メモリ不足"; return false; }
-  Serial.printf("[BLE] start receive mode heap=%u largest=%u\n",
-                (unsigned)ESP.getFreeHeap(),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   NimBLEDevice::init(BLE_DG_DEVICE_NAME);
-  NimBLEDevice::setMTU(185);  // ページ側の180バイト書き込みを通すため
-  NimBLEServer *server = NimBLEDevice::createServer();
-  server->setCallbacks(&g_ble_dg_server_cb);
-  NimBLEService *svc = server->createService(BLE_DG_SERVICE_UUID);
+  NimBLEDevice::setMTU(185);
+  NimBLEServer *bleServer = NimBLEDevice::createServer();
+  if (!bleServer) { g_ble_boot_result.store(-1); vTaskDelete(nullptr); return; }
+  bleServer->setCallbacks(&g_ble_dg_server_cb);
+  NimBLEService *svc = bleServer->createService(BLE_DG_SERVICE_UUID);
+  if (!svc) { g_ble_boot_result.store(-1); vTaskDelete(nullptr); return; }
   NimBLECharacteristic *ctrl = svc->createCharacteristic(BLE_DG_CTRL_UUID, NIMBLE_PROPERTY::WRITE);
-  ctrl->setCallbacks(&g_ble_dg_ctrl_cb);
   NimBLECharacteristic *data = svc->createCharacteristic(BLE_DG_DATA_UUID, NIMBLE_PROPERTY::WRITE);
-  data->setCallbacks(&g_ble_dg_data_cb);
   g_ble_dg_status_chr = svc->createCharacteristic(
       BLE_DG_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  if (!ctrl || !data || !g_ble_dg_status_chr) {
+    g_ble_boot_result.store(-1); vTaskDelete(nullptr); return;
+  }
+  ctrl->setCallbacks(&g_ble_dg_ctrl_cb);
+  data->setCallbacks(&g_ble_dg_data_cb);
   g_ble_dg_status_chr->setValue(std::string("WAIT"));
-  svc->start();
+  if (!svc->start()) { g_ble_boot_result.store(-1); vTaskDelete(nullptr); return; }
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  if (!adv) { g_ble_boot_result.store(-1); vTaskDelete(nullptr); return; }
   adv->addServiceUUID(BLE_DG_SERVICE_UUID);
   adv->setScanResponse(true);
-  adv->start();
-  g_ble_dg_received = 0;
-  g_ble_dg_expect = 0;
-  g_ble_dg_state = DG_WAIT;
   g_ble_dg_deadline = millis() + BLE_DG_WINDOW_MS;
-  if (g_display_off) display_wake();
-  note_activity();
-  avatar.setSpeechText("BLE受信待ち");
-  Serial.printf("[BLE] advertising as %s (window %lu s) heap=%u largest=%u\n",
-                BLE_DG_DEVICE_NAME, (unsigned long)(BLE_DG_WINDOW_MS / 1000),
-                (unsigned)ESP.getFreeHeap(),
+  g_ble_dg_state = DG_WAIT;
+  if (!adv->start()) { g_ble_boot_result.store(-1); vTaskDelete(nullptr); return; }
+  Serial.printf("[BLE] advertising as %s (BLE-only boot) heap=%u largest=%u\n",
+                BLE_DG_DEVICE_NAME, (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-  return true;
+  g_ble_boot_result.store(1);
+  vTaskDelete(nullptr);
 }
 
-// 受信モードを終了し、BLE スタックを解放する
-static void ble_digest_stop(const char *reason) {
-  if (g_ble_dg_state == DG_OFF) return;
-  g_ble_dg_state = DG_OFF;
-  NimBLEDevice::deinit(true);
-  g_ble_dg_status_chr = nullptr;
-  Serial.printf("[BLE] stop (%s) heap=%u largest=%u\n", reason,
-                (unsigned)ESP.getFreeHeap(),
-                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+static void ble_mode_setup() {
+  ble_mode_screen("Starting (max 15s)...");
+  g_ble_boot_deadline = millis() + BLE_BOOT_TIMEOUT_MS;
+  g_ble_dg_mutex = xSemaphoreCreateMutex();
+  g_ble_dg_buf = (uint8_t *)ps_malloc(DIGEST_MAX_BYTES);
+  if (!g_ble_dg_mutex || !g_ble_dg_buf ||
+      xTaskCreatePinnedToCore(ble_boot_task, "bleBoot", 6144, nullptr, 1, nullptr, 0) != pdPASS)
+    g_ble_boot_result.store(-1);
 }
 
-// loop から毎回呼ぶ：コミットの保存・タイムアウト・自動OFFを進める
 static void ble_digest_tick() {
   uint8_t st = g_ble_dg_state;
-  if (st == DG_OFF) return;
   uint32_t now = millis();
   if (st == DG_COMMIT) {
-    // loop 文脈で検証と保存を行う（FS 操作を BLE タスクで行わない）
+    // END freezes the buffer against writes/ABORT/disconnect while FS saves it.
+    xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
     uint32_t got = g_ble_dg_received, exp = g_ble_dg_expect;
+    xSemaphoreGive(g_ble_dg_mutex);
     String name;
     bool ok = (exp > 0 && got == exp && g_ble_dg_buf != nullptr);
     if (ok) ok = digest_store(g_ble_dg_buf, got, name);
-    if (ok) {
-      g_ble_dg_state = DG_DONE;
-      g_ble_dg_off_at = now + BLE_DG_HOLD_MS;
-      ble_dg_set_status("DONE " + name);
-      avatar.setSpeechText("転送を保存しました");
-      g_info_msg_until = now + 4000;
-      sw_tone();
-      Serial.printf("[BLE] saved %s (%u bytes)\n", name.c_str(), (unsigned)got);
-    } else {
+    g_ble_dg_state = ok ? DG_DONE : DG_ERROR;
+    g_ble_dg_off_at = millis() + BLE_DG_HOLD_MS;
+    ble_dg_set_status(ok ? "DONE " + name : String("ERR store"));
+    ble_mode_screen(ok ? "Saved. Reboot in 15s." : "Save failed. Reboot in 15s.");
+    Serial.printf("[BLE] commit ok=%d got=%u expect=%u\n", ok, (unsigned)got, (unsigned)exp);
+    return;
+  }
+  if ((st == DG_WAIT || st == DG_RECV) && modeDeadlineReached(now, g_ble_dg_deadline)) {
+    // Callbacks must see the timeout state under the same lock as END/DATA.
+    xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+    if (g_ble_dg_state == DG_WAIT || g_ble_dg_state == DG_RECV) {
       g_ble_dg_state = DG_ERROR;
-      g_ble_dg_off_at = now + BLE_DG_HOLD_MS;
-      ble_dg_set_status("ERR store");
-      avatar.setSpeechText("転送の保存に失敗しました");
-      g_info_msg_until = now + 4000;
-      Serial.printf("[BLE] commit failed (got=%u expect=%u)\n", (unsigned)got, (unsigned)exp);
+      g_ble_dg_off_at = now + 3000;
+    }
+    xSemaphoreGive(g_ble_dg_mutex);
+    if (g_ble_dg_state == DG_ERROR) {
+      ble_dg_set_status("ERR timeout");
+      ble_mode_screen("Timeout. Reboot in 3s.");
     }
     return;
   }
-  if ((st == DG_WAIT || st == DG_RECV) && (int32_t)(now - g_ble_dg_deadline) >= 0) {
-    g_ble_dg_state = DG_ERROR;
-    g_ble_dg_off_at = now + 3000;
-    ble_dg_set_status("ERR timeout");
-    avatar.setSpeechText("BLE受信タイムアウト");
-    g_info_msg_until = now + 3000;
-    Serial.println("[BLE] receive window timeout");
-    return;
-  }
-  if ((st == DG_DONE || st == DG_ERROR) && (int32_t)(now - g_ble_dg_off_at) >= 0) {
+  if ((st == DG_DONE || st == DG_ERROR) && modeDeadlineReached(now, g_ble_dg_off_at))
     ble_digest_stop(st == DG_DONE ? "done" : "error/timeout");
-    if (!audioRunning() && speech_text == "" && speech_text_buffer == "") avatar.setSpeechText("");
-  }
 }
 
-// GET /ble: 受信モードを開始する（CORS 付きで書き込みページからも呼べる）
-static void handle_ble() {
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  if (ble_digest_active()) {
-    String json = String("{\"active\":true,\"state\":") + String((int)g_ble_dg_state) +
-                  ",\"received\":" + String((unsigned)g_ble_dg_received) +
-                  ",\"expect\":" + String((unsigned)g_ble_dg_expect) + "}";
-    server.send(200, "application/json", json);
+static void ble_mode_loop() {
+  M5.update();
+  // Never interrupt an FS commit. loop runs button handling before a save starts.
+  if (M5.BtnC.wasPressed()) { ble_digest_stop("button C"); return; }
+  int result = g_ble_boot_result.load();
+  if (result < 0 || (result == 0 && modeDeadlineReached(millis(), g_ble_boot_deadline))) {
+    ble_mode_screen("BLE startup failed. Returning...");
+    delay(500);
+    ble_digest_stop("startup failed/timeout");
     return;
   }
-  String err;
-  if (ble_digest_start(err)) {
-    server.send(200, "application/json", "{\"active\":true,\"started\":true}");
-  } else {
-    server.send(409, "application/json",
-                String("{\"active\":false,\"error\":\"") + err + "\"}");
+  if (result == 1) {
+    static bool shown = false;
+    if (!shown) { ble_mode_screen("WAIT (3 minutes)"); shown = true; }
+    ble_digest_tick();
   }
+  delay(10);
+}
+
+// Read-only GET: old links must not initialize Bluetooth in a normal boot.
+static void handle_mode() {
+  server.sendHeader("Cache-Control", "no-store");
+  server.send_P(200, "text/html; charset=utf-8", OPERATING_MODE_HTML);
+}
+
+// Explicit same-origin POST only. Reply first, then restart at the loop boundary.
+static void handle_ble() {
+  if (server.header("X-Stackchan-Mode") != "ble") {
+    server.send(403, "application/json", "{\"error\":\"mode header required\"}");
+    return;
+  }
+  if (g_mode_switch_pending || !canEnterBleMode(audioRunning(), tts_processing(),
+                                               speech_text != "" || speech_text_buffer != "")) {
+    server.send(409, "application/json", "{\"error\":\"busy; wait for audio and speech to finish\"}");
+    return;
+  }
+  esp_err_t err = saveNextOperatingMode(OperatingMode::BleTransfer);
+  if (err != ESP_OK) {
+    Serial.printf("[MODE] cannot save next mode: %d\n", (int)err);
+    server.send(500, "application/json", "{\"error\":\"mode setting could not be saved\"}");
+    return;
+  }
+  g_mode_switch_pending = true;
+  g_mode_restart_at = millis() + 750;
+  server.send(202, "application/json", "{\"mode\":\"ble\",\"rebooting\":true}");
 }
 
 // GET /digest: テスト用（最新の転送ニュースを読み上げる）
@@ -3890,6 +3939,25 @@ static void handle_shot_delete();
 
 void setup()
 {
+  esp_err_t mode_error = ESP_OK;
+  g_operating_mode = consumeNextOperatingMode(mode_error);
+  if (g_operating_mode == OperatingMode::BleTransfer) {
+    auto ble_cfg = M5.config();
+    ble_cfg.internal_spk = false;
+    ble_cfg.external_spk = false;
+    ble_cfg.external_speaker_value = 0;
+    ble_cfg.internal_mic = false;
+    M5.begin(ble_cfg);
+    Serial.println("[BOOT] Firmware " STACKCHAN_FIRMWARE_LABEL);
+    Serial.println("[MODE] BLE-only: Wi-Fi/TLS/audio/Avatar/scheduler not started");
+    ble_mode_setup();
+    return;
+  }
+  // Memory release is irreversible in this boot. BLE is only entered by reboot.
+  size_t heap_before_bt_release = ESP.getFreeHeap();
+  esp_err_t bt_release = esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_IDLE
+      ? esp_bt_mem_release(ESP_BT_MODE_BTDM) : ESP_ERR_INVALID_STATE;
+  size_t heap_after_bt_release = ESP.getFreeHeap();
   // 第9.3弾: グラフィックス直列化ロックを最初に生成する
   // （avatar.init() で描画タスクが始まる前に必ず用意する）
   g_gfx_mutex = xSemaphoreCreateRecursiveMutex();
@@ -3902,6 +3970,13 @@ void setup()
   cfg.external_speaker_value = 0;  // This build targets the built-in Core2 speaker.
 //  cfg.output_power = true;
   M5.begin(cfg);
+  Serial.printf("[MODE] normal: BT memory release=%d heap=%u -> %u mode_read=%d\n",
+                (int)bt_release, (unsigned)heap_before_bt_release,
+                (unsigned)heap_after_bt_release, (int)mode_error);
+  if (bt_release != ESP_OK) {
+    Serial.println("[BOOT] FATAL: normal-mode BT memory release failed");
+    for (;;) delay(1000);
+  }
   if (!g_gfx_mutex || !g_tls_mutex || stackchan_avatar_gfx_lock_revision() != STACKCHAN_AVATAR_GFX_LOCKED) {
     Serial.println("[BOOT] FATAL: graphics/TLS lock unavailable");
     for (;;) delay(1000);
@@ -4194,8 +4269,8 @@ void setup()
 
   delay(1000);
 
-  const char* diagnosticHeaders[] = {"X-Stackchan-Audio-Test", "X-Stackchan-TLS-Test"};
-  server.collectHeaders(diagnosticHeaders, 2);
+  const char* diagnosticHeaders[] = {"X-Stackchan-Audio-Test", "X-Stackchan-TLS-Test", "X-Stackchan-Mode"};
+  server.collectHeaders(diagnosticHeaders, 3);
   server.on("/audio", []() { server.send_P(200, "text/html; charset=utf-8", AUDIO_DIAGNOSTICS_HTML); });
   server.on("/audio_status", HTTP_GET, handle_audio_status);
   server.on("/audio_test", HTTP_POST, handle_audio_test);
@@ -4220,7 +4295,9 @@ void setup()
   server.on("/news", handle_news);
   server.on("/weather", HTTP_GET, handle_weather);  // 第9.20弾: 天気テスト用（明日の予報）
   server.on("/train", HTTP_GET, handle_train);      // 第9.21弾: 運行情報テスト用（対象3路線）
-  server.on("/ble", HTTP_GET, handle_ble);          // 第9.23弾: BLE テキスト転送の受信モード開始
+  server.on("/mode", HTTP_GET, handle_mode);
+  server.on("/ble", HTTP_GET, handle_mode);  // Read-only settings; never initialize BLE here.
+  server.on("/ble", HTTP_POST, handle_ble);
   server.on("/digest", HTTP_GET, handle_digest);    // 第9.23弾: 転送ニュース読み上げ（テスト用）
   server.on("/schedule", handle_schedule);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
@@ -5036,11 +5113,15 @@ static void toggle_periodic() {
 
 void loop()
 {
+  if (g_operating_mode == OperatingMode::BleTransfer) { ble_mode_loop(); return; }
+  if (g_mode_switch_pending) {
+    if (modeDeadlineReached(millis(), g_mode_restart_at)) ESP.restart();
+    delay(10);
+    return;
+  }
   static int lastms = 0;
 
   wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続
-
-  ble_digest_tick();  // 第9.23弾: BLE テキスト転送の状態遷移（保存・タイムアウト・自動OFF）
 
   pose_prepare_tick();  // 第9.2弾: ポーズ画像の先行デコード（draw タスク外で実施）
 
@@ -5412,6 +5493,7 @@ void loop()
   if (!audioRunning()) {
     server.handleClient();
   }
+  if (g_mode_switch_pending) return;
 
   // 読み上げ字幕（2行パネル）を進める（発話中はユニットを順に切り替え、
   // 発話が終わったら最後のユニットを3秒残してから消す）

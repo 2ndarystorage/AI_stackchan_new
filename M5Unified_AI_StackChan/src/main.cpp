@@ -65,7 +65,11 @@ SemaphoreHandle_t g_gfx_mutex = nullptr;
 SemaphoreHandle_t g_tls_mutex = nullptr;
 
 // Called by the vendored Avatar while the shared graphics mutex is held.
-void stackchan_draw_version_badge() { drawFirmwareVersionBadge(M5.Display); }
+// 第9.23弾: バッジは Face::draw から合成キャンバスを受け取って描く（点滅対策で
+// パネル直接描画から移設。バッテリー/音量 HUD と同じキャンバス内描画になった）
+void stackchan_draw_version_badge(M5Canvas *spi) {
+  if (spi) drawFirmwareVersionBadge(*spi);
+}
 static bool audioBeginMicrophone() {
   return handoverToMicrophone(M5.Speaker, M5.Mic,
       [](i2s_port_t port) { i2s_driver_uninstall(port); });
@@ -494,7 +498,9 @@ bool g_led_enable = true;            // 全体の有効/無効（NVS "setting"/"
 // SIDE_LED_MAX_BRIGHTNESS(6) と同じ見え方になるよう対応付けている。
 // 設定ダイアログ（右上タップ）で変更し、NVS "setting"/"ledlevel" に保存する。
 // 既存の ON/OFF（g_led_enable、/schedule ページ）とは独立で矛盾しない。
-static const uint8_t LED_LEVEL_VALUES[6] = {0, 1, 2, 3, 6, 12};
+// 第9.23弾: 低い側の刻みが 1/255 単位で見分けられなかったため、レベル3を 3→4 に
+// 見直し（既定レベル4=6 と上限レベル5=12 は従来どおり）
+static const uint8_t LED_LEVEL_VALUES[6] = {0, 1, 2, 4, 6, 12};
 uint8_t g_led_level = 4;             // LED輝度レベル（0〜5、既定4。KinakoFace.h から参照）
 static void applyLedLevel(bool save) {
   FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);
@@ -561,16 +567,18 @@ struct NewsCatDef {
   int nhkCat;             // NHK RSS のカテゴリ番号（-1 = NHKなし）
   const char* googleUrl;  // フォールバック／単独取得用の Google ニュース RSS
 };
-static const NewsCatDef NEWS_CATS[5] = {
+static const NewsCatDef NEWS_CATS[6] = {
   {"トピックス",   "今日のニュースです。",     0,  "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"},
   {"AIニュース",   "AIニュースです。",        -1, "https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja"},
   {"芸能ニュース", "芸能ニュースです。",       6,  "https://news.google.com/rss/search?q=%E8%8A%B8%E8%83%BD&hl=ja&gl=JP&ceid=JP:ja"},
   {"テック",       "テックニュースです。",    -1, "https://news.google.com/rss/search?q=%E3%83%86%E3%82%AF%E3%83%8E%E3%83%AD%E3%82%B8%E3%83%BC&hl=ja&gl=JP&ceid=JP:ja"},
   {"その他",       "その他のニュースです。",   1,  "https://news.google.com/rss/search?q=%E7%A4%BE%E4%BC%9A&hl=ja&gl=JP&ceid=JP:ja"},
+  // 第9.23弾: BLE で転送されたテキスト（exec_news_category で特別処理。nhkCat=-2 が目印）
+  {"転送ニュース", "転送ニュースです。",      -2, ""},
 };
-// カテゴリごとの側面LED色（トピックス=白、AI=水色、芸能=ピンク、テック=緑、その他=黄）
-static const CRGB NEWS_CAT_COLORS[5] = {
-  CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0),
+// カテゴリごとの側面LED色（トピックス=白、AI=水色、芸能=ピンク、テック=緑、その他=黄、転送=紫）
+static const CRGB NEWS_CAT_COLORS[6] = {
+  CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0), CRGB(170, 90, 255),
 };
 bool g_menu_open = false;        // カテゴリ選択メニュー表示中
 int g_menu_sel = 0;              // 選択中のカテゴリ（0〜4）
@@ -630,6 +638,10 @@ bool g_sched_morning = true;         // モーニング読み上げ（NVS "setti
 bool g_sched_hourly = true;          // 時報（NVS "setting"/"s_hourly"）
 extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり）で定義
 String exec_news(bool automatic = false);  // 実体は後方（ニュース読み上げの節）で定義
+static void exec_digest_category();    // 第9.23弾: 転送ニュースの読み上げ（実体は後方）
+static void append_unread_digest();    // 第9.23弾: 自動読み上げへの未読転送テキスト連結（実体は後方）
+static bool ble_digest_active();       // 第9.23弾: BLE 受信モード中か（実体は後方）
+void sw_tone();                        // 実体は後方（音まわり）
 static bool play_dance_video();      // 実体は後方（SST_ChatGPT の直前）で定義。第9弾
 static void dance_boot_check();      // 起動時1回だけの自動再生判定（loop から呼ぶ）。第9.1弾
 
@@ -638,7 +650,7 @@ static void dance_boot_check();      // 起動時1回だけの自動再生判定
 // loop 内の同期処理のため、その間 run_schedule() 自体が呼ばれず割り込まれない
 static bool scheduler_ready() {
   return mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "" &&
-         !g_menu_open && !g_cap_active;
+         !g_menu_open && !g_cap_active && !ble_digest_active();  // 第9.23弾: BLE受信中は発火しない
 }
 
 // 毎朝7:00：日付の挨拶＋通常ニュース（トピックス＋AI）
@@ -652,6 +664,7 @@ static void sched_fn_morning() {
            t.tm_mon + 1, t.tm_mday, wday[t.tm_wday % 7]);
   g_pending_pose = POSE_RUN;  // 第9弾: モーニングの発話中は「走る」ポーズ（ニュースのサムズアップより優先）
   exec_news(true);  // speech_text にニュース本文をセットする（自動読み上げ: 新しい記事がなければニュース部分は無言でスキップし、挨拶のみになる。第9.20弾）
+  append_unread_digest();  // 第9.23弾: 未読の転送テキストがあればニュースの後に連結する
   speech_text = String(buf) + speech_text;
 }
 
@@ -1901,7 +1914,8 @@ String exec_news(bool automatic) {
 // 従来の exec_news()（トピックス＋AI連結）とは独立した読み上げにする
 void exec_news_category(int cat) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return; }
-  if (cat < 0 || cat > 4) cat = 0;
+  if (cat < 0 || cat > 5) cat = 0;
+  if (cat == 5) { exec_digest_category(); return; }  // 第9.23弾: 転送ニュース
   const NewsCatDef& c = NEWS_CATS[cat];
   // 第9.8弾: exec_news() と同様、取得前に TTS 接続ペアの解放を依頼する
   g_tts_release_req = true;
@@ -2447,6 +2461,498 @@ void handle_train() {
     server.send(200, "text/plain", String("運行情報を取得できませんでした") + diag);
   }
 }
+
+// ==== BLE テキスト転送「転送ニュース」（第9.23弾） ====
+// Muse／ChatGPT／Codex が要約したテキスト（ITニュース、GitHub／
+// Hugging Face ランキング等）を、書き込みページから Web Bluetooth で
+// 転送して保存し、ニュースの1カテゴリとして読み上げる。
+//
+// 設計方針:
+// - メモリ節約のため BLE(NimBLE) は常時ONにせず、GET /ble で開始する
+//   受信モードの間だけ初期化する（待ち受け最大3分、完了後は自動OFF）。
+// - 音声処理中は受信モードを開始しない。受信モード中は定期通知・
+//   スケジューラ・中央タップ会話開始を止め、転送に専念する。
+// - GATT（128bit カスタムUUID）:
+//     Service : e8f5a001-b7d3-4c1e-9a2b-3d4c5e6f7081
+//     CTRL    : e8f5a002-… (Write) "BEGIN:<総バイト数>" / "END" / "ABORT"
+//     DATA    : e8f5a003-… (Write) 本文チャンク（応答あり、最大180バイト）
+//     STATUS  : e8f5a004-… (Read/Notify) "WAIT" / "RECV n/m" /
+//               "DONE dg_NNNN.txt" / "ERR …"
+//   本文は「1行目=タイトル、以降=本文」のプレーンテキスト(UTF-8)そのもの。
+// - 受信データは PSRAM 上で組み立て、END 受信後に loop 文脈で総バイト数を
+//   検証してから正式保存する（FS 操作を BLE タスクで行わない）。
+//   途中切断時は受信済みを破棄して受付待ちに戻る。
+// - 保存先は microSD の /digest/ を優先し、なければ SPIFFS（第9.19弾の
+//   キャプチャと同じ優先順位）。保持は最新10件、1件最大60KB。
+// - 既読管理は NVS "setting"/"dgread"（最後に読み上げた連番）。書き込み時の
+//   NVS 初期化でリセットされる（ニュース既読と同じ扱い）。
+#include <NimBLEDevice.h>
+
+#define BLE_DG_SERVICE_UUID "e8f5a001-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_CTRL_UUID    "e8f5a002-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_DATA_UUID    "e8f5a003-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_STATUS_UUID  "e8f5a004-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_DEVICE_NAME  "StackChan-Digest"
+#define BLE_DG_WINDOW_MS    180000UL  // 受信待ち受けの上限（3分）
+#define BLE_DG_HOLD_MS      15000UL   // 完了/エラー後に STATUS を読めるよう保持する時間
+#define DIGEST_MAX_BYTES    (60 * 1024)  // 1件の上限
+#define DIGEST_KEEP_FILES   10           // 保持する最新件数
+#define DIGEST_DIR          "/digest"
+#define DIGEST_CAT_INDEX    5            // NEWS_CATS の「転送ニュース」
+
+// ---- 転送テキストの保存（microSD 優先、なければ SPIFFS） ----
+static fs::FS *digest_open(bool &use_sd) {
+  use_sd = false;
+  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+    use_sd = true;
+    if (!SD.exists(DIGEST_DIR)) SD.mkdir(DIGEST_DIR);
+    return &SD;
+  }
+  return &SPIFFS;
+}
+static void digest_close(bool use_sd) { if (use_sd) SD.end(); }
+
+// ファイル名が dg_NNNN.txt 形式なら連番を返す（それ以外は -1）
+static int digest_parse_index(const String &name) {
+  int slash = name.lastIndexOf('/');
+  String base = (slash >= 0) ? name.substring(slash + 1) : name;
+  if (!base.startsWith("dg_") || !base.endsWith(".txt")) return -1;
+  String num = base.substring(3, base.length() - 4);
+  if (num.length() == 0) return -1;
+  for (size_t i = 0; i < num.length(); i++) if (!isDigit(num[i])) return -1;
+  return num.toInt();
+}
+
+struct DigestEntry { int index; String path; };
+
+// 保存先の転送テキストを走査する。戻り値は out に格納した件数、
+// max_index は最大の連番（ファイルが無ければ 0）
+static int digest_scan(fs::FS &fsys, bool use_sd, DigestEntry *out, int max_out, int &max_index) {
+  max_index = 0;
+  int count = 0;
+  File dir = use_sd ? fsys.open(DIGEST_DIR) : fsys.open("/");
+  if (!dir) return 0;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    String fname = f.name();
+    int idx = digest_parse_index(fname);
+    if (idx >= 0) {
+      if (idx > max_index) max_index = idx;
+      if (count < max_out) {
+        out[count].index = idx;
+        out[count].path = use_sd ? (fname.startsWith("/") ? fname : String(DIGEST_DIR) + "/" + fname)
+                                 : fname;
+        count++;
+      }
+    }
+    f.close();
+  }
+  dir.close();
+  return count;
+}
+
+// 受信したテキストを正式保存する。保持上限を超える分は古い順に削除する
+static bool digest_store(const uint8_t *data, size_t len, String &out_name) {
+  bool use_sd;
+  fs::FS *fsys = digest_open(use_sd);
+  DigestEntry entries[24];
+  int max_index = 0;
+  int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
+  while (count >= DIGEST_KEEP_FILES) {
+    int oldest = 0;
+    for (int i = 1; i < count; i++) if (entries[i].index < entries[oldest].index) oldest = i;
+    Serial.printf("[Digest] remove old: %s\n", entries[oldest].path.c_str());
+    if (!fsys->remove(entries[oldest].path)) break;  // 削除できなければ諦める（無限ループ防止）
+    entries[oldest] = entries[count - 1];
+    count--;
+  }
+  char name[20];
+  snprintf(name, sizeof(name), "dg_%04d.txt", max_index + 1);
+  String path = String(DIGEST_DIR) + "/" + name;
+  File out = fsys->open(path, FILE_WRITE);
+  if (!out) { digest_close(use_sd); return false; }
+  size_t written = out.write(data, len);
+  out.close();
+  digest_close(use_sd);
+  if (written != len) return false;
+  out_name = name;
+  Serial.printf("[Digest] stored %s (%u bytes, %s)\n", path.c_str(), (unsigned)len,
+                use_sd ? "SD" : "SPIFFS");
+  return true;
+}
+
+// 最新の転送テキストを読み出す。無ければ false
+static bool digest_load_latest(String &out_text, int &out_index) {
+  bool use_sd;
+  fs::FS *fsys = digest_open(use_sd);
+  DigestEntry entries[24];
+  int max_index = 0;
+  int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
+  out_index = 0;
+  out_text = "";
+  if (count == 0 || max_index == 0) { digest_close(use_sd); return false; }
+  String path;
+  for (int i = 0; i < count; i++) if (entries[i].index == max_index) path = entries[i].path;
+  if (path == "") { digest_close(use_sd); return false; }
+  File f = fsys->open(path, FILE_READ);
+  if (!f) { digest_close(use_sd); return false; }
+  size_t remain = f.size();
+  if (remain > DIGEST_MAX_BYTES) remain = DIGEST_MAX_BYTES;
+  out_text.reserve(remain + 1);
+  uint8_t buf[256];
+  while (remain > 0) {
+    int n = f.read(buf, remain < sizeof(buf) ? remain : sizeof(buf));
+    if (n <= 0) break;
+    out_text.concat((const char *)buf, (unsigned int)n);
+    remain -= (size_t)n;
+  }
+  f.close();
+  digest_close(use_sd);
+  out_index = max_index;
+  return out_text.length() > 0;
+}
+
+// 既読管理（NVS "setting"/"dgread" に最後に読み上げた連番を保持）
+static int digest_last_read_index() {
+  uint32_t h;
+  int v = 0;
+  if (ESP_OK == nvs_open("setting", NVS_READONLY, &h)) {
+    int32_t t = 0;
+    if (ESP_OK == nvs_get_i32(h, "dgread", &t)) v = (int)t;
+    nvs_close(h);
+  }
+  return v;
+}
+static void digest_mark_read(int idx) {
+  uint32_t h;
+  if (ESP_OK == nvs_open("setting", NVS_READWRITE, &h)) {
+    nvs_set_i32(h, "dgread", idx);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
+// ファイル内容（1行目=タイトル、以降=本文）から読み上げ文を作る。
+// 本文の改行は文の区切りとして扱い、行末に句読点が無ければ「。」を補う
+static bool digest_build_speech(const String &content, String &out_title, String &out_speech) {
+  int nl = content.indexOf('\n');
+  String title = (nl >= 0) ? content.substring(0, nl) : content;
+  title.trim();
+  String body = (nl >= 0) ? content.substring(nl + 1) : "";
+  out_title = title;
+  String b;
+  b.reserve(body.length() + 16);
+  for (size_t i = 0; i < body.length(); i++) {
+    char c = body[i];
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (b.length() > 0 && !b.endsWith("。") && !b.endsWith("！") && !b.endsWith("？") &&
+          !b.endsWith("、") && !b.endsWith(".")) {
+        b += "。";
+      }
+      continue;
+    }
+    b += c;
+  }
+  out_speech = "";
+  if (title != "") out_speech += title + "。";
+  out_speech += b;
+  if (out_speech.length() > 0 && !out_speech.endsWith("。") && !out_speech.endsWith("！") &&
+      !out_speech.endsWith("？")) {
+    out_speech += "。";
+  }
+  return out_speech.length() > 0;
+}
+
+// カテゴリ「転送ニュース」の手動読み上げ（最新の保存テキストを読む）
+static void exec_digest_category() {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return; }
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  String content;
+  int idx = 0;
+  String title, speech;
+  if (!digest_load_latest(content, idx) || !digest_build_speech(content, title, speech)) {
+    speech_text = "転送ニュースはまだありません";
+    avatar.setSpeechText("転送ニュースはまだありません");
+    g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;
+    return;
+  }
+  capAddLabel("転送ニュース");
+  capBuildFromText(speech);
+  g_led_news_color = NEWS_CAT_COLORS[DIGEST_CAT_INDEX];  // 転送ニュースのLED色は紫
+  if (g_cap_count > 0) g_cap_armed = true;
+  speech_text = "転送ニュースです。" + speech;
+  g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
+  digest_mark_read(idx);
+  Serial.printf("[Digest] speak latest #%d (%u chars)\n", idx, (unsigned)speech.length());
+}
+
+// 自動読み上げ（定期通知・モーニング）用：未読の最新転送テキストがあれば
+// speech_text の末尾に連結し、既読にする。無ければ何もしない
+static void append_unread_digest() {
+  String content;
+  int idx = 0;
+  if (!digest_load_latest(content, idx)) return;
+  if (idx <= digest_last_read_index()) return;  // 既読なら繰り返さない
+  String title, speech;
+  if (!digest_build_speech(content, title, speech)) return;
+  capAddLabel("転送ニュース");
+  capBuildFromText(speech);
+  bool was_empty = (speech_text == "");
+  speech_text += was_empty ? String("転送ニュースです。") : String("続いて、転送ニュースです。");
+  speech_text += speech;
+  if (was_empty) g_led_news_color = NEWS_CAT_COLORS[DIGEST_CAT_INDEX];
+  if (g_cap_count > 0) g_cap_armed = true;
+  g_pending_news_speech = true;
+  digest_mark_read(idx);
+  Serial.printf("[Digest] appended unread #%d to automatic speech\n", idx);
+}
+
+// ---- BLE 受信モード ----
+enum BleDgState : uint8_t { DG_OFF = 0, DG_WAIT, DG_RECV, DG_COMMIT, DG_DONE, DG_ERROR };
+static volatile uint8_t g_ble_dg_state = DG_OFF;
+static volatile uint32_t g_ble_dg_expect = 0;    // BEGIN で申告された総バイト数
+static volatile uint32_t g_ble_dg_received = 0;  // 受信済みバイト数
+static uint8_t *g_ble_dg_buf = nullptr;          // PSRAM 上の組み立てバッファ（初回に確保して使い回す）
+static SemaphoreHandle_t g_ble_dg_mutex = nullptr;
+static uint32_t g_ble_dg_deadline = 0;           // 受信窓の終了時刻（WAIT/RECV）
+static uint32_t g_ble_dg_off_at = 0;             // DONE/ERROR 後に自動OFFする時刻
+static NimBLECharacteristic *g_ble_dg_status_chr = nullptr;
+
+static bool ble_digest_active() { return g_ble_dg_state != DG_OFF; }
+
+static void ble_dg_set_status(const String &s) {
+  if (g_ble_dg_status_chr) {
+    g_ble_dg_status_chr->setValue(std::string(s.c_str()));
+    g_ble_dg_status_chr->notify();
+  }
+}
+
+class BleDgCtrlCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *chr) override {
+    std::string v = chr->getValue();
+    String cmd(v.c_str());
+    if (cmd.startsWith("BEGIN:")) {
+      uint32_t total = (uint32_t)cmd.substring(6).toInt();
+      bool accepted = false;
+      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+      if (g_ble_dg_state == DG_WAIT && total > 0 && total <= DIGEST_MAX_BYTES) {
+        g_ble_dg_expect = total;
+        g_ble_dg_received = 0;
+        g_ble_dg_state = DG_RECV;
+        accepted = true;
+      }
+      xSemaphoreGive(g_ble_dg_mutex);
+      if (accepted) {
+        Serial.printf("[BLE] BEGIN total=%u\n", (unsigned)total);
+        ble_dg_set_status("RECV 0/" + String(total));
+      } else {
+        Serial.printf("[BLE] BEGIN rejected (state=%d total=%u)\n", (int)g_ble_dg_state, (unsigned)total);
+        ble_dg_set_status("ERR begin");
+      }
+    } else if (cmd == "END") {
+      if (g_ble_dg_state == DG_RECV) {
+        g_ble_dg_state = DG_COMMIT;  // 検証と保存は loop 側（ble_digest_tick）で行う
+        Serial.printf("[BLE] END received=%u expect=%u\n",
+                      (unsigned)g_ble_dg_received, (unsigned)g_ble_dg_expect);
+      }
+    } else if (cmd == "ABORT") {
+      bool was = false;
+      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+      if (g_ble_dg_state == DG_RECV) {
+        g_ble_dg_received = 0;
+        g_ble_dg_expect = 0;
+        g_ble_dg_state = DG_WAIT;
+        was = true;
+      }
+      xSemaphoreGive(g_ble_dg_mutex);
+      if (was) {
+        Serial.println("[BLE] ABORT (partial data discarded)");
+        ble_dg_set_status("WAIT");
+      }
+    }
+  }
+};
+
+class BleDgDataCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *chr) override {
+    if (!g_ble_dg_buf) return;
+    std::string v = chr->getValue();
+    size_t len = v.size();
+    if (len == 0) return;
+    uint32_t got = 0, exp = 0;
+    bool progress = false;
+    xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+    if (g_ble_dg_state == DG_RECV) {
+      uint32_t room = (g_ble_dg_expect > g_ble_dg_received) ? (g_ble_dg_expect - g_ble_dg_received) : 0;
+      size_t take = (len < room) ? len : room;
+      if (take) memcpy(g_ble_dg_buf + g_ble_dg_received, v.data(), take);
+      g_ble_dg_received += take;
+      got = g_ble_dg_received;
+      exp = g_ble_dg_expect;
+      progress = (got == exp) || ((got % 1024) < len);  // 約1KBごとと完了時に通知
+    }
+    xSemaphoreGive(g_ble_dg_mutex);
+    if (progress) ble_dg_set_status("RECV " + String(got) + "/" + String(exp));
+    note_activity();  // 転送中は画面の自動消灯タイマーを進めない
+  }
+};
+
+class BleDgServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
+    Serial.println("[BLE] connected");
+    note_activity();
+  }
+  void onDisconnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
+    Serial.println("[BLE] disconnected");
+    if (g_ble_dg_state == DG_RECV) {
+      // 転送途中の切断：受信済みデータは破棄し、受付待ちに戻る
+      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+      g_ble_dg_received = 0;
+      g_ble_dg_expect = 0;
+      g_ble_dg_state = DG_WAIT;
+      xSemaphoreGive(g_ble_dg_mutex);
+      ble_dg_set_status("WAIT");
+      Serial.println("[BLE] partial data discarded (disconnect)");
+    }
+    // NimBLE は切断後に広告を自動再開しないため、受信窓の間は再開する
+    if (g_ble_dg_state == DG_WAIT) NimBLEDevice::startAdvertising();
+  }
+};
+
+static BleDgCtrlCallbacks g_ble_dg_ctrl_cb;
+static BleDgDataCallbacks g_ble_dg_data_cb;
+static BleDgServerCallbacks g_ble_dg_server_cb;
+
+// 受信モードを開始する。音声処理中は開始しない（BLE と TLS/音声の競合回避）
+static bool ble_digest_start(String &err) {
+  if (g_ble_dg_state != DG_OFF) { err = "すでに受信モードです"; return false; }
+  if (audioRunning() || tts_processing() || speech_text != "" || speech_text_buffer != "") {
+    err = "音声処理中です";
+    return false;
+  }
+  if (!g_ble_dg_mutex) g_ble_dg_mutex = xSemaphoreCreateMutex();
+  if (!g_ble_dg_buf) g_ble_dg_buf = (uint8_t *)ps_malloc(DIGEST_MAX_BYTES);
+  if (!g_ble_dg_buf) { err = "メモリ不足"; return false; }
+  Serial.printf("[BLE] start receive mode heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  NimBLEDevice::init(BLE_DG_DEVICE_NAME);
+  NimBLEDevice::setMTU(185);  // ページ側の180バイト書き込みを通すため
+  NimBLEServer *server = NimBLEDevice::createServer();
+  server->setCallbacks(&g_ble_dg_server_cb);
+  NimBLEService *svc = server->createService(BLE_DG_SERVICE_UUID);
+  NimBLECharacteristic *ctrl = svc->createCharacteristic(BLE_DG_CTRL_UUID, NIMBLE_PROPERTY::WRITE);
+  ctrl->setCallbacks(&g_ble_dg_ctrl_cb);
+  NimBLECharacteristic *data = svc->createCharacteristic(BLE_DG_DATA_UUID, NIMBLE_PROPERTY::WRITE);
+  data->setCallbacks(&g_ble_dg_data_cb);
+  g_ble_dg_status_chr = svc->createCharacteristic(
+      BLE_DG_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  g_ble_dg_status_chr->setValue(std::string("WAIT"));
+  svc->start();
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(BLE_DG_SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+  g_ble_dg_received = 0;
+  g_ble_dg_expect = 0;
+  g_ble_dg_state = DG_WAIT;
+  g_ble_dg_deadline = millis() + BLE_DG_WINDOW_MS;
+  if (g_display_off) display_wake();
+  note_activity();
+  avatar.setSpeechText("BLE受信待ち");
+  Serial.printf("[BLE] advertising as %s (window %lu s) heap=%u largest=%u\n",
+                BLE_DG_DEVICE_NAME, (unsigned long)(BLE_DG_WINDOW_MS / 1000),
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  return true;
+}
+
+// 受信モードを終了し、BLE スタックを解放する
+static void ble_digest_stop(const char *reason) {
+  if (g_ble_dg_state == DG_OFF) return;
+  g_ble_dg_state = DG_OFF;
+  NimBLEDevice::deinit(true);
+  g_ble_dg_status_chr = nullptr;
+  Serial.printf("[BLE] stop (%s) heap=%u largest=%u\n", reason,
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+// loop から毎回呼ぶ：コミットの保存・タイムアウト・自動OFFを進める
+static void ble_digest_tick() {
+  uint8_t st = g_ble_dg_state;
+  if (st == DG_OFF) return;
+  uint32_t now = millis();
+  if (st == DG_COMMIT) {
+    // loop 文脈で検証と保存を行う（FS 操作を BLE タスクで行わない）
+    uint32_t got = g_ble_dg_received, exp = g_ble_dg_expect;
+    String name;
+    bool ok = (exp > 0 && got == exp && g_ble_dg_buf != nullptr);
+    if (ok) ok = digest_store(g_ble_dg_buf, got, name);
+    if (ok) {
+      g_ble_dg_state = DG_DONE;
+      g_ble_dg_off_at = now + BLE_DG_HOLD_MS;
+      ble_dg_set_status("DONE " + name);
+      avatar.setSpeechText("転送を保存しました");
+      g_info_msg_until = now + 4000;
+      sw_tone();
+      Serial.printf("[BLE] saved %s (%u bytes)\n", name.c_str(), (unsigned)got);
+    } else {
+      g_ble_dg_state = DG_ERROR;
+      g_ble_dg_off_at = now + BLE_DG_HOLD_MS;
+      ble_dg_set_status("ERR store");
+      avatar.setSpeechText("転送の保存に失敗しました");
+      g_info_msg_until = now + 4000;
+      Serial.printf("[BLE] commit failed (got=%u expect=%u)\n", (unsigned)got, (unsigned)exp);
+    }
+    return;
+  }
+  if ((st == DG_WAIT || st == DG_RECV) && (int32_t)(now - g_ble_dg_deadline) >= 0) {
+    g_ble_dg_state = DG_ERROR;
+    g_ble_dg_off_at = now + 3000;
+    ble_dg_set_status("ERR timeout");
+    avatar.setSpeechText("BLE受信タイムアウト");
+    g_info_msg_until = now + 3000;
+    Serial.println("[BLE] receive window timeout");
+    return;
+  }
+  if ((st == DG_DONE || st == DG_ERROR) && (int32_t)(now - g_ble_dg_off_at) >= 0) {
+    ble_digest_stop(st == DG_DONE ? "done" : "error/timeout");
+    if (!audioRunning() && speech_text == "" && speech_text_buffer == "") avatar.setSpeechText("");
+  }
+}
+
+// GET /ble: 受信モードを開始する（CORS 付きで書き込みページからも呼べる）
+static void handle_ble() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (ble_digest_active()) {
+    String json = String("{\"active\":true,\"state\":") + String((int)g_ble_dg_state) +
+                  ",\"received\":" + String((unsigned)g_ble_dg_received) +
+                  ",\"expect\":" + String((unsigned)g_ble_dg_expect) + "}";
+    server.send(200, "application/json", json);
+    return;
+  }
+  String err;
+  if (ble_digest_start(err)) {
+    server.send(200, "application/json", "{\"active\":true,\"started\":true}");
+  } else {
+    server.send(409, "application/json",
+                String("{\"active\":false,\"error\":\"") + err + "\"}");
+  }
+}
+
+// GET /digest: テスト用（最新の転送ニュースを読み上げる）
+static void handle_digest() {
+  String content;
+  int idx = 0;
+  bool has = digest_load_latest(content, idx);
+  exec_digest_category();
+  server.send(200, "text/plain",
+              has ? (String("転送ニュース #") + String(idx) + " を読み上げます")
+                  : String("転送ニュースはまだありません"));
+}
+
 
 void handle_voice() {
   String set = server.arg("set");
@@ -3142,6 +3648,7 @@ void ledTask(void *args)
   (void)args;
   static CRGB prev_frame[SIDE_LED_COUNT];
   static bool prev_valid = false;
+  static uint8_t shown_brightness = 0xFF;  // 最後に show() で出力した全体輝度（第9.23弾）
   float smooth_level = 0.0f;   // 発話中の明滅用に平滑化した音声レベル
   for (;;)
   {
@@ -3193,11 +3700,17 @@ void ledTask(void *args)
       }
     }
 
-    if (!prev_valid || memcmp(prev_frame, frame, sizeof(frame)) != 0) {
+    // 第9.23弾: 輝度だけが変わった場合も出力する。従来はフレーム（ピクセル値）の
+    // 変化でしか show() しなかったため、静止フレーム（聞き取り中の青一色・音量
+    // ゲージ等）では FastLED.setBrightness() の変更が LED に届かなかった。
+    uint8_t cur_brightness = FastLED.getBrightness();
+    if (!prev_valid || cur_brightness != shown_brightness ||
+        memcmp(prev_frame, frame, sizeof(frame)) != 0) {
       for (int i = 0; i < SIDE_LED_COUNT; i++) g_side_leds[i] = frame[i];
       FastLED.show();
       memcpy(prev_frame, frame, sizeof(frame));
       prev_valid = true;
+      shown_brightness = cur_brightness;
     }
     delay(30);
   }
@@ -3707,6 +4220,8 @@ void setup()
   server.on("/news", handle_news);
   server.on("/weather", HTTP_GET, handle_weather);  // 第9.20弾: 天気テスト用（明日の予報）
   server.on("/train", HTTP_GET, handle_train);      // 第9.21弾: 運行情報テスト用（対象3路線）
+  server.on("/ble", HTTP_GET, handle_ble);          // 第9.23弾: BLE テキスト転送の受信モード開始
+  server.on("/digest", HTTP_GET, handle_digest);    // 第9.23弾: 転送ニュース読み上げ（テスト用）
   server.on("/schedule", handle_schedule);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
   server.on("/role", handle_role);
@@ -4467,7 +4982,7 @@ static void change_volume(int delta) {
 
 // メニュー選択中を吹き出しに表示する（例「2/5 AIニュース」）
 static void menuShowBalloon() {
-  String s = String(g_menu_sel + 1) + "/5 " + NEWS_CATS[g_menu_sel].label;
+  String s = String(g_menu_sel + 1) + "/6 " + NEWS_CATS[g_menu_sel].label;
   avatar.setSpeechText(s.c_str());
 }
 
@@ -4477,12 +4992,12 @@ static void menuShowBalloon() {
 // （描画タスクのパネル transaction と begin/end が競合しないように）。
 static void drawMenuList() {
   GfxLockGuard gfx_guard;
-  M5.Lcd.fillRect(0, 76, 176, 106, TFT_BLACK);
+  M5.Lcd.fillRect(0, 76, 176, 118, TFT_BLACK);
   M5.Lcd.setFont(&fonts::efontJA_16);
   M5.Lcd.setTextSize(1);
   M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  for (int i = 0; i < 5; i++) {
-    M5.Lcd.setCursor(4, 80 + i * 20);
+  for (int i = 0; i < 6; i++) {
+    M5.Lcd.setCursor(4, 79 + i * 19);
     M5.Lcd.print((i == g_menu_sel) ? "▶ " : "  ");
     M5.Lcd.print(NEWS_CATS[i].label);
   }
@@ -4494,7 +5009,7 @@ static void menu_step(int delta) {
   // 発話中・ニュース表示中はメニューを開かない（吹き出しを奪わない）
   if (audioRunning() || speech_text != "" || speech_text_buffer != "" || g_cap_active) return;
   if (g_menu_open) {
-    g_menu_sel = (g_menu_sel + delta + 5) % 5;
+    g_menu_sel = (g_menu_sel + delta + 6) % 6;
   } else {
     g_menu_open = true;
   }
@@ -4525,6 +5040,8 @@ void loop()
 
   wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続
 
+  ble_digest_tick();  // 第9.23弾: BLE テキスト転送の状態遷移（保存・タイムアウト・自動OFF）
+
   pose_prepare_tick();  // 第9.2弾: ポーズ画像の先行デコード（draw タスク外で実施）
 
   battery_icon_tick();  // 第9.6弾: バッテリー残量の定期取得（描画は顔合成側）
@@ -4546,11 +5063,12 @@ void loop()
   // 定期通知モード：ON で発火時刻を過ぎたらニュース（トピックス＋AI）を読み上げる。
   // 再生中・発話待ちがある場合は割り込まず、約30秒後に再試行する
   if (g_periodic_on && (int32_t)(millis() - g_periodic_next_ms) >= 0) {
-    if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "") {
+    if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "" && !ble_digest_active()) {
       g_menu_open = false;
       avatar.setSpeechText("ニュースです");
       exec_news(true);  // 自動読み上げ: 新しい記事がなければ無言でスキップ（第9.20弾）
-      if (g_news_nothing_new) avatar.setSpeechText("");
+      append_unread_digest();  // 第9.23弾: 未読の転送テキストがあれば続けて読み上げる
+      if (g_news_nothing_new && speech_text == "") avatar.setSpeechText("");
       g_periodic_next_ms = millis() + 300000UL;
     } else {
       g_periodic_next_ms = millis() + 30000UL;
@@ -4801,7 +5319,7 @@ void loop()
   if (g_center_tap_pending &&
       (int32_t)(millis() - g_center_tap_ms) > (int32_t)CENTER_TAP_WINDOW_MS) {
     g_center_tap_pending = false;
-    if (!g_display_off && !g_settings_open && !g_menu_open &&
+    if (!g_display_off && !g_settings_open && !g_menu_open && !ble_digest_active() &&
         !g_news_playing && !g_pending_news_speech && !audioRunning() &&
         speech_text == "" && speech_text_buffer == "") {
       sw_tone();

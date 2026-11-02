@@ -99,8 +99,13 @@ int main() {
 ''')
         main = (SRC/'main.cpp').read_text()
         avatar = (ROOT/'M5Unified_AI_StackChan/lib/M5Stack-Avatar/src/Avatar.cpp').read_text()
-        self.assertIn('::stackchan_draw_version_badge();', avatar)
-        self.assertGreater(avatar.index('::stackchan_draw_version_badge();'), avatar.index('face->draw(ctx);'))
+        face = (ROOT/'M5Unified_AI_StackChan/lib/M5Stack-Avatar/src/Face.cpp').read_text()
+        self.assertNotIn('::stackchan_draw_version_badge();', avatar)
+        badge = face.index('::stackchan_draw_version_badge(sprite);')
+        self.assertGreater(badge, face.index('battery->draw(sprite, br, ctx);'))
+        self.assertLess(badge, face.index('sprite->pushRotateZoom('))
+        self.assertLess(badge, face.index('tmpSprite->pushSprite(&M5.Display,'))
+        self.assertIn('if (spi) drawFirmwareVersionBadge(*spi);', main)
         self.assertIn('drawFirmwareVersionBadge(M5.Lcd);\n    consec_errors', main)
 
     def test_only_first_buflen_at_source_eof_is_reclassified(self):

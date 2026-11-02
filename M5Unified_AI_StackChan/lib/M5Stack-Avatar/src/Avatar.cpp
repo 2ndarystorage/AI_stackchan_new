@@ -17,7 +17,8 @@ extern "C" unsigned stackchan_avatar_gfx_lock_revision() {
 #define PI 3.1415926535897932384626433832795
 #endif
 
-extern void stackchan_draw_version_badge();
+// 第9.23弾 (vendored change): バッジ描画は Face::draw 内（合成キャンバス）へ移設。
+// 以前のようなパネルへの直接描画は Avatar::draw から行わない（VENDORED.md 参照）。
 
 namespace m5avatar {
 
@@ -214,7 +215,6 @@ void Avatar::draw() {
                                      this->mouthOpenRatio, this->speechText,
                                      this->rotation, this->scale, this->colorDepth, this->batteryIconStatus, this->batteryLevel, this->speechFont);
   face->draw(ctx);
-  ::stackchan_draw_version_badge();
   delete ctx;
 }
 

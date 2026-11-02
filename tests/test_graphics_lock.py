@@ -47,6 +47,8 @@ struct Face {
     assert(active.fetch_add(1)==0);
     std::this_thread::yield();
     assert(active.fetch_sub(1)==1);
+    // v9.23 composites the badge inside Face::draw, under the same outer lock.
+    stackchan_draw_version_badge();
   }
 };
 using Expression = int;

@@ -4,6 +4,10 @@
 
 #include "Face.h"
 
+// 第9.23弾 (vendored change): バージョンバッジは顔の合成キャンバスへ描く。
+// 実体はアプリ側 main.cpp。理由は VENDORED.md を参照。
+extern void stackchan_draw_version_badge(M5Canvas *spi);
+
 #ifndef _min
 #define _min(a, b) std::min(a, b)
 #endif
@@ -123,6 +127,9 @@ void Face::draw(DrawContext *ctx) {
   b->draw(sprite, br, ctx);
   h->draw(sprite, br, ctx);
   battery->draw(sprite, br, ctx);
+  // 第9.23弾 (vendored change): バッジを合成の最終段でキャンバス内へ描く。
+  // パネルへ直接描くと次のフレームのキャンバス転写で消され、点滅して見えた。
+  ::stackchan_draw_version_badge(sprite);
   // drawAccessory(sprite, position, ctx);
 
   // TODO(meganetaaan): rethink responsibility for transform function

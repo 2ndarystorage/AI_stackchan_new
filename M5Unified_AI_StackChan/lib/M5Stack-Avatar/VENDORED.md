@@ -43,9 +43,36 @@ implementation fails linking. `setExpression()` takes the shared recursive
 graphics lock rather than suspending drawLoop mid-transaction. The draw stack
 remains 8192 bytes and `Avatar::draw()` holds the same lock as dance playback.
 
-## v9.16 version overlay
+## v9.16 version overlay (superseded by v9.23 below)
 
 After drawing the face, `Avatar::draw()` calls the application-owned
 `stackchan_draw_version_badge()` before releasing GfxLockGuard. This keeps
 the top-left firmware label visible above the balloon, with no extra task
 or out-of-lock display access. Keep this hook when updating the library.
+
+## v9.23 badge drawn into the compositing canvas
+
+The v9.16 hook drew the badge directly onto the panel (`M5.Display`) after
+`Face::draw()` had pushed the composed canvas. Every following frame push
+overwrote the badge, and the hook then redrew it, so on the real device
+the top-left version label visibly flickered. The badge is now drawn as
+the final step of face composition: `Face::draw()` calls
+`stackchan_draw_version_badge(sprite)` (implemented by the application in
+`main.cpp`) right after the balloon/effect/battery drawables, still inside
+the same `GfxLockGuard` held by `Avatar::draw()`. The `Avatar::draw()`
+panel-direct call was removed. The badge is now part of every composed
+frame, exactly like the application's battery/volume HUD, and rotates with
+the face transform together with that HUD. Keep this call when updating
+the library.
+
+## v9.19 balloon position and font size
+
+`src/Balloon.h`: the speech balloon overlapped the two-line caption panel
+that the application's KinakoFace draws at the bottom of the screen
+(panel y196–240, glyphs from y200). The balloon center was moved up
+(`cy` 220 → 170), so its bottom edge (cy + textHeight*2+2 = 196) now sits
+exactly at the caption panel's top edge, and the balloon text size was
+reduced (`TEXT_SIZE` 2 → 1.5, changed to a float constant; about 32px →
+24px glyphs with the efontJA_16 speech font). The caption font is drawn
+by the application and is unchanged. Keep both values when updating the
+library.

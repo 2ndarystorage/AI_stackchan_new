@@ -27,9 +27,12 @@ static bool audioRunning();
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include "HttpBody.h"  // chunked デコード付き本文読み取り（第9.22弾）
 #include "rootCACertificate.h"
 #include "rootCAgoogle.h"
 #include "rootCANHK.h"
+#include "rootCAopenmeteo.h"
+#include "rootCAtrain.h"
 #include <ArduinoJson.h>
 #include <ESP32WebServer.h>
 #define ENABLE_MDNS
@@ -62,7 +65,11 @@ SemaphoreHandle_t g_gfx_mutex = nullptr;
 SemaphoreHandle_t g_tls_mutex = nullptr;
 
 // Called by the vendored Avatar while the shared graphics mutex is held.
-void stackchan_draw_version_badge() { drawFirmwareVersionBadge(M5.Display); }
+// 第9.23弾: バッジは Face::draw から合成キャンバスを受け取って描く（点滅対策で
+// パネル直接描画から移設。バッテリー/音量 HUD と同じキャンバス内描画になった）
+void stackchan_draw_version_badge(M5Canvas *spi) {
+  if (spi) drawFirmwareVersionBadge(*spi);
+}
 static bool audioBeginMicrophone() {
   return handoverToMicrophone(M5.Speaker, M5.Mic,
       [](i2s_port_t port) { i2s_driver_uninstall(port); });
@@ -485,6 +492,27 @@ static void capBuildFromText(const String& text) {
 #define SIDE_LED_MAX_BRIGHTNESS 6   // 全体の明るさ上限（第9.5弾：48→16、第9.6弾：16→6、省電力化）
 CRGB g_side_leds[SIDE_LED_COUNT];
 bool g_led_enable = true;            // 全体の有効/無効（NVS "setting"/"led"、既定ON）
+
+// ==== LED輝度の段階設定（第9.19弾） ====
+// レベル0〜5 → FastLED の全体輝度。既定レベル4 = 従来の固定上限
+// SIDE_LED_MAX_BRIGHTNESS(6) と同じ見え方になるよう対応付けている。
+// 設定ダイアログ（右上タップ）で変更し、NVS "setting"/"ledlevel" に保存する。
+// 既存の ON/OFF（g_led_enable、/schedule ページ）とは独立で矛盾しない。
+// 第9.23弾: 低い側の刻みが 1/255 単位で見分けられなかったため、レベル3を 3→4 に
+// 見直し（既定レベル4=6 と上限レベル5=12 は従来どおり）
+static const uint8_t LED_LEVEL_VALUES[6] = {0, 1, 2, 4, 6, 12};
+uint8_t g_led_level = 4;             // LED輝度レベル（0〜5、既定4。KinakoFace.h から参照）
+static void applyLedLevel(bool save) {
+  FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);
+  if (save) {
+    nvs_handle_t h;
+    if (nvs_open("setting", NVS_READWRITE, &h) == ESP_OK) {
+      nvs_set_u8(h, "ledlevel", g_led_level);
+      nvs_commit(h);
+      nvs_close(h);
+    }
+  }
+}
 bool g_led_listening = false;        // 録音中（青）
 bool g_led_thinking = false;         // ChatGPT 応答待ち（紫パルス）
 bool g_led_news_active = false;      // ニュース読み上げ中（カテゴリ色）
@@ -539,20 +567,62 @@ struct NewsCatDef {
   int nhkCat;             // NHK RSS のカテゴリ番号（-1 = NHKなし）
   const char* googleUrl;  // フォールバック／単独取得用の Google ニュース RSS
 };
-static const NewsCatDef NEWS_CATS[5] = {
+static const NewsCatDef NEWS_CATS[6] = {
   {"トピックス",   "今日のニュースです。",     0,  "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"},
   {"AIニュース",   "AIニュースです。",        -1, "https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja"},
   {"芸能ニュース", "芸能ニュースです。",       6,  "https://news.google.com/rss/search?q=%E8%8A%B8%E8%83%BD&hl=ja&gl=JP&ceid=JP:ja"},
   {"テック",       "テックニュースです。",    -1, "https://news.google.com/rss/search?q=%E3%83%86%E3%82%AF%E3%83%8E%E3%83%AD%E3%82%B8%E3%83%BC&hl=ja&gl=JP&ceid=JP:ja"},
   {"その他",       "その他のニュースです。",   1,  "https://news.google.com/rss/search?q=%E7%A4%BE%E4%BC%9A&hl=ja&gl=JP&ceid=JP:ja"},
+  // 第9.23弾: BLE で転送されたテキスト（exec_news_category で特別処理。nhkCat=-2 が目印）
+  {"転送ニュース", "転送ニュースです。",      -2, ""},
 };
-// カテゴリごとの側面LED色（トピックス=白、AI=水色、芸能=ピンク、テック=緑、その他=黄）
-static const CRGB NEWS_CAT_COLORS[5] = {
-  CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0),
+// カテゴリごとの側面LED色（トピックス=白、AI=水色、芸能=ピンク、テック=緑、その他=黄、転送=紫）
+static const CRGB NEWS_CAT_COLORS[6] = {
+  CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0), CRGB(170, 90, 255),
 };
 bool g_menu_open = false;        // カテゴリ選択メニュー表示中
 int g_menu_sel = 0;              // 選択中のカテゴリ（0〜4）
 uint32_t g_menu_deadline = 0;    // 最後のタップから約2.5秒後に確定する時刻
+
+// ==== 画面消灯・設定ダイアログ（第9.19弾） ====
+#define DISPLAY_IDLE_OFF_MS 300000UL     // 無操作で自動消灯するまでの時間（5分）
+#define CENTER_TAP_WINDOW_MS 300         // 中央ダブルタップの判定窓（ms）。シングルタップ（会話開始）の発火はこの分だけ遅れる
+#define BTNC_TAP_WINDOW_MS 300           // BtnC ダブルタップの判定窓（ms）。短押し（定期通知トグル）の発火はこの分だけ遅れる
+#define SETTINGS_DIALOG_TIMEOUT_MS 5000  // 設定ダイアログの無操作自動クローズ（ms）
+bool g_settings_open = false;            // 設定ダイアログ表示中（KinakoFace.h から参照）
+uint32_t g_settings_deadline = 0;        // ダイアログの自動クローズ時刻
+static bool g_display_off = false;       // 画面が消灯中か
+static uint32_t g_last_activity_ms = 0;  // 最終操作時刻（タッチ/物理ボタン/発話開始で更新）
+static bool g_center_tap_pending = false;  // 中央シングルタップの発火待ち（ダブルタップ判定中）
+static uint32_t g_center_tap_ms = 0;       // 中央タップを受け付けた時刻
+
+static void note_activity() { g_last_activity_ms = millis(); }
+
+// 画面を消灯する。描画タスクと同じ GfxLock の中でパネルを操作し、描画と競合させない
+static void display_sleep() {
+  if (g_display_off) return;
+  g_display_off = true;
+  g_settings_open = false;
+  g_menu_open = false;
+  g_center_tap_pending = false;
+  {
+    GfxLockGuard gfx_guard;
+    M5.Display.sleep();  // バックライトOFF＋パネルスリープ（M5GFX）
+  }
+  Serial.println("[DISPLAY] sleep");
+}
+
+// 画面を点灯する。復帰に使った入力そのものは呼び出し側で消費し、他の機能に回さない
+static void display_wake() {
+  if (!g_display_off) return;
+  g_display_off = false;
+  note_activity();
+  {
+    GfxLockGuard gfx_guard;
+    M5.Display.wakeup();  // スリープ解除＋バックライトを元の輝度へ復帰
+  }
+  Serial.println("[DISPLAY] wake");
+}
 
 // ==== 定期通知モード（BtnC短押しトグル、5分おきニュース） ====
 // 状態は RAM のみ（再起動で OFF に戻る）
@@ -567,7 +637,11 @@ uint32_t g_periodic_next_ms = 0;     // 次回ニュース読み上げの発火�
 bool g_sched_morning = true;         // モーニング読み上げ（NVS "setting"/"s_morning"）
 bool g_sched_hourly = true;          // 時報（NVS "setting"/"s_hourly"）
 extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり）で定義
-String exec_news();                  // 実体は後方（ニュース読み上げの節）で定義
+String exec_news(bool automatic = false);  // 実体は後方（ニュース読み上げの節）で定義
+static void exec_digest_category();    // 第9.23弾: 転送ニュースの読み上げ（実体は後方）
+static void append_unread_digest();    // 第9.23弾: 自動読み上げへの未読転送テキスト連結（実体は後方）
+static bool ble_digest_active();       // 第9.23弾: BLE 受信モード中か（実体は後方）
+void sw_tone();                        // 実体は後方（音まわり）
 static bool play_dance_video();      // 実体は後方（SST_ChatGPT の直前）で定義。第9弾
 static void dance_boot_check();      // 起動時1回だけの自動再生判定（loop から呼ぶ）。第9.1弾
 
@@ -576,7 +650,7 @@ static void dance_boot_check();      // 起動時1回だけの自動再生判定
 // loop 内の同期処理のため、その間 run_schedule() 自体が呼ばれず割り込まれない
 static bool scheduler_ready() {
   return mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "" &&
-         !g_menu_open && !g_cap_active;
+         !g_menu_open && !g_cap_active && !ble_digest_active();  // 第9.23弾: BLE受信中は発火しない
 }
 
 // 毎朝7:00：日付の挨拶＋通常ニュース（トピックス＋AI）
@@ -589,7 +663,8 @@ static void sched_fn_morning() {
   snprintf(buf, sizeof(buf), "おはようございます。今日は%d月%d日（%s曜日）です。",
            t.tm_mon + 1, t.tm_mday, wday[t.tm_wday % 7]);
   g_pending_pose = POSE_RUN;  // 第9弾: モーニングの発話中は「走る」ポーズ（ニュースのサムズアップより優先）
-  exec_news();  // speech_text にニュース本文（失敗時はその旨の文）をセットする
+  exec_news(true);  // speech_text にニュース本文をセットする（自動読み上げ: 新しい記事がなければニュース部分は無言でスキップし、挨拶のみになる。第9.20弾）
+  append_unread_digest();  // 第9.23弾: 未読の転送テキストがあればニュースの後に連結する
   speech_text = String(buf) + speech_text;
 }
 
@@ -1273,6 +1348,196 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
   return v;
 }
 
+// ==== ニュースの鮮度・重複対策（第9.20弾） ====
+// 実機で古い台風ニュース（フィード先頭に残り続ける過去記事）を繰り返し
+// 読み上げる事象への対策。
+// (a) 鮮度: 記事の pubDate が48時間より古いものは読み上げ対象から外す。
+//     日付が取れない記事は除外しない（重複防止側で繰り返しを防ぐ）。
+//     未来日時の異常値（現在+24時間より先）は「日付なし」として扱う。
+// (b) 重複: 読み上げ済み記事のタイトルハッシュを SPIFFS に記録し、
+//     次回以降はスキップする。保持は最大60件・5日で自動的に掃除する。
+// (c) すべて古い/既読で新しい記事がなかった場合は g_news_nothing_new を立て、
+//     手動では「新しいニュースはありません」と読み上げ、自動読み上げ
+//     （定期通知・スケジューラ）では無言でスキップする（exec_news 側）。
+#define NEWS_OLD_LIMIT_SEC (48L * 3600L)
+#define NEWS_SEEN_MAX 60
+#define NEWS_SEEN_KEEP_SEC (5L * 24L * 3600L)
+#define NEWS_SEEN_PATH "/news_seen.txt"
+
+bool g_news_nothing_new = false;     // 直近の exec_news 系で「新しい記事がなかった」
+static bool g_news_feed_ok = false;  // いずれかのフィードの取得自体には成功した
+static int g_news_skip_old = 0;      // 直近の取得で古さにより除外した件数
+static int g_news_skip_seen = 0;     // 直近の取得で既読により除外した件数
+
+// 時刻が NTP 同期済みらしい値か（2026-01-01 UTC 以降）。未同期時は鮮度判定をしない
+static bool newsNowValid(time_t now) { return now > (time_t)1767225600L; }
+
+// civil 日付 → epoch 日数（days_from_civil）
+static int64_t newsDaysFromCivil(int y, int m, int d) {
+  y -= (m <= 2) ? 1 : 0;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = (int64_t)y - era * 400;
+  int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+
+// RSS の pubDate（RFC822: "Sun, 01 Nov 2026 06:30:00 +0900" / "... GMT"）を
+// epoch 秒に変換する。解釈できなければ 0（= 日付なし）を返す
+static time_t newsParseRssDate(const String& s) {
+  static const char* MONS[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  int monPos = -1, mon = 0;
+  for (int i = 0; i < 12; i++) {
+    int p = s.indexOf(MONS[i]);
+    if (p >= 0) { monPos = p; mon = i + 1; break; }
+  }
+  if (monPos < 0) return 0;
+  // 日: 月名の直前にある数値
+  int day = 0;
+  {
+    int i = monPos - 1;
+    while (i >= 0 && s[i] == ' ') i--;
+    int end = i + 1;
+    while (i >= 0 && isDigit(s[i])) i--;
+    if (end - (i + 1) <= 0) return 0;
+    day = s.substring(i + 1, end).toInt();
+  }
+  // 年: 月名の後ろにある4桁数値
+  int year = 0, yearEnd = -1;
+  for (int i = monPos + 3; i + 4 <= (int)s.length(); i++) {
+    if (isDigit(s[i]) && isDigit(s[i + 1]) && isDigit(s[i + 2]) && isDigit(s[i + 3])) {
+      year = s.substring(i, i + 4).toInt();
+      yearEnd = i + 4;
+      break;
+    }
+  }
+  if (day <= 0 || year < 2000) return 0;
+  // 時刻: 年の後ろの HH:MM:SS
+  int hh = 0, mm = 0, ss = 0;
+  int colon = (yearEnd > 0) ? s.indexOf(':', yearEnd) : -1;
+  if (colon >= 2) {
+    hh = s.substring(colon - 2, colon).toInt();
+    mm = s.substring(colon + 1, colon + 3).toInt();
+    if (colon + 3 < (int)s.length() && s[colon + 3] == ':') ss = s.substring(colon + 4, colon + 6).toInt();
+  }
+  // タイムゾーン: "+0900"/"-0500" 形式。無ければ GMT/UT は +0、JST は +9時間
+  long tzSec = 0;
+  bool tzFound = false;
+  for (int i = 0; i + 4 < (int)s.length(); i++) {
+    if ((s[i] == '+' || s[i] == '-') && isDigit(s[i + 1]) && isDigit(s[i + 2]) && isDigit(s[i + 3]) && isDigit(s[i + 4])) {
+      long th = s.substring(i + 1, i + 3).toInt();
+      long tm = s.substring(i + 3, i + 5).toInt();
+      tzSec = (th * 3600 + tm * 60) * (s[i] == '-' ? -1 : 1);
+      tzFound = true;
+      break;
+    }
+  }
+  if (!tzFound && s.indexOf("JST") >= 0) tzSec = 9 * 3600;
+  int64_t epoch = newsDaysFromCivil(year, mon, day) * 86400LL + hh * 3600LL + mm * 60LL + ss - tzSec;
+  return (time_t)epoch;
+}
+
+// 記事が「古い」（48時間超）かどうか。日付なし・時刻未同期・未来の異常値は古いとしない
+static bool newsIsOld(time_t pub, time_t now) {
+  if (pub == 0 || !newsNowValid(now)) return false;
+  if (pub > now + 24L * 3600L) return false;  // 未来日時の異常値は日付なし扱い
+  return (now - pub) > NEWS_OLD_LIMIT_SEC;
+}
+
+// タイトルの FNV-1a 32bit ハッシュ（重複判定用）
+static uint32_t newsTitleHash(const String& title) {
+  uint32_t h = 2166136261u;
+  for (size_t i = 0; i < title.length(); i++) {
+    h ^= (uint8_t)title[i];
+    h *= 16777619u;
+  }
+  return h;
+}
+
+struct NewsSeenEntry { uint32_t hash; uint32_t epoch; };
+static NewsSeenEntry g_news_seen[NEWS_SEEN_MAX];
+static int g_news_seen_count = 0;
+static bool g_news_seen_loaded = false;
+
+static void newsSeenLoad() {
+  if (g_news_seen_loaded) return;
+  g_news_seen_loaded = true;
+  g_news_seen_count = 0;
+  File f = SPIFFS.open(NEWS_SEEN_PATH, FILE_READ);
+  if (!f) return;
+  while (f.available() && g_news_seen_count < NEWS_SEEN_MAX) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    int sp = line.indexOf(' ');
+    if (sp <= 0) continue;
+    g_news_seen[g_news_seen_count].hash = (uint32_t)strtoul(line.substring(0, sp).c_str(), nullptr, 16);
+    g_news_seen[g_news_seen_count].epoch = (uint32_t)line.substring(sp + 1).toInt();
+    g_news_seen_count++;
+  }
+  f.close();
+  Serial.printf("[News] seen store loaded: %d entries\n", g_news_seen_count);
+}
+
+// 保持期間（5日）を過ぎた記録を掃除してから全件を書き戻す
+static void newsSeenSave() {
+  time_t now = time(nullptr);
+  bool nowOk = newsNowValid(now);
+  int w = 0;
+  for (int i = 0; i < g_news_seen_count; i++) {
+    uint32_t ep = g_news_seen[i].epoch;
+    // epoch 0 = 時刻未同期時の記録。日付では消さず、件数上限側で押し出す
+    if (nowOk && ep != 0 && (int64_t)now - (int64_t)ep > NEWS_SEEN_KEEP_SEC) continue;
+    g_news_seen[w++] = g_news_seen[i];
+  }
+  g_news_seen_count = w;
+  File f = SPIFFS.open(NEWS_SEEN_PATH, FILE_WRITE);
+  if (!f) { Serial.println("[News] seen store save failed"); return; }
+  for (int i = 0; i < g_news_seen_count; i++) {
+    f.printf("%08lx %lu\n", (unsigned long)g_news_seen[i].hash, (unsigned long)g_news_seen[i].epoch);
+  }
+  f.close();
+}
+
+static bool newsSeenContains(uint32_t h) {
+  newsSeenLoad();
+  for (int i = 0; i < g_news_seen_count; i++) if (g_news_seen[i].hash == h) return true;
+  return false;
+}
+
+// 読み上げ対象に決まった記事を記録する（満杯時は最も古い記録を押し出す）
+static void newsSeenAdd(uint32_t h) {
+  newsSeenLoad();
+  if (newsSeenContains(h)) return;
+  if (g_news_seen_count >= NEWS_SEEN_MAX) {
+    int oldest = 0;
+    for (int i = 1; i < g_news_seen_count; i++) if (g_news_seen[i].epoch < g_news_seen[oldest].epoch) oldest = i;
+    for (int i = oldest; i + 1 < g_news_seen_count; i++) g_news_seen[i] = g_news_seen[i + 1];
+    g_news_seen_count--;
+  }
+  time_t now = time(nullptr);
+  g_news_seen[g_news_seen_count].hash = h;
+  g_news_seen[g_news_seen_count].epoch = newsNowValid(now) ? (uint32_t)now : 0;
+  g_news_seen_count++;
+  newsSeenSave();
+}
+
+// 1記事分の鮮度・重複フィルタ。true = 読み上げ対象にする（その場合は既読に記録する）
+static bool newsAcceptArticle(const String& title, time_t pub) {
+  if (newsIsOld(pub, time(nullptr))) {
+    g_news_skip_old++;
+    Serial.printf("[News] skip old article: %s\n", title.c_str());
+    return false;
+  }
+  uint32_t h = newsTitleHash(title);
+  if (newsSeenContains(h)) {
+    g_news_skip_seen++;
+    Serial.printf("[News] skip already-read article: %s\n", title.c_str());
+    return false;
+  }
+  newsSeenAdd(h);
+  return true;
+}
+
 // NHKニュースRSS（カテゴリ nhkCat）の本文を取得する（第9.6弾で分離）。
 // 成否コードは g_nhk_http_code に残す（接続失敗時は負値）。
 static String fetchNhkRssBody(int nhkCat) {
@@ -1341,6 +1606,7 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
     payload = fetchNhkRssBody(nhkCat);
   }
   if (payload == "") return "";
+  g_news_feed_ok = true;  // フィード自体は取得できた（第9.20弾）
 
   String result = intro;
   int pos = 0;
@@ -1348,8 +1614,18 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
   while (count < 3) {
     int itemPos = payload.indexOf("<item>", pos);
     if (itemPos < 0) break;
+    pos = itemPos + 6;
     String title = xmlExtract(payload, "title", itemPos);
     if (title == "") break;
+    // pubDate は次の <item> の手前までで探す（他記事の日付を拾わない）
+    String pubStr = "";
+    {
+      int nextItem = payload.indexOf("<item>", pos);
+      int pubPos = payload.indexOf("<pubDate>", itemPos);
+      if (pubPos >= 0 && (nextItem < 0 || pubPos < nextItem)) pubStr = xmlExtract(payload, "pubDate", itemPos);
+    }
+    // 第9.20弾: 48時間より古い記事と既読記事は読み上げ対象から外す
+    if (!newsAcceptArticle(title, newsParseRssDate(pubStr))) continue;
     String desc = xmlExtract(payload, "description", itemPos);
     result += title + "。";
     if (desc != "") result += desc + "。";
@@ -1361,7 +1637,6 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
       if (dispDescs) dispDescs[dispCount] = desc;
       dispItems[dispCount++] = item;
     }
-    pos = itemPos + 6;
     count++;
   }
   if (count == 0) return "";
@@ -1411,9 +1686,24 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
         if (stream) {
           const char* patItem = "<item>";
           const char* patTitle = "<title>";
-          int state = 0;  // 0:<item>待ち 1:<title>待ち 2:見出し取得中
+          const char* patPub = "<pubDate>";
+          const char* patItemEnd = "</item>";
+          int state = 0;  // 0:<item>待ち 1:<title>待ち 2:見出し取得中 3:<pubDate>待ち 4:pubDate取得中
           int match = 0;
+          int matchEnd = 0;
           String title = "";
+          // 第9.20弾: 見出しは <pubDate>（または </item>）まで保留し、鮮度・重複
+          // フィルタを通ったものだけを outTitles へ出す（pubDate は title の後ろにある）
+          String pendingTitle = "";
+          String pubStr = "";
+          auto emitPending = [&]() {
+            if (pendingTitle == "") return;
+            if (outCount < want && newsAcceptArticle(pendingTitle, newsParseRssDate(pubStr))) {
+              outTitles[outCount++] = pendingTitle;
+            }
+            pendingTitle = "";
+            pubStr = "";
+          };
           const uint32_t MAX_SCAN = 120 * 1024;
           uint32_t scanned = 0;
           uint32_t startMs = millis();
@@ -1442,11 +1732,49 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
                   }
                   title = stripMediaSuffix(decodeEntities(title));
                   if (title != "") {
-                    outTitles[outCount++] = title;
+                    pendingTitle = title;  // 第9.20弾: pubDate を見てから確定する
+                    state = 3;
+                  } else {
+                    state = 0;
                   }
                   title = "";
+                  match = 0;
+                  matchEnd = 0;
+                }
+              } else if (state == 4) {
+                if (pubStr.length() < 64) pubStr += c;
+                if (pubStr.endsWith("</pubDate>")) {
+                  pubStr = pubStr.substring(0, pubStr.length() - 10);
+                  pubStr.trim();
+                  emitPending();
                   state = 0;
                   match = 0;
+                  matchEnd = 0;
+                }
+              } else if (state == 3) {
+                // <pubDate> と </item> の先に来た方で確定する（日付なし記事も拾う）
+                if (c == patPub[match]) {
+                  match++;
+                  if (patPub[match] == '\0') {
+                    state = 4;
+                    match = 0;
+                    pubStr = "";
+                  }
+                } else {
+                  match = (c == patPub[0]) ? 1 : 0;
+                }
+                if (state == 3) {
+                  if (c == patItemEnd[matchEnd]) {
+                    matchEnd++;
+                    if (patItemEnd[matchEnd] == '\0') {
+                      emitPending();
+                      state = 0;
+                      match = 0;
+                      matchEnd = 0;
+                    }
+                  } else {
+                    matchEnd = (c == patItemEnd[0]) ? 1 : 0;
+                  }
                 }
               } else {
                 const char* pat = (state == 0) ? patItem : patTitle;
@@ -1463,6 +1791,7 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
               }
             }
           }
+          emitPending();  // 第9.20弾: 走査打ち切り時に残った見出しを日付なしとして拾う
           Serial.printf("[Google RSS] headlines: %d (scanned %u bytes)\n", outCount, (unsigned)scanned);
         }
       }
@@ -1477,17 +1806,19 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
 // うえで1回だけ再試行するラッパー（第9.6弾）
 static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
   bool ok = fetchGoogleHeadlinesOnce(url, want, outTitles, outCount, httpCodeOut);
+  if (httpCodeOut == 200) g_news_feed_ok = true;  // フィード自体は取得できた（第9.20弾）
   if (!ok && httpCodeOut < 0) {
     Serial.printf("[Google RSS] retry after connection failure (code %d)\n", httpCodeOut);
     delay(1500);
     ok = fetchGoogleHeadlinesOnce(url, want, outTitles, outCount, httpCodeOut);
+    if (httpCodeOut == 200) g_news_feed_ok = true;
   }
   return ok;
 }
 
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
 // あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
-String exec_news() {
+String exec_news(bool automatic) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
   // 第9.8弾: ニュース取得（TLS）の前に、TTS接続ペアの解放を合成タスクへ
   // 依頼し、少し待って内蔵ヒープ（最大連続ブロック）を回復させてから
@@ -1495,6 +1826,11 @@ String exec_news() {
   // ハンドシェイクがメモリ確保失敗（-32512）になる事象への対策。
   g_tts_release_req = true;
   for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  // 第9.20弾: 鮮度・重複対策の状態を初期化する
+  g_news_nothing_new = false;
+  g_news_feed_ok = false;
+  g_news_skip_old = 0;
+  g_news_skip_seen = 0;
   captionReset();  // 前回の表示キューが残っていたら破棄する
   // 一般ニュース：NHK（見出し＋説明）→ 失敗時は Google トップニュースの見出しで代替
   String dispItems[5];
@@ -1549,13 +1885,26 @@ String exec_news() {
     g_led_news_color = CRGB::White;  // 通常ニュースのLED色は白
     if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
+  } else if (g_news_feed_ok) {
+    // 第9.20弾: 取得はできたが、古い記事と既読ばかりで新しい記事がなかった
+    g_news_nothing_new = true;
+    Serial.printf("[News] nothing new (skipped old=%d seen=%d, automatic=%d)\n",
+                  g_news_skip_old, g_news_skip_seen, automatic ? 1 : 0);
+    if (!automatic) {
+      speech_text = "新しいニュースはありません";
+      avatar.setSpeechText("新しいニュースはありません");
+      g_info_msg_until = millis() + 4000;
+      g_pending_news_speech = true;
+    }
+    // 自動読み上げ（定期通知・スケジューラ）の場合は無言でスキップする
   } else {
     speech_text = "ニュースを取得できませんでした";
     // 第9.6弾: 音声が出ない場合でも理由が分かるよう、吹き出しにも表示して残す
     avatar.setSpeechText("ニュースを取得できませんでした");
     g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
-  g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   return text;
 }
 
@@ -1565,11 +1914,17 @@ String exec_news() {
 // 従来の exec_news()（トピックス＋AI連結）とは独立した読み上げにする
 void exec_news_category(int cat) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return; }
-  if (cat < 0 || cat > 4) cat = 0;
+  if (cat < 0 || cat > 5) cat = 0;
+  if (cat == 5) { exec_digest_category(); return; }  // 第9.23弾: 転送ニュース
   const NewsCatDef& c = NEWS_CATS[cat];
   // 第9.8弾: exec_news() と同様、取得前に TTS 接続ペアの解放を依頼する
   g_tts_release_req = true;
   for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  // 第9.20弾: 鮮度・重複対策の状態を初期化する
+  g_news_nothing_new = false;
+  g_news_feed_ok = false;
+  g_news_skip_old = 0;
+  g_news_skip_seen = 0;
   captionReset();  // 前回の表示キューが残っていたら破棄する
   String dispItems[5];
   String dispTitles[5];
@@ -1606,26 +1961,998 @@ void exec_news_category(int cat) {
     g_led_news_color = NEWS_CAT_COLORS[cat];  // カテゴリ色をLEDに使う
     if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
+  } else if (g_news_feed_ok) {
+    // 第9.20弾: 取得はできたが、古い記事と既読ばかりで新しい記事がなかった
+    // （カテゴリ読み上げは手動トリガーのため、その旨を短く読み上げる）
+    g_news_nothing_new = true;
+    Serial.printf("[News] nothing new in category (skipped old=%d seen=%d)\n",
+                  g_news_skip_old, g_news_skip_seen);
+    speech_text = "新しいニュースはありません";
+    avatar.setSpeechText("新しいニュースはありません");
+    g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;
   } else {
     speech_text = "ニュースを取得できませんでした";
     // 第9.6弾: 音声が出ない場合でも理由が分かるよう、吹き出しにも表示して残す
     avatar.setSpeechText("ニュースを取得できませんでした");
     g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
-  g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
 }
 
 void handle_news() {
   String news = exec_news();
   String diag = String("\n[diag] NHK httpCode=") + String(g_nhk_http_code)
               + " GoogleTop httpCode=" + String(g_google_top_http_code)
-              + " GoogleAI httpCode=" + String(g_google_ai_http_code);
+              + " GoogleAI httpCode=" + String(g_google_ai_http_code)
+              + " skippedOld=" + String(g_news_skip_old)
+              + " skippedSeen=" + String(g_news_skip_seen);
   if (news != "") {
     server.send(200, "text/plain", news + diag);
+  } else if (g_news_nothing_new) {
+    server.send(200, "text/plain", String("新しいニュースはありません") + diag);
   } else {
     server.send(200, "text/plain", String("ニュースを取得できませんでした") + diag);
   }
 }
+
+// ==== 天気予報（Open-Meteo・第9.20弾） ====
+// ChatGPT はネットを見られないため、ニュースと同じ方式で本体が直接取得して
+// 読み上げる。取得先は Open-Meteo（APIキー不要）、対象は東京（35.68, 139.69）。
+// TLS は rootCAopenmeteo.h（ISRG Root X1 + X2。SSL Labs で両エンドポイントの
+// 実チェーン確認済み）をピン留めし、TlsGateGuard で他 TLS と直列化する。
+int g_weather_http_code = 0;  // 診断用（/weather のレスポンスで確認できる）
+
+static const char* WEATHER_API_URL =
+  "https://api.open-meteo.com/v1/forecast?latitude=35.68&longitude=139.69"
+  "&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+  "&timezone=Asia%2FTokyo";
+
+// Open-Meteo の JSON 本文を取得する（1回分）。HTTPコードは g_weather_http_code に残す
+// 第9.22弾: 本文は HttpBody.h の ChunkReader で読む。Open-Meteo は
+// Transfer-Encoding: chunked で返すため、生ストリームをそのまま String に
+// 入れると先頭にチャンクサイズ行（実測で本文638バイトに対し+12バイト）が
+// 混ざり、deserializeJson が失敗していた（v9.21 実機で確認）。
+// Content-Length 形式の応答でも同じ経路で読める。
+static bool fetchWeatherJsonOnce(String& out) {
+  out = "";
+  g_weather_http_code = 0;
+  Serial.printf("[Weather] start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  TlsGateGuard tls_guard;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (!client) return false;
+  client->setCACert(root_ca_openmeteo);
+  client->setTimeout(10000);
+  bool ok = false;
+  {
+    HTTPClient https;
+    https.setTimeout(10000);
+    const char* reqHeaders[] = {"Content-Length", "Transfer-Encoding"};
+    https.collectHeaders(reqHeaders, 2);
+    if (https.begin(*client, WEATHER_API_URL)) {
+      int code = https.GET();
+      g_weather_http_code = code;
+      Serial.printf("[Weather] GET... code: %d\n", code);
+      if (code == HTTP_CODE_OK) {
+        int size = https.getSize();  // Content-Length（無ければ -1）
+        String te = https.header("Transfer-Encoding");
+        te.toLowerCase();
+        bool chunked = te.indexOf("chunked") >= 0;
+        Serial.printf("[Weather] headers: content-length=%d transfer-encoding=%s (mode=%s)\n",
+                      size, te.c_str(), chunked ? "chunked" : (size > 0 ? "identity" : "close"));
+        WiFiClient *stream = https.getStreamPtr();
+        if (stream) {
+          ChunkReader reader;
+          reader.begin(stream, chunked, 12000);
+          String payload;
+          int readStatus = 1;
+          bool complete = httpReadBody(reader, payload, 32 * 1024,
+                                       size > 0 ? size : -1, &readStatus);
+          Serial.printf("[Weather] body %u bytes (complete=%d, status=%d)\n",
+                        (unsigned)payload.length(), (int)complete, readStatus);
+          if (complete && payload.length() > 0) { out = payload; ok = true; }
+        }
+      }
+      https.end();
+    }
+  }
+  delete client;
+  return ok;
+}
+
+// 接続失敗時は、全て解放したうえで1回だけ再試行する（ニュース取得と同じ方針）
+static bool fetchWeatherJson(String& out) {
+  bool ok = fetchWeatherJsonOnce(out);
+  if (!ok && g_weather_http_code < 0) {
+    Serial.printf("[Weather] retry after connection failure (code %d)\n", g_weather_http_code);
+    delay(1500);
+    ok = fetchWeatherJsonOnce(out);
+  }
+  return ok;
+}
+
+// WMO weather code → 日本語の天気表現
+static String weatherCodeJa(int code) {
+  switch (code) {
+    case 0: return "晴れ";
+    case 1: return "晴れ時々曇り";
+    case 2: return "曇り時々晴れ";
+    case 3: return "曇り";
+    case 45: case 48: return "霧";
+    case 51: case 53: case 55: case 56: case 57: return "小雨";
+    case 61: case 63: case 66: case 67: return "雨";
+    case 65: return "強い雨";
+    case 71: case 73: case 77: return "雪";
+    case 75: return "強い雪";
+    case 80: case 81: return "にわか雨";
+    case 82: return "激しいにわか雨";
+    case 85: case 86: return "にわか雪";
+    case 95: case 96: case 99: return "雷雨";
+    default: break;
+  }
+  if (code >= 95) return "雷雨";
+  if (code >= 85) return "にわか雪";
+  if (code >= 80) return "にわか雨";
+  if (code >= 70) return "雪";
+  if (code >= 60) return "雨";
+  if (code >= 50) return "小雨";
+  return "曇り";
+}
+
+// "2026-11-02" → 曜日（0=日 … 6=土）。Sakamoto の方法。解釈できなければ -1
+static int weatherWeekday(const String& dateStr) {
+  if (dateStr.length() < 10) return -1;
+  int y = dateStr.substring(0, 4).toInt();
+  int m = dateStr.substring(5, 7).toInt();
+  int d = dateStr.substring(8, 10).toInt();
+  if (y < 2000 || m < 1 || m > 12 || d < 1 || d > 31) return -1;
+  static const int T[] = {0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4};
+  if (m < 3) y -= 1;
+  return (y + y / 4 - y / 100 + y / 400 + T[m - 1] + d) % 7;
+}
+
+static const char* WEATHER_WDAYS[] = {"日曜日", "月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日"};
+
+// 天気の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）。
+// dayOffset >= 0: その日（0=今日 1=明日 2=明後日）／ dayOffset < 0: 週間（7日分）
+static String exec_weather_impl(int dayOffset) {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+  // ニュース取得と同様、TLS の前に TTS 接続ペアの解放を依頼してヒープを回復させる
+  g_tts_release_req = true;
+  for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  String text = "";
+  String payload;
+  if (fetchWeatherJson(payload)) {
+    DynamicJsonDocument doc(8192);
+    DeserializationError jerr = deserializeJson(doc, payload);
+    if (jerr == DeserializationError::Ok) {
+      JsonArray times = doc["daily"]["time"];
+      JsonArray codes = doc["daily"]["weathercode"];
+      JsonArray tmaxs = doc["daily"]["temperature_2m_max"];
+      JsonArray tmins = doc["daily"]["temperature_2m_min"];
+      JsonArray pops  = doc["daily"]["precipitation_probability_max"];
+      size_t days = times.size();
+      if (days > 0 && codes.size() == days && tmaxs.size() == days && tmins.size() == days) {
+        if (dayOffset >= 0) {
+          if ((size_t)dayOffset < days) {
+            const char* label = (dayOffset == 0) ? "今日" : (dayOffset == 1) ? "明日" : "明後日";
+            text = String(label) + "の東京の天気は" + weatherCodeJa(codes[dayOffset].as<int>())
+                 + "、最高気温は" + String((int)lroundf(tmaxs[dayOffset].as<float>())) + "度"
+                 + "、最低気温は" + String((int)lroundf(tmins[dayOffset].as<float>())) + "度";
+            if (pops.size() == days && !pops[dayOffset].isNull()) {
+              text += "、降水確率は" + String(pops[dayOffset].as<int>()) + "パーセント";
+            }
+            text += "です。";
+          }
+        } else {
+          text = "東京の週間天気予報です。";
+          for (size_t i = 0; i < days && i < 7; i++) {
+            String dateStr = times[i].as<String>();
+            int wd = weatherWeekday(dateStr);
+            text += String(dateStr.substring(5, 7).toInt()) + "月"
+                  + String(dateStr.substring(8, 10).toInt()) + "日";
+            if (wd >= 0) text += String("（") + WEATHER_WDAYS[wd] + "）";
+            text += "は" + weatherCodeJa(codes[i].as<int>())
+                  + "、最高" + String((int)lroundf(tmaxs[i].as<float>())) + "度"
+                  + "、最低" + String((int)lroundf(tmins[i].as<float>())) + "度。";
+          }
+        }
+      }
+    } else {
+      // 第9.22弾: 失敗理由（InvalidInput / NoMemory 等）と本文先頭を残す
+      Serial.printf("[Weather] JSON parse failed: %s (body %u bytes, head=\"%.24s\")\n",
+                    jerr.c_str(), (unsigned)payload.length(), payload.c_str());
+    }
+  }
+  if (text != "") {
+    // 会話応答と同じく、読み上げ文を2行字幕の対象にする
+    capBuildFromText(text);
+    g_led_news_color = CRGB::White;
+    if (g_cap_count > 0) g_cap_armed = true;
+    speech_text = text;
+  } else {
+    speech_text = "天気予報を取得できませんでした";
+    avatar.setSpeechText("天気予報を取得できませんでした");
+    g_info_msg_until = millis() + 4000;
+  }
+  g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
+  return text;
+}
+
+String exec_weather(int dayOffset) { return exec_weather_impl(dayOffset); }
+String exec_weather_weekly() { return exec_weather_impl(-1); }
+
+void handle_weather() {
+  String w = exec_weather(1);  // テスト用: 明日の予報を読み上げ開始する
+  String diag = String("\n[diag] Weather httpCode=") + String(g_weather_http_code);
+  if (w != "") {
+    server.send(200, "text/plain", w + diag);
+  } else {
+    server.send(200, "text/plain", String("天気予報を取得できませんでした") + diag);
+  }
+}
+
+// ==== 電車の運行情報（日テレ防災・第9.21弾） ====
+// ChatGPT はネットを見られないため、天気と同じ方式で本体が直接取得して
+// 読み上げる。取得元は日テレ気象・防災サイトの関東エリア鉄道情報ページ
+// （bosai.news.ntv.co.jp）。「現在運行情報のある路線」だけが
+// 会社名・路線名・状態（列車遅延／運転見合わせ等）とともに列挙される形式で、
+// 対象路線が載っていなければ平常と判断できる。無料の公式APIはなく、
+// かつて広く使われた RTI技研の delay.json は提供元解散で停止済みのため、
+// このページを採用した（2026-11-01 実データで形式を確認）。
+// TLS は rootCAtrain.h（ISRG Root X1 + X2）をピン留めし、TlsGateGuard で
+// 他 TLS と直列化する。ページ全体は保持せず、直近バイト列だけを残す
+// ストリーミング走査で対象路線名とその直後の状態語を探す（Transfer-Encoding:
+// chunked の場合は生ストリームをデコードしながら走査する）。
+int g_train_http_code = 0;  // 診断用（/train のレスポンスで確認できる）
+
+static const char* TRAIN_INFO_URL =
+  "https://bosai.news.ntv.co.jp/railway/area/%E9%96%A2%E6%9D%B1";  // 関東
+
+// 状態の重大度（大きいほど重い。同路線に複数エントリがあれば最大を採る）
+#define TRAIN_ST_NONE   0
+#define TRAIN_ST_RESUME 1  // 運転再開
+#define TRAIN_ST_DELAY  2  // 列車遅延
+#define TRAIN_ST_DISORDER 3  // ダイヤ乱れ
+#define TRAIN_ST_PLAN   4  // 運転計画
+#define TRAIN_ST_SUSPEND 5  // 運転見合わせ
+
+struct TrainLineState {
+  const char* pattern;    // ページ内で探す路線名（部分一致。東急/JR の接頭辞に依存しない）
+  const char* speakName;  // 読み上げ用路線名
+  int status;             // TRAIN_ST_*
+  int phase;              // 0=路線名を検索中, 1=状態語の窓を収集中, 2=確定
+  uint32_t nameEndAbs;    // 路線名一致の終了位置（コンテンツ絶対位置）
+  uint32_t minPos;        // 次に路線名を探す下限（コンテンツ絶対位置）
+};
+
+static int trainEvalStatus(const String& win) {
+  if (win.indexOf("運転見合わせ") >= 0 || win.indexOf("運休") >= 0) return TRAIN_ST_SUSPEND;
+  if (win.indexOf("運転計画") >= 0) return TRAIN_ST_PLAN;
+  if (win.indexOf("ダイヤ乱れ") >= 0 || win.indexOf("ダイヤの乱れ") >= 0 ||
+      win.indexOf("運転変更") >= 0) return TRAIN_ST_DISORDER;
+  if (win.indexOf("列車遅延") >= 0 || win.indexOf("遅延") >= 0) return TRAIN_ST_DELAY;
+  if (win.indexOf("運転再開") >= 0) return TRAIN_ST_RESUME;
+  return TRAIN_ST_NONE;
+}
+
+// 運行情報ページを1回取得し、対象路線の状態を lines[] に埋める
+static bool fetchTrainStatusOnce(TrainLineState* lines, int nLines) {
+  g_train_http_code = 0;
+  Serial.printf("[Train] start heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  TlsGateGuard tls_guard;
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if (!client) return false;
+  client->setCACert(root_ca_train);
+  client->setTimeout(12000);
+  bool ok = false;
+  {
+    HTTPClient https;
+    https.setTimeout(12000);
+    const char* reqHeaders[] = {"Transfer-Encoding"};
+    https.collectHeaders(reqHeaders, 1);
+    if (https.begin(*client, TRAIN_INFO_URL)) {
+      int code = https.GET();
+      g_train_http_code = code;
+      Serial.printf("[Train] GET... code: %d\n", code);
+      if (code == HTTP_CODE_OK) {
+        WiFiClient *stream = https.getStreamPtr();
+        if (stream) {
+          bool chunked = String(https.header("Transfer-Encoding")).indexOf("chunked") >= 0;
+          // チャンク転送デコーダの状態
+          int chunkState = 0;          // 0=サイズ行, 1=データ, 2=データ直後の改行読み捨て
+          uint32_t chunkLeft = 0;
+          String sizeLine;
+          // ストリーミング走査の状態（recent は直近バイト列のみ保持）
+          String recent;
+          recent.reserve(1400);
+          uint32_t total = 0;          // コンテンツ総バイト数
+          uint32_t recentBase = 0;     // recent[0] のコンテンツ絶対位置
+          const uint32_t WINDOW = 400; // 路線名の直後で状態語を探す範囲
+          const uint32_t deadline = millis() + 25000;
+          const uint32_t MAX_CONTENT = 1024 * 1024;
+          uint8_t rbuf[512];
+          bool streamDone = false;
+          // コンテンツバイト列を走査へ流し込む（走査状態を前進させる）
+          auto feedContent = [&](const uint8_t* p, int n) {
+            recent.concat((const char*)p, (unsigned int)n);
+            total += (uint32_t)n;
+            if (recent.length() > 1200) {
+              int drop = (int)recent.length() - 1200;
+              recent.remove(0, drop);
+              recentBase += (uint32_t)drop;
+            }
+            for (int li = 0; li < nLines; li++) {
+              TrainLineState& L = lines[li];
+              if (L.phase == 0) {
+                int from = (L.minPos > recentBase) ? (int)(L.minPos - recentBase) : 0;
+                int idx = recent.indexOf(L.pattern, from);
+                if (idx >= 0) {
+                  L.nameEndAbs = recentBase + (uint32_t)idx + strlen(L.pattern);
+                  L.phase = 1;
+                }
+              }
+              if (L.phase == 1 && total - L.nameEndAbs >= WINDOW) {
+                int start = (int)(L.nameEndAbs - recentBase);
+                if (start < 0) start = 0;
+                String win = recent.substring(start, start + (int)WINDOW);
+                int cut = win.indexOf("</a>");
+                int cut2 = win.indexOf("<a");
+                if (cut < 0 || (cut2 >= 0 && cut2 < cut)) cut = cut2;
+                if (cut >= 0) win = win.substring(0, cut);
+                int st = trainEvalStatus(win);
+                if (st > L.status) L.status = st;
+                if (st > TRAIN_ST_NONE) {
+                  L.phase = 2;
+                } else {
+                  L.phase = 0;              // 名前だけの出現だったので後方で探し直す
+                  L.minPos = L.nameEndAbs;
+                }
+              }
+            }
+          };
+          while ((int32_t)(millis() - deadline) < 0 && total < MAX_CONTENT && !streamDone) {
+            bool allDone = true;
+            for (int li = 0; li < nLines; li++) if (lines[li].phase != 2) allDone = false;
+            if (allDone) break;  // 全路線が確定したら残りは読まない
+            size_t avail = stream->available();
+            if (avail == 0) {
+              if (!stream->connected()) break;
+              delay(1);
+              continue;
+            }
+            int n = stream->read(rbuf, avail < sizeof(rbuf) ? avail : sizeof(rbuf));
+            if (n <= 0) { delay(1); continue; }
+            if (!chunked) {
+              feedContent(rbuf, n);
+            } else {
+              // チャンク転送をデコードしながら feedContent へ渡す
+              int i = 0;
+              while (i < n && !streamDone) {
+                if (chunkState == 0) {
+                  char c = (char)rbuf[i++];
+                  if (c == '\n') {
+                    long sz = strtol(sizeLine.c_str(), nullptr, 16);
+                    sizeLine = "";
+                    if (sz <= 0) { streamDone = true; break; }
+                    chunkLeft = (uint32_t)sz;
+                    chunkState = 1;
+                  } else if (c != '\r') {
+                    sizeLine += c;
+                    if (sizeLine.length() > 10) sizeLine = "";  // 異常な行は捨てる
+                  }
+                } else if (chunkState == 1) {
+                  int take = (int)((uint32_t)(n - i) < chunkLeft ? (uint32_t)(n - i) : chunkLeft);
+                  feedContent(rbuf + i, take);
+                  i += take;
+                  chunkLeft -= (uint32_t)take;
+                  if (chunkLeft == 0) chunkState = 2;
+                } else {
+                  // チャンク直後の CRLF を読み捨てる（LF まで）
+                  char c = (char)rbuf[i++];
+                  if (c == '\n') chunkState = 0;
+                }
+              }
+            }
+          }
+          // 窓が WINDOW に満たないまま終わった路線は、残りの窓で最終判定する
+          for (int li = 0; li < nLines; li++) {
+            TrainLineState& L = lines[li];
+            if (L.phase == 1) {
+              int start = (int)(L.nameEndAbs - recentBase);
+              if (start >= 0 && start < (int)recent.length()) {
+                String win = recent.substring(start);
+                int cut = win.indexOf("</a>");
+                int cut2 = win.indexOf("<a");
+                if (cut < 0 || (cut2 >= 0 && cut2 < cut)) cut = cut2;
+                if (cut >= 0) win = win.substring(0, cut);
+                int st = trainEvalStatus(win);
+                if (st > L.status) L.status = st;
+              }
+              L.phase = 2;
+            }
+          }
+          Serial.printf("[Train] scanned %u bytes\n", (unsigned)total);
+          ok = true;  // HTTP 200 で本文を読めた（路線が無ければ平常扱い）
+        }
+      }
+      https.end();
+    }
+  }
+  delete client;
+  return ok;
+}
+
+static bool fetchTrainStatus(TrainLineState* lines, int nLines) {
+  bool ok = fetchTrainStatusOnce(lines, nLines);
+  if (!ok && g_train_http_code < 0) {
+    Serial.printf("[Train] retry after connection failure (code %d)\n", g_train_http_code);
+    for (int li = 0; li < nLines; li++) {  // 再試行前に走査状態を初期化する
+      lines[li].status = TRAIN_ST_NONE;
+      lines[li].phase = 0;
+      lines[li].nameEndAbs = 0;
+      lines[li].minPos = 0;
+    }
+    delay(1500);
+    ok = fetchTrainStatusOnce(lines, nLines);
+  }
+  return ok;
+}
+
+// 運行情報の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）
+static String exec_train() {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+  // ニュース取得と同様、TLS の前に TTS 接続ペアの解放を依頼してヒープを回復させる
+  g_tts_release_req = true;
+  for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  TrainLineState lines[] = {
+    {"田園都市線", "田園都市線", TRAIN_ST_NONE, 0, 0, 0},
+    {"大井町線",   "大井町線",   TRAIN_ST_NONE, 0, 0, 0},
+    {"南武線",     "南武線",     TRAIN_ST_NONE, 0, 0, 0},
+  };
+  const int nLines = 3;
+  String text = "";
+  if (fetchTrainStatus(lines, nLines)) {
+    for (int li = 0; li < nLines; li++) {
+      Serial.printf("[Train] %s status=%d\n", lines[li].speakName, lines[li].status);
+      if (lines[li].status == TRAIN_ST_NONE) continue;
+      text += String(lines[li].speakName) + "は";
+      switch (lines[li].status) {
+        case TRAIN_ST_SUSPEND:  text += "運転を見合わせています。"; break;
+        case TRAIN_ST_PLAN:     text += "運転計画の変更が予定されています。"; break;
+        case TRAIN_ST_DISORDER: text += "ダイヤが乱れています。"; break;
+        case TRAIN_ST_DELAY:    text += "列車に遅れが出ています。"; break;
+        case TRAIN_ST_RESUME:   text += "運転を再開しています。"; break;
+        default: break;
+      }
+    }
+    if (text == "") {
+      text = "田園都市線、大井町線、南武線に遅れはありません。";
+    }
+  }
+  if (text != "") {
+    // 会話応答と同じく、読み上げ文を2行字幕の対象にする
+    capBuildFromText(text);
+    g_led_news_color = CRGB::White;
+    if (g_cap_count > 0) g_cap_armed = true;
+    speech_text = text;
+  } else {
+    speech_text = "運行情報を取得できませんでした";
+    avatar.setSpeechText("運行情報を取得できませんでした");
+    g_info_msg_until = millis() + 4000;
+  }
+  g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
+  return text;
+}
+
+void handle_train() {
+  String t = exec_train();  // テスト用: 対象3路線の運行情報を読み上げ開始する
+  String diag = String("\n[diag] Train httpCode=") + String(g_train_http_code);
+  if (t != "") {
+    server.send(200, "text/plain", t + diag);
+  } else {
+    server.send(200, "text/plain", String("運行情報を取得できませんでした") + diag);
+  }
+}
+
+// ==== BLE テキスト転送「転送ニュース」（第9.23弾） ====
+// Muse／ChatGPT／Codex が要約したテキスト（ITニュース、GitHub／
+// Hugging Face ランキング等）を、書き込みページから Web Bluetooth で
+// 転送して保存し、ニュースの1カテゴリとして読み上げる。
+//
+// 設計方針:
+// - メモリ節約のため BLE(NimBLE) は常時ONにせず、GET /ble で開始する
+//   受信モードの間だけ初期化する（待ち受け最大3分、完了後は自動OFF）。
+// - 音声処理中は受信モードを開始しない。受信モード中は定期通知・
+//   スケジューラ・中央タップ会話開始を止め、転送に専念する。
+// - GATT（128bit カスタムUUID）:
+//     Service : e8f5a001-b7d3-4c1e-9a2b-3d4c5e6f7081
+//     CTRL    : e8f5a002-… (Write) "BEGIN:<総バイト数>" / "END" / "ABORT"
+//     DATA    : e8f5a003-… (Write) 本文チャンク（応答あり、最大180バイト）
+//     STATUS  : e8f5a004-… (Read/Notify) "WAIT" / "RECV n/m" /
+//               "DONE dg_NNNN.txt" / "ERR …"
+//   本文は「1行目=タイトル、以降=本文」のプレーンテキスト(UTF-8)そのもの。
+// - 受信データは PSRAM 上で組み立て、END 受信後に loop 文脈で総バイト数を
+//   検証してから正式保存する（FS 操作を BLE タスクで行わない）。
+//   途中切断時は受信済みを破棄して受付待ちに戻る。
+// - 保存先は microSD の /digest/ を優先し、なければ SPIFFS（第9.19弾の
+//   キャプチャと同じ優先順位）。保持は最新10件、1件最大60KB。
+// - 既読管理は NVS "setting"/"dgread"（最後に読み上げた連番）。書き込み時の
+//   NVS 初期化でリセットされる（ニュース既読と同じ扱い）。
+#include <NimBLEDevice.h>
+
+#define BLE_DG_SERVICE_UUID "e8f5a001-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_CTRL_UUID    "e8f5a002-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_DATA_UUID    "e8f5a003-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_STATUS_UUID  "e8f5a004-b7d3-4c1e-9a2b-3d4c5e6f7081"
+#define BLE_DG_DEVICE_NAME  "StackChan-Digest"
+#define BLE_DG_WINDOW_MS    180000UL  // 受信待ち受けの上限（3分）
+#define BLE_DG_HOLD_MS      15000UL   // 完了/エラー後に STATUS を読めるよう保持する時間
+#define DIGEST_MAX_BYTES    (60 * 1024)  // 1件の上限
+#define DIGEST_KEEP_FILES   10           // 保持する最新件数
+#define DIGEST_DIR          "/digest"
+#define DIGEST_CAT_INDEX    5            // NEWS_CATS の「転送ニュース」
+
+// ---- 転送テキストの保存（microSD 優先、なければ SPIFFS） ----
+static fs::FS *digest_open(bool &use_sd) {
+  use_sd = false;
+  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+    use_sd = true;
+    if (!SD.exists(DIGEST_DIR)) SD.mkdir(DIGEST_DIR);
+    return &SD;
+  }
+  return &SPIFFS;
+}
+static void digest_close(bool use_sd) { if (use_sd) SD.end(); }
+
+// ファイル名が dg_NNNN.txt 形式なら連番を返す（それ以外は -1）
+static int digest_parse_index(const String &name) {
+  int slash = name.lastIndexOf('/');
+  String base = (slash >= 0) ? name.substring(slash + 1) : name;
+  if (!base.startsWith("dg_") || !base.endsWith(".txt")) return -1;
+  String num = base.substring(3, base.length() - 4);
+  if (num.length() == 0) return -1;
+  for (size_t i = 0; i < num.length(); i++) if (!isDigit(num[i])) return -1;
+  return num.toInt();
+}
+
+struct DigestEntry { int index; String path; };
+
+// 保存先の転送テキストを走査する。戻り値は out に格納した件数、
+// max_index は最大の連番（ファイルが無ければ 0）
+static int digest_scan(fs::FS &fsys, bool use_sd, DigestEntry *out, int max_out, int &max_index) {
+  max_index = 0;
+  int count = 0;
+  File dir = use_sd ? fsys.open(DIGEST_DIR) : fsys.open("/");
+  if (!dir) return 0;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    String fname = f.name();
+    int idx = digest_parse_index(fname);
+    if (idx >= 0) {
+      if (idx > max_index) max_index = idx;
+      if (count < max_out) {
+        out[count].index = idx;
+        out[count].path = use_sd ? (fname.startsWith("/") ? fname : String(DIGEST_DIR) + "/" + fname)
+                                 : fname;
+        count++;
+      }
+    }
+    f.close();
+  }
+  dir.close();
+  return count;
+}
+
+// 受信したテキストを正式保存する。保持上限を超える分は古い順に削除する
+static bool digest_store(const uint8_t *data, size_t len, String &out_name) {
+  bool use_sd;
+  fs::FS *fsys = digest_open(use_sd);
+  DigestEntry entries[24];
+  int max_index = 0;
+  int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
+  while (count >= DIGEST_KEEP_FILES) {
+    int oldest = 0;
+    for (int i = 1; i < count; i++) if (entries[i].index < entries[oldest].index) oldest = i;
+    Serial.printf("[Digest] remove old: %s\n", entries[oldest].path.c_str());
+    if (!fsys->remove(entries[oldest].path)) break;  // 削除できなければ諦める（無限ループ防止）
+    entries[oldest] = entries[count - 1];
+    count--;
+  }
+  char name[20];
+  snprintf(name, sizeof(name), "dg_%04d.txt", max_index + 1);
+  String path = String(DIGEST_DIR) + "/" + name;
+  File out = fsys->open(path, FILE_WRITE);
+  if (!out) { digest_close(use_sd); return false; }
+  size_t written = out.write(data, len);
+  out.close();
+  digest_close(use_sd);
+  if (written != len) return false;
+  out_name = name;
+  Serial.printf("[Digest] stored %s (%u bytes, %s)\n", path.c_str(), (unsigned)len,
+                use_sd ? "SD" : "SPIFFS");
+  return true;
+}
+
+// 最新の転送テキストを読み出す。無ければ false
+static bool digest_load_latest(String &out_text, int &out_index) {
+  bool use_sd;
+  fs::FS *fsys = digest_open(use_sd);
+  DigestEntry entries[24];
+  int max_index = 0;
+  int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
+  out_index = 0;
+  out_text = "";
+  if (count == 0 || max_index == 0) { digest_close(use_sd); return false; }
+  String path;
+  for (int i = 0; i < count; i++) if (entries[i].index == max_index) path = entries[i].path;
+  if (path == "") { digest_close(use_sd); return false; }
+  File f = fsys->open(path, FILE_READ);
+  if (!f) { digest_close(use_sd); return false; }
+  size_t remain = f.size();
+  if (remain > DIGEST_MAX_BYTES) remain = DIGEST_MAX_BYTES;
+  out_text.reserve(remain + 1);
+  uint8_t buf[256];
+  while (remain > 0) {
+    int n = f.read(buf, remain < sizeof(buf) ? remain : sizeof(buf));
+    if (n <= 0) break;
+    out_text.concat((const char *)buf, (unsigned int)n);
+    remain -= (size_t)n;
+  }
+  f.close();
+  digest_close(use_sd);
+  out_index = max_index;
+  return out_text.length() > 0;
+}
+
+// 既読管理（NVS "setting"/"dgread" に最後に読み上げた連番を保持）
+static int digest_last_read_index() {
+  uint32_t h;
+  int v = 0;
+  if (ESP_OK == nvs_open("setting", NVS_READONLY, &h)) {
+    int32_t t = 0;
+    if (ESP_OK == nvs_get_i32(h, "dgread", &t)) v = (int)t;
+    nvs_close(h);
+  }
+  return v;
+}
+static void digest_mark_read(int idx) {
+  uint32_t h;
+  if (ESP_OK == nvs_open("setting", NVS_READWRITE, &h)) {
+    nvs_set_i32(h, "dgread", idx);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
+// ファイル内容（1行目=タイトル、以降=本文）から読み上げ文を作る。
+// 本文の改行は文の区切りとして扱い、行末に句読点が無ければ「。」を補う
+static bool digest_build_speech(const String &content, String &out_title, String &out_speech) {
+  int nl = content.indexOf('\n');
+  String title = (nl >= 0) ? content.substring(0, nl) : content;
+  title.trim();
+  String body = (nl >= 0) ? content.substring(nl + 1) : "";
+  out_title = title;
+  String b;
+  b.reserve(body.length() + 16);
+  for (size_t i = 0; i < body.length(); i++) {
+    char c = body[i];
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (b.length() > 0 && !b.endsWith("。") && !b.endsWith("！") && !b.endsWith("？") &&
+          !b.endsWith("、") && !b.endsWith(".")) {
+        b += "。";
+      }
+      continue;
+    }
+    b += c;
+  }
+  out_speech = "";
+  if (title != "") out_speech += title + "。";
+  out_speech += b;
+  if (out_speech.length() > 0 && !out_speech.endsWith("。") && !out_speech.endsWith("！") &&
+      !out_speech.endsWith("？")) {
+    out_speech += "。";
+  }
+  return out_speech.length() > 0;
+}
+
+// カテゴリ「転送ニュース」の手動読み上げ（最新の保存テキストを読む）
+static void exec_digest_category() {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return; }
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  String content;
+  int idx = 0;
+  String title, speech;
+  if (!digest_load_latest(content, idx) || !digest_build_speech(content, title, speech)) {
+    speech_text = "転送ニュースはまだありません";
+    avatar.setSpeechText("転送ニュースはまだありません");
+    g_info_msg_until = millis() + 4000;
+    g_pending_news_speech = true;
+    return;
+  }
+  capAddLabel("転送ニュース");
+  capBuildFromText(speech);
+  g_led_news_color = NEWS_CAT_COLORS[DIGEST_CAT_INDEX];  // 転送ニュースのLED色は紫
+  if (g_cap_count > 0) g_cap_armed = true;
+  speech_text = "転送ニュースです。" + speech;
+  g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
+  digest_mark_read(idx);
+  Serial.printf("[Digest] speak latest #%d (%u chars)\n", idx, (unsigned)speech.length());
+}
+
+// 自動読み上げ（定期通知・モーニング）用：未読の最新転送テキストがあれば
+// speech_text の末尾に連結し、既読にする。無ければ何もしない
+static void append_unread_digest() {
+  String content;
+  int idx = 0;
+  if (!digest_load_latest(content, idx)) return;
+  if (idx <= digest_last_read_index()) return;  // 既読なら繰り返さない
+  String title, speech;
+  if (!digest_build_speech(content, title, speech)) return;
+  capAddLabel("転送ニュース");
+  capBuildFromText(speech);
+  bool was_empty = (speech_text == "");
+  speech_text += was_empty ? String("転送ニュースです。") : String("続いて、転送ニュースです。");
+  speech_text += speech;
+  if (was_empty) g_led_news_color = NEWS_CAT_COLORS[DIGEST_CAT_INDEX];
+  if (g_cap_count > 0) g_cap_armed = true;
+  g_pending_news_speech = true;
+  digest_mark_read(idx);
+  Serial.printf("[Digest] appended unread #%d to automatic speech\n", idx);
+}
+
+// ---- BLE 受信モード ----
+enum BleDgState : uint8_t { DG_OFF = 0, DG_WAIT, DG_RECV, DG_COMMIT, DG_DONE, DG_ERROR };
+static volatile uint8_t g_ble_dg_state = DG_OFF;
+static volatile uint32_t g_ble_dg_expect = 0;    // BEGIN で申告された総バイト数
+static volatile uint32_t g_ble_dg_received = 0;  // 受信済みバイト数
+static uint8_t *g_ble_dg_buf = nullptr;          // PSRAM 上の組み立てバッファ（初回に確保して使い回す）
+static SemaphoreHandle_t g_ble_dg_mutex = nullptr;
+static uint32_t g_ble_dg_deadline = 0;           // 受信窓の終了時刻（WAIT/RECV）
+static uint32_t g_ble_dg_off_at = 0;             // DONE/ERROR 後に自動OFFする時刻
+static NimBLECharacteristic *g_ble_dg_status_chr = nullptr;
+
+static bool ble_digest_active() { return g_ble_dg_state != DG_OFF; }
+
+static void ble_dg_set_status(const String &s) {
+  if (g_ble_dg_status_chr) {
+    g_ble_dg_status_chr->setValue(std::string(s.c_str()));
+    g_ble_dg_status_chr->notify();
+  }
+}
+
+class BleDgCtrlCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *chr) override {
+    std::string v = chr->getValue();
+    String cmd(v.c_str());
+    if (cmd.startsWith("BEGIN:")) {
+      uint32_t total = (uint32_t)cmd.substring(6).toInt();
+      bool accepted = false;
+      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+      if (g_ble_dg_state == DG_WAIT && total > 0 && total <= DIGEST_MAX_BYTES) {
+        g_ble_dg_expect = total;
+        g_ble_dg_received = 0;
+        g_ble_dg_state = DG_RECV;
+        accepted = true;
+      }
+      xSemaphoreGive(g_ble_dg_mutex);
+      if (accepted) {
+        Serial.printf("[BLE] BEGIN total=%u\n", (unsigned)total);
+        ble_dg_set_status("RECV 0/" + String(total));
+      } else {
+        Serial.printf("[BLE] BEGIN rejected (state=%d total=%u)\n", (int)g_ble_dg_state, (unsigned)total);
+        ble_dg_set_status("ERR begin");
+      }
+    } else if (cmd == "END") {
+      if (g_ble_dg_state == DG_RECV) {
+        g_ble_dg_state = DG_COMMIT;  // 検証と保存は loop 側（ble_digest_tick）で行う
+        Serial.printf("[BLE] END received=%u expect=%u\n",
+                      (unsigned)g_ble_dg_received, (unsigned)g_ble_dg_expect);
+      }
+    } else if (cmd == "ABORT") {
+      bool was = false;
+      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+      if (g_ble_dg_state == DG_RECV) {
+        g_ble_dg_received = 0;
+        g_ble_dg_expect = 0;
+        g_ble_dg_state = DG_WAIT;
+        was = true;
+      }
+      xSemaphoreGive(g_ble_dg_mutex);
+      if (was) {
+        Serial.println("[BLE] ABORT (partial data discarded)");
+        ble_dg_set_status("WAIT");
+      }
+    }
+  }
+};
+
+class BleDgDataCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic *chr) override {
+    if (!g_ble_dg_buf) return;
+    std::string v = chr->getValue();
+    size_t len = v.size();
+    if (len == 0) return;
+    uint32_t got = 0, exp = 0;
+    bool progress = false;
+    xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+    if (g_ble_dg_state == DG_RECV) {
+      uint32_t room = (g_ble_dg_expect > g_ble_dg_received) ? (g_ble_dg_expect - g_ble_dg_received) : 0;
+      size_t take = (len < room) ? len : room;
+      if (take) memcpy(g_ble_dg_buf + g_ble_dg_received, v.data(), take);
+      g_ble_dg_received += take;
+      got = g_ble_dg_received;
+      exp = g_ble_dg_expect;
+      progress = (got == exp) || ((got % 1024) < len);  // 約1KBごとと完了時に通知
+    }
+    xSemaphoreGive(g_ble_dg_mutex);
+    if (progress) ble_dg_set_status("RECV " + String(got) + "/" + String(exp));
+    note_activity();  // 転送中は画面の自動消灯タイマーを進めない
+  }
+};
+
+class BleDgServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
+    Serial.println("[BLE] connected");
+    note_activity();
+  }
+  void onDisconnect(NimBLEServer *srv, ble_gap_conn_desc *desc) override {
+    Serial.println("[BLE] disconnected");
+    if (g_ble_dg_state == DG_RECV) {
+      // 転送途中の切断：受信済みデータは破棄し、受付待ちに戻る
+      xSemaphoreTake(g_ble_dg_mutex, portMAX_DELAY);
+      g_ble_dg_received = 0;
+      g_ble_dg_expect = 0;
+      g_ble_dg_state = DG_WAIT;
+      xSemaphoreGive(g_ble_dg_mutex);
+      ble_dg_set_status("WAIT");
+      Serial.println("[BLE] partial data discarded (disconnect)");
+    }
+    // NimBLE は切断後に広告を自動再開しないため、受信窓の間は再開する
+    if (g_ble_dg_state == DG_WAIT) NimBLEDevice::startAdvertising();
+  }
+};
+
+static BleDgCtrlCallbacks g_ble_dg_ctrl_cb;
+static BleDgDataCallbacks g_ble_dg_data_cb;
+static BleDgServerCallbacks g_ble_dg_server_cb;
+
+// 受信モードを開始する。音声処理中は開始しない（BLE と TLS/音声の競合回避）
+static bool ble_digest_start(String &err) {
+  if (g_ble_dg_state != DG_OFF) { err = "すでに受信モードです"; return false; }
+  if (audioRunning() || tts_processing() || speech_text != "" || speech_text_buffer != "") {
+    err = "音声処理中です";
+    return false;
+  }
+  if (!g_ble_dg_mutex) g_ble_dg_mutex = xSemaphoreCreateMutex();
+  if (!g_ble_dg_buf) g_ble_dg_buf = (uint8_t *)ps_malloc(DIGEST_MAX_BYTES);
+  if (!g_ble_dg_buf) { err = "メモリ不足"; return false; }
+  Serial.printf("[BLE] start receive mode heap=%u largest=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  NimBLEDevice::init(BLE_DG_DEVICE_NAME);
+  NimBLEDevice::setMTU(185);  // ページ側の180バイト書き込みを通すため
+  NimBLEServer *server = NimBLEDevice::createServer();
+  server->setCallbacks(&g_ble_dg_server_cb);
+  NimBLEService *svc = server->createService(BLE_DG_SERVICE_UUID);
+  NimBLECharacteristic *ctrl = svc->createCharacteristic(BLE_DG_CTRL_UUID, NIMBLE_PROPERTY::WRITE);
+  ctrl->setCallbacks(&g_ble_dg_ctrl_cb);
+  NimBLECharacteristic *data = svc->createCharacteristic(BLE_DG_DATA_UUID, NIMBLE_PROPERTY::WRITE);
+  data->setCallbacks(&g_ble_dg_data_cb);
+  g_ble_dg_status_chr = svc->createCharacteristic(
+      BLE_DG_STATUS_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  g_ble_dg_status_chr->setValue(std::string("WAIT"));
+  svc->start();
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(BLE_DG_SERVICE_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+  g_ble_dg_received = 0;
+  g_ble_dg_expect = 0;
+  g_ble_dg_state = DG_WAIT;
+  g_ble_dg_deadline = millis() + BLE_DG_WINDOW_MS;
+  if (g_display_off) display_wake();
+  note_activity();
+  avatar.setSpeechText("BLE受信待ち");
+  Serial.printf("[BLE] advertising as %s (window %lu s) heap=%u largest=%u\n",
+                BLE_DG_DEVICE_NAME, (unsigned long)(BLE_DG_WINDOW_MS / 1000),
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  return true;
+}
+
+// 受信モードを終了し、BLE スタックを解放する
+static void ble_digest_stop(const char *reason) {
+  if (g_ble_dg_state == DG_OFF) return;
+  g_ble_dg_state = DG_OFF;
+  NimBLEDevice::deinit(true);
+  g_ble_dg_status_chr = nullptr;
+  Serial.printf("[BLE] stop (%s) heap=%u largest=%u\n", reason,
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+// loop から毎回呼ぶ：コミットの保存・タイムアウト・自動OFFを進める
+static void ble_digest_tick() {
+  uint8_t st = g_ble_dg_state;
+  if (st == DG_OFF) return;
+  uint32_t now = millis();
+  if (st == DG_COMMIT) {
+    // loop 文脈で検証と保存を行う（FS 操作を BLE タスクで行わない）
+    uint32_t got = g_ble_dg_received, exp = g_ble_dg_expect;
+    String name;
+    bool ok = (exp > 0 && got == exp && g_ble_dg_buf != nullptr);
+    if (ok) ok = digest_store(g_ble_dg_buf, got, name);
+    if (ok) {
+      g_ble_dg_state = DG_DONE;
+      g_ble_dg_off_at = now + BLE_DG_HOLD_MS;
+      ble_dg_set_status("DONE " + name);
+      avatar.setSpeechText("転送を保存しました");
+      g_info_msg_until = now + 4000;
+      sw_tone();
+      Serial.printf("[BLE] saved %s (%u bytes)\n", name.c_str(), (unsigned)got);
+    } else {
+      g_ble_dg_state = DG_ERROR;
+      g_ble_dg_off_at = now + BLE_DG_HOLD_MS;
+      ble_dg_set_status("ERR store");
+      avatar.setSpeechText("転送の保存に失敗しました");
+      g_info_msg_until = now + 4000;
+      Serial.printf("[BLE] commit failed (got=%u expect=%u)\n", (unsigned)got, (unsigned)exp);
+    }
+    return;
+  }
+  if ((st == DG_WAIT || st == DG_RECV) && (int32_t)(now - g_ble_dg_deadline) >= 0) {
+    g_ble_dg_state = DG_ERROR;
+    g_ble_dg_off_at = now + 3000;
+    ble_dg_set_status("ERR timeout");
+    avatar.setSpeechText("BLE受信タイムアウト");
+    g_info_msg_until = now + 3000;
+    Serial.println("[BLE] receive window timeout");
+    return;
+  }
+  if ((st == DG_DONE || st == DG_ERROR) && (int32_t)(now - g_ble_dg_off_at) >= 0) {
+    ble_digest_stop(st == DG_DONE ? "done" : "error/timeout");
+    if (!audioRunning() && speech_text == "" && speech_text_buffer == "") avatar.setSpeechText("");
+  }
+}
+
+// GET /ble: 受信モードを開始する（CORS 付きで書き込みページからも呼べる）
+static void handle_ble() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  if (ble_digest_active()) {
+    String json = String("{\"active\":true,\"state\":") + String((int)g_ble_dg_state) +
+                  ",\"received\":" + String((unsigned)g_ble_dg_received) +
+                  ",\"expect\":" + String((unsigned)g_ble_dg_expect) + "}";
+    server.send(200, "application/json", json);
+    return;
+  }
+  String err;
+  if (ble_digest_start(err)) {
+    server.send(200, "application/json", "{\"active\":true,\"started\":true}");
+  } else {
+    server.send(409, "application/json",
+                String("{\"active\":false,\"error\":\"") + err + "\"}");
+  }
+}
+
+// GET /digest: テスト用（最新の転送ニュースを読み上げる）
+static void handle_digest() {
+  String content;
+  int idx = 0;
+  bool has = digest_load_latest(content, idx);
+  exec_digest_category();
+  server.send(200, "text/plain",
+              has ? (String("転送ニュース #") + String(idx) + " を読み上げます")
+                  : String("転送ニュースはまだありません"));
+}
+
 
 void handle_voice() {
   String set = server.arg("set");
@@ -2321,6 +3648,7 @@ void ledTask(void *args)
   (void)args;
   static CRGB prev_frame[SIDE_LED_COUNT];
   static bool prev_valid = false;
+  static uint8_t shown_brightness = 0xFF;  // 最後に show() で出力した全体輝度（第9.23弾）
   float smooth_level = 0.0f;   // 発話中の明滅用に平滑化した音声レベル
   for (;;)
   {
@@ -2372,11 +3700,17 @@ void ledTask(void *args)
       }
     }
 
-    if (!prev_valid || memcmp(prev_frame, frame, sizeof(frame)) != 0) {
+    // 第9.23弾: 輝度だけが変わった場合も出力する。従来はフレーム（ピクセル値）の
+    // 変化でしか show() しなかったため、静止フレーム（聞き取り中の青一色・音量
+    // ゲージ等）では FastLED.setBrightness() の変更が LED に届かなかった。
+    uint8_t cur_brightness = FastLED.getBrightness();
+    if (!prev_valid || cur_brightness != shown_brightness ||
+        memcmp(prev_frame, frame, sizeof(frame)) != 0) {
       for (int i = 0; i < SIDE_LED_COUNT; i++) g_side_leds[i] = frame[i];
       FastLED.show();
       memcpy(prev_frame, frame, sizeof(frame));
       prev_valid = true;
+      shown_brightness = cur_brightness;
     }
     delay(30);
   }
@@ -2549,6 +3883,11 @@ String SpeechToText(bool isGoogle){
   return ret;
 }
 
+// 画面キャプチャ HTTP ハンドラの前方宣言（実体はキャプチャ処理の後方、第9.19弾）
+static void handle_shots_list();
+static void handle_shot_download();
+static void handle_shot_delete();
+
 void setup()
 {
   // 第9.3弾: グラフィックス直列化ロックを最初に生成する
@@ -2708,6 +4047,7 @@ void setup()
       if (ESP_OK == nvs_get_u8(nvs_handle, "s_morning", &v)) g_sched_morning = (v != 0);
       if (ESP_OK == nvs_get_u8(nvs_handle, "s_hourly", &v)) g_sched_hourly = (v != 0);
       if (ESP_OK == nvs_get_u8(nvs_handle, "led", &v)) g_led_enable = (v != 0);
+      if (ESP_OK == nvs_get_u8(nvs_handle, "ledlevel", &v) && v <= 5) g_led_level = v;  // 第9.19弾: LED輝度レベル
       nvs_close(nvs_handle);
     }
   }
@@ -2860,6 +4200,9 @@ void setup()
   server.on("/audio_status", HTTP_GET, handle_audio_status);
   server.on("/audio_test", HTTP_POST, handle_audio_test);
   server.on("/tls_test", HTTP_POST, handle_tls_test);
+  server.on("/shots", HTTP_GET, handle_shots_list);    // 第9.19弾: キャプチャ一覧
+  server.on("/shot", HTTP_GET, handle_shot_download);  // 第9.19弾: キャプチャ取得
+  server.on("/shotdel", handle_shot_delete);           // 第9.19弾: キャプチャ削除（GET/POST）
   server.on("/", handleRoot);
 
   server.on("/inline", [](){
@@ -2875,6 +4218,10 @@ void setup()
   server.on("/voice", handle_voice);
   server.on("/model", handle_model);
   server.on("/news", handle_news);
+  server.on("/weather", HTTP_GET, handle_weather);  // 第9.20弾: 天気テスト用（明日の予報）
+  server.on("/train", HTTP_GET, handle_train);      // 第9.21弾: 運行情報テスト用（対象3路線）
+  server.on("/ble", HTTP_GET, handle_ble);          // 第9.23弾: BLE テキスト転送の受信モード開始
+  server.on("/digest", HTTP_GET, handle_digest);    // 第9.23弾: 転送ニュース読み上げ（テスト用）
   server.on("/schedule", handle_schedule);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
   server.on("/role", handle_role);
@@ -2955,7 +4302,7 @@ void setup()
 
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動
   FastLED.addLeds<SK6812, SIDE_LED_PIN, GRB>(g_side_leds, SIDE_LED_COUNT);
-  FastLED.setBrightness(SIDE_LED_MAX_BRIGHTNESS);
+  FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);  // 第9.19弾: 段階設定（既定レベル4＝従来上限6と同じ）
   FastLED.clear(true);
   xTaskCreatePinnedToCore(ledTask, "ledTask", 4096, NULL, 1, NULL, 0);
 
@@ -2977,7 +4324,8 @@ void setup()
   avatar.setSpeechFont(&fonts::efontJA_16);
 
 //  M5.Speaker.setVolume(200);
-  // タッチレイアウト：四隅＝音量（右上/右下）とニュースカテゴリ選択（左上/左下）、
+  // タッチレイアウト：右上＝設定ダイアログ（第9.19弾。表示中は四隅が音量/LED調整）、
+  // 左上/左下＝ニュースカテゴリ選択、右下＝単独では無効（旧・音量ダウンは廃止）、
   // 中央＝会話開始(STT)、左右の帯＝独り言切替(box_BtnA)/定期通知トグル(box_BtnC)、
   // 下部中央＝サーボ切替。四隅・中央・帯が重ならないよう配置している
   box_servo.setupBox(130, 185, 60, 50);
@@ -2995,6 +4343,8 @@ void setup()
   // 回り始めた状態）に dance_boot_check() 経由で1回だけ再生する方式へ移した。
   // Wi-Fi 未設定の場合は Wifi_setup() の SmartConfig 待ち→再起動ループに
   // なるため、従来どおり初期設定を妨げることもない。
+
+  g_last_activity_ms = millis();  // 画面自動消灯タイマーの起点（第9.19弾）
 }
 
 String random_words[18] = {"あなたは誰","楽しい","怒った","可愛い","悲しい","眠い","ジョークを言って","泣きたい","怒ったぞ","こんにちは","お疲れ様","詩を書いて","疲れた","お腹空いた","嫌いだ","苦しい","俳句を作って","歌をうたって"};
@@ -3272,7 +4622,26 @@ void SST_ChatGPT() {
         if(ret != "") {
           Serial.println(ret);
           if (!audioRunning() && speech_text=="" && speech_text_buffer == "") {
-            if (ret.indexOf("ニュース") >= 0) {
+            if (ret.indexOf("天気") >= 0 || ret.indexOf("予報") >= 0) {
+              // 天気は ChatGPT を経由せず Open-Meteo から取得して読み上げる（第9.20弾）
+              avatar.setExpression(Expression::Happy);
+              avatar.setSpeechText("天気予報です");
+              if (ret.indexOf("週間") >= 0) {
+                exec_weather_weekly();
+              } else if (ret.indexOf("明後日") >= 0) {
+                exec_weather(2);
+              } else if (ret.indexOf("今日") >= 0) {
+                exec_weather(0);
+              } else {
+                exec_weather(1);  // 「明日」を含む場合と、日付指定がない場合の既定
+              }
+            } else if (ret.indexOf("遅延") >= 0 || ret.indexOf("遅れ") >= 0 ||
+                       ret.indexOf("運行") >= 0 || ret.indexOf("電車") >= 0) {
+              // 運行情報は ChatGPT を経由せず日テレ防災から取得して読み上げる（第9.21弾）
+              avatar.setExpression(Expression::Happy);
+              avatar.setSpeechText("運行情報です");
+              exec_train();
+            } else if (ret.indexOf("ニュース") >= 0) {
               // ニュースは ChatGPT を経由せず RSS を読み上げる（会話履歴には入れない）
               avatar.setExpression(Expression::Happy);
               avatar.setSpeechText("ニュースです");
@@ -3299,6 +4668,283 @@ void SST_ChatGPT() {
         // 第9弾: 会話開始ポーズ（手振り）を解除する。発話が始まる場合は
         // loop 側の発話開始処理がセッション用ポーズを改めて設定する
         g_pose_state = -1;
+}
+
+// LED輝度レベルを delta 段階変える（第9.19弾、設定ダイアログの右下/左下）。
+// 変更は即時に FastLED へ反映され（ledTask が次フレームで表示）、NVS に保存される
+static void change_led_level(int delta) {
+  int nl = (int)g_led_level + delta;
+  if (nl < 0) nl = 0;
+  if (nl > 5) nl = 5;
+  if (nl == (int)g_led_level) return;
+  g_led_level = (uint8_t)nl;
+  applyLedLevel(true);
+  Serial.printf("[LED] brightness level=%u (FastLED=%u)\n",
+                (unsigned)g_led_level, (unsigned)LED_LEVEL_VALUES[g_led_level]);
+  if (!audioRunning()) {
+    sw_tone();
+  } else {
+    M5.Speaker.setChannelVolume(7, 255);
+    M5.Speaker.tone(1320.0f, 70, 7, false);
+  }
+}
+
+// ==== 画面キャプチャ（第9.19弾） ====
+// BtnC ダブルタップで LCD の内容を読み出し、24bit BMP(320x240) で保存する。
+// 保存先は microSD の /shots/ を優先し、カードが使えない場合は SPIFFS の
+// /shots/（名前の接頭辞による仮想フォルダ）へフォールバックする。
+// 暴走防止: 保存先ごとにファイル数の上限を持ち、超えたら古い順に削除する。
+#define SHOTS_DIR "/shots"
+#define SHOTS_MAX_SD 100     // microSD 側の最大保持数
+#define SHOTS_MAX_SPIFFS 3   // SPIFFS 側の最大保持数（1枚約230KBのため少なめ）
+
+// キャプチャ保存先のファイルシステムを選ぶ。SD が使える場合は SD を開いた
+// 状態で返し、呼び出し側は使い終わったら shots_close() で閉じること
+static fs::FS *shots_open(bool &use_sd) {
+  use_sd = false;
+  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+    use_sd = true;
+    if (!SD.exists(SHOTS_DIR)) SD.mkdir(SHOTS_DIR);
+    return &SD;
+  }
+  return &SPIFFS;
+}
+static void shots_close(bool use_sd) {
+  if (use_sd) SD.end();
+}
+
+// ファイル名が shot_NNNN.bmp 形式なら連番を返す（それ以外は -1）
+static int shots_parse_index(const String &name) {
+  int slash = name.lastIndexOf('/');
+  String base = (slash >= 0) ? name.substring(slash + 1) : name;
+  if (!base.startsWith("shot_") || !base.endsWith(".bmp")) return -1;
+  String num = base.substring(5, base.length() - 4);
+  if (num.length() == 0) return -1;
+  for (size_t i = 0; i < num.length(); i++) if (!isDigit(num[i])) return -1;
+  return num.toInt();
+}
+
+// 保存先にあるキャプチャを走査する。count=件数、max_index=最大の連番、
+// oldest_path=最も古い（連番が最小の）ファイルのフルパス
+static void shots_scan(fs::FS &fsys, bool use_sd, int &count, int &max_index, String &oldest_path) {
+  count = 0;
+  max_index = 0;
+  int min_index = -1;
+  oldest_path = "";
+  File dir = use_sd ? fsys.open(SHOTS_DIR) : fsys.open("/");
+  if (!dir) return;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    String fname = f.name();
+    int idx = shots_parse_index(fname);
+    if (idx >= 0) {
+      count++;
+      if (idx > max_index) max_index = idx;
+      if (min_index < 0 || idx < min_index) {
+        min_index = idx;
+        oldest_path = use_sd ? (fname.startsWith("/") ? fname : String(SHOTS_DIR) + "/" + fname)
+                             : fname;
+      }
+    }
+    f.close();
+  }
+  dir.close();
+}
+
+// ファイル名の検証（HTTP 経由の取得/削除用）。shot_NNNN.bmp の形だけを許可し、
+// パス区切りや ".." を含むものは弾く（パストラバーサル対策）
+static bool shots_valid_name(const String &name) {
+  if (name.length() == 0 || name.length() > 32) return false;
+  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || name.indexOf("..") >= 0) return false;
+  return shots_parse_index(name) >= 0;
+}
+
+// 画面キャプチャを実行する。成功したら保存先とファイル名を返す
+static bool capture_screen(String &out_where, String &out_name) {
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  int count, max_index;
+  String oldest;
+  shots_scan(*fsys, use_sd, count, max_index, oldest);
+  const int max_files = use_sd ? SHOTS_MAX_SD : SHOTS_MAX_SPIFFS;
+  // 上限を超えないよう、古いものから削除する（保存後に max_files 以下に収める）
+  while (count >= max_files && oldest.length() > 0) {
+    Serial.printf("[SHOT] remove old: %s\n", oldest.c_str());
+    String prev = oldest;
+    fsys->remove(oldest);
+    shots_scan(*fsys, use_sd, count, max_index, oldest);
+    if (oldest == prev) break;  // 削除できなかったら諦める（無限ループ防止）
+  }
+  char name[24];
+  snprintf(name, sizeof(name), "shot_%04d.bmp", max_index + 1);
+  String path = String(SHOTS_DIR) + "/" + name;
+
+  // フレーム全体を PSRAM へ読み出してから書き込む（描画ロックの保持を読み出し中だけにする）
+  const int W = 320, H = 240;
+  // 空き容量の確認（不足する場合はファイルを作らずに失敗として返す）
+  {
+    const uint32_t need = 54 + (uint32_t)W * 3 * (uint32_t)H;
+    uint64_t total = use_sd ? SD.totalBytes() : SPIFFS.totalBytes();
+    uint64_t used = use_sd ? SD.usedBytes() : SPIFFS.usedBytes();
+    if (total < used || total - used < need) {
+      Serial.println("[SHOT] not enough free space");
+      shots_close(use_sd);
+      return false;
+    }
+  }
+  uint16_t *frame = (uint16_t *)ps_malloc((size_t)W * H * sizeof(uint16_t));
+  if (!frame) { shots_close(use_sd); return false; }
+  {
+    GfxLockGuard gfx_guard;
+    M5.Display.readRect(0, 0, W, H, frame);
+  }
+
+  File out = fsys->open(path, FILE_WRITE);
+  if (!out) {
+    free(frame);
+    shots_close(use_sd);
+    return false;
+  }
+  // BMP ヘッダ（BITMAPFILEHEADER 14 + BITMAPINFOHEADER 40、24bit 非圧縮）
+  const uint32_t row_bytes = (uint32_t)W * 3;  // 960（4の倍数なので行パディング不要）
+  const uint32_t img_bytes = row_bytes * (uint32_t)H;
+  const uint32_t file_bytes = 54 + img_bytes;
+  uint8_t hdr[54] = {0};
+  hdr[0] = 'B'; hdr[1] = 'M';
+  memcpy(hdr + 2, &file_bytes, 4);
+  uint32_t data_off = 54;
+  memcpy(hdr + 10, &data_off, 4);
+  uint32_t dib = 40;
+  memcpy(hdr + 14, &dib, 4);
+  int32_t w32 = W, h32 = H;
+  memcpy(hdr + 18, &w32, 4);
+  memcpy(hdr + 22, &h32, 4);  // 正の値＝ボトムアップ
+  uint16_t planes = 1, bpp = 24;
+  memcpy(hdr + 26, &planes, 2);
+  memcpy(hdr + 28, &bpp, 2);
+  memcpy(hdr + 34, &img_bytes, 4);
+  out.write(hdr, sizeof(hdr));
+  // 画素: ボトムアップ（最下行から）、RGB565 → BGR888 へ変換しながら書く
+  uint8_t *row = (uint8_t *)malloc(row_bytes);
+  bool ok = (row != nullptr);
+  if (ok) {
+    for (int y = H - 1; y >= 0 && ok; y--) {
+      const uint16_t *src = frame + (size_t)y * W;
+      for (int x = 0; x < W; x++) {
+        uint16_t c = src[x];
+        uint8_t r = (uint8_t)(((c >> 11) & 0x1F) << 3) | (uint8_t)(((c >> 11) & 0x1F) >> 2);
+        uint8_t g = (uint8_t)(((c >> 5) & 0x3F) << 2) | (uint8_t)(((c >> 5) & 0x3F) >> 4);
+        uint8_t b = (uint8_t)((c & 0x1F) << 3) | (uint8_t)((c & 0x1F) >> 2);
+        row[x * 3 + 0] = b;
+        row[x * 3 + 1] = g;
+        row[x * 3 + 2] = r;
+      }
+      ok = (out.write(row, row_bytes) == row_bytes);
+    }
+    free(row);
+  }
+  out.close();
+  free(frame);
+  shots_close(use_sd);
+  if (!ok) return false;
+  out_where = use_sd ? "SD" : "SPIFFS";
+  out_name = name;
+  Serial.printf("[SHOT] saved %s to %s (%u bytes)\n", path.c_str(), out_where.c_str(), (unsigned)file_bytes);
+  return true;
+}
+
+// BtnC ダブルタップ時の処理：キャプチャして結果をトーンと吹き出しで知らせる
+static void do_screen_capture() {
+  if (g_display_off) display_wake();
+  note_activity();
+  String where, name;
+  if (capture_screen(where, name)) {
+    sw_tone();
+    delay(120);
+    sw_tone();
+    if (!audioRunning()) {
+      avatar.setSpeechText(("キャプチャ保存 " + where).c_str());
+      g_info_msg_until = millis() + 3000;
+    }
+  } else {
+    // 失敗時は画面表示で知らせる（保存先なし・容量不足など）
+    avatar.setSpeechText("キャプチャ失敗");
+    g_info_msg_until = millis() + 4000;
+    Serial.println("[SHOT] capture failed");
+  }
+}
+
+// ==== 画面キャプチャの HTTP 連携（第9.19弾） ====
+// 一覧: GET /shots → {"storage":"SD"|"SPIFFS","files":[{"name","size"},...]} の JSON
+// 取得: GET /shot?name=shot_0001.bmp → BMP を attachment で返す
+// 削除: GET/POST /shotdel?name=shot_0001.bmp → 削除して JSON で結果を返す
+// いずれも CORS ヘッダ（Access-Control-Allow-Origin: *）を付ける。
+// 保存先の優先順位はキャプチャ時と同じ（microSD があれば SD、無ければ SPIFFS）。
+static void shots_send_error(int code, const char *msg) {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(code, "application/json", String("{\"error\":\"") + msg + "\"}");
+}
+
+static void handle_shots_list() {
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  String json = String("{\"storage\":\"") + (use_sd ? "SD" : "SPIFFS") + "\",\"files\":[";
+  File dir = use_sd ? fsys->open(SHOTS_DIR) : fsys->open("/");
+  if (dir) {
+    bool first = true;
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+      String fname = f.name();
+      if (shots_parse_index(fname) >= 0) {
+        int slash = fname.lastIndexOf('/');
+        String base = (slash >= 0) ? fname.substring(slash + 1) : fname;
+        if (!first) json += ",";
+        first = false;
+        json += "{\"name\":\"" + base + "\",\"size\":" + String((unsigned)f.size()) + "}";
+      }
+      f.close();
+    }
+    dir.close();
+  }
+  json += "]}";
+  shots_close(use_sd);
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+static void handle_shot_download() {
+  if (!server.hasArg("name")) { shots_send_error(400, "name required"); return; }
+  String name = server.arg("name");
+  if (!shots_valid_name(name)) { shots_send_error(400, "invalid name"); return; }
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  String path = String(SHOTS_DIR) + "/" + name;
+  File f = fsys->open(path, FILE_READ);
+  if (!f) {
+    shots_close(use_sd);
+    shots_send_error(404, "not found");
+    return;
+  }
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + name + "\"");
+  server.streamFile(f, "image/bmp");
+  f.close();
+  shots_close(use_sd);
+}
+
+static void handle_shot_delete() {
+  if (!server.hasArg("name")) { shots_send_error(400, "name required"); return; }
+  String name = server.arg("name");
+  if (!shots_valid_name(name)) { shots_send_error(400, "invalid name"); return; }
+  bool use_sd;
+  fs::FS *fsys = shots_open(use_sd);
+  String path = String(SHOTS_DIR) + "/" + name;
+  bool ok = fsys->exists(path) && fsys->remove(path);
+  shots_close(use_sd);
+  if (ok) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", "{\"deleted\":\"" + name + "\"}");
+  } else {
+    shots_send_error(404, "not found");
+  }
 }
 
 // 音量ゲージ文字列（6マス表示。例「音量 ■■■□□□」、レベル0は全□）
@@ -3336,7 +4982,7 @@ static void change_volume(int delta) {
 
 // メニュー選択中を吹き出しに表示する（例「2/5 AIニュース」）
 static void menuShowBalloon() {
-  String s = String(g_menu_sel + 1) + "/5 " + NEWS_CATS[g_menu_sel].label;
+  String s = String(g_menu_sel + 1) + "/6 " + NEWS_CATS[g_menu_sel].label;
   avatar.setSpeechText(s.c_str());
 }
 
@@ -3346,12 +4992,12 @@ static void menuShowBalloon() {
 // （描画タスクのパネル transaction と begin/end が競合しないように）。
 static void drawMenuList() {
   GfxLockGuard gfx_guard;
-  M5.Lcd.fillRect(0, 76, 176, 106, TFT_BLACK);
+  M5.Lcd.fillRect(0, 76, 176, 118, TFT_BLACK);
   M5.Lcd.setFont(&fonts::efontJA_16);
   M5.Lcd.setTextSize(1);
   M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  for (int i = 0; i < 5; i++) {
-    M5.Lcd.setCursor(4, 80 + i * 20);
+  for (int i = 0; i < 6; i++) {
+    M5.Lcd.setCursor(4, 79 + i * 19);
     M5.Lcd.print((i == g_menu_sel) ? "▶ " : "  ");
     M5.Lcd.print(NEWS_CATS[i].label);
   }
@@ -3363,7 +5009,7 @@ static void menu_step(int delta) {
   // 発話中・ニュース表示中はメニューを開かない（吹き出しを奪わない）
   if (audioRunning() || speech_text != "" || speech_text_buffer != "" || g_cap_active) return;
   if (g_menu_open) {
-    g_menu_sel = (g_menu_sel + delta + 5) % 5;
+    g_menu_sel = (g_menu_sel + delta + 6) % 6;
   } else {
     g_menu_open = true;
   }
@@ -3394,6 +5040,8 @@ void loop()
 
   wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続
 
+  ble_digest_tick();  // 第9.23弾: BLE テキスト転送の状態遷移（保存・タイムアウト・自動OFF）
+
   pose_prepare_tick();  // 第9.2弾: ポーズ画像の先行デコード（draw タスク外で実施）
 
   battery_icon_tick();  // 第9.6弾: バッテリー残量の定期取得（描画は顔合成側）
@@ -3415,10 +5063,12 @@ void loop()
   // 定期通知モード：ON で発火時刻を過ぎたらニュース（トピックス＋AI）を読み上げる。
   // 再生中・発話待ちがある場合は割り込まず、約30秒後に再試行する
   if (g_periodic_on && (int32_t)(millis() - g_periodic_next_ms) >= 0) {
-    if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "") {
+    if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "" && !ble_digest_active()) {
       g_menu_open = false;
       avatar.setSpeechText("ニュースです");
-      exec_news();
+      exec_news(true);  // 自動読み上げ: 新しい記事がなければ無言でスキップ（第9.20弾）
+      append_unread_digest();  // 第9.23弾: 未読の転送テキストがあれば続けて読み上げる
+      if (g_news_nothing_new && speech_text == "") avatar.setSpeechText("");
       g_periodic_next_ms = millis() + 300000UL;
     } else {
       g_periodic_next_ms = millis() + 30000UL;
@@ -3431,8 +5081,23 @@ void loop()
   run_schedule();
 
   M5.update();
-  if (M5.BtnA.wasPressed())
+
+  // 画面消灯中は、最初のタッチ/物理ボタンを「復帰」専用として消費する（第9.19弾）。
+  // 復帰に使った入力で会話開始・カテゴリ変更・ボタン機能が誤作動しないようにする
+  bool input_swallow = false;
+  if (g_display_off) {
+    bool wake_input = M5.BtnA.wasPressed() || M5.BtnB.wasPressed() || M5.BtnC.wasPressed();
+    if (!wake_input && M5.Touch.getCount() > 0) {
+      auto td = M5.Touch.getDetail();
+      wake_input = td.wasPressed();
+    }
+    if (wake_input) display_wake();
+    input_swallow = true;
+  }
+
+  if (!input_swallow && M5.BtnA.wasPressed())
   {
+    note_activity();
     if(mode >= 0){
       sw_tone();
       if(mode == 0){
@@ -3452,7 +5117,8 @@ void loop()
   // BtnB短押し（ニュース読み上げ）検出用：押下時刻を記録する
   static uint32_t btnB_press_start = 0;
   static bool btnB_long_fired = false;
-  if (M5.BtnB.wasPressed()) {
+  if (!input_swallow && M5.BtnB.wasPressed()) {
+    note_activity();
     btnB_press_start = millis();
     btnB_long_fired = false;
   }
@@ -3489,48 +5155,86 @@ void loop()
     btnB_press_start = 0;
   }
 
-  // BtnC短押し＝定期通知モードのトグル、長押し(2秒)＝バッテリー残量読み上げ
+  // BtnC短押し＝定期通知モードのトグル、ダブルタップ＝画面キャプチャ、
+  // 長押し(2秒)＝バッテリー残量読み上げ（第9.19弾でダブルタップを追加）。
+  // ダブル判定のため、短押し（定期通知トグル）の発火は最大 BTNC_TAP_WINDOW_MS(300ms) 遅れる
   static uint32_t btnC_press_start = 0;
   static bool btnC_long_fired = false;
-  if (M5.BtnC.wasPressed()) {
+  static uint32_t btnC_tap_deadline = 0;  // 保留中の短押し（定期通知トグル）の確定時刻（0=なし）
+  if (!input_swallow && M5.BtnC.wasPressed()) {
+    note_activity();
     btnC_press_start = millis();
     btnC_long_fired = false;
   }
   if (M5.BtnC.pressedFor(2000) && !btnC_long_fired) {
     btnC_long_fired = true;  // 長押しが発動したら短押し扱いしない
+    btnC_tap_deadline = 0;   // 保留中の単押しも取り消す
     sw_tone();
     report_batt_level();
   }
   if (M5.BtnC.wasReleased()) {
     if (!btnC_long_fired && btnC_press_start != 0 && (millis() - btnC_press_start) < 1500 && mode >= 0) {
-      toggle_periodic();
+      if (btnC_tap_deadline != 0) {
+        // 判定窓内の2回目のタップ＝ダブルタップ → 画面キャプチャ
+        btnC_tap_deadline = 0;
+        do_screen_capture();
+      } else {
+        // 1回目のタップは保留し、窓内に2回目がなければ定期通知トグルとして確定する
+        btnC_tap_deadline = millis() + BTNC_TAP_WINDOW_MS;
+      }
     }
     btnC_press_start = 0;
+  }
+  // 保留中の BtnC 短押しの確定（ダブルタップにならなかった場合）
+  if (btnC_tap_deadline != 0 && (int32_t)(millis() - btnC_tap_deadline) >= 0) {
+    btnC_tap_deadline = 0;
+    if (mode >= 0) toggle_periodic();
   }
 
 #if defined(ARDUINO_M5STACK_Core2) || defined( ARDUINO_M5STACK_CORES3 )
   auto count = M5.Touch.getCount();
-  if (count)
+  if (count && !input_swallow)
   {
     auto t = M5.Touch.getDetail();
     if (t.wasPressed())
     {          
-      // 右上＝音量アップ、右下＝音量ダウン（6段階・レベル0は無音）
+      note_activity();
+      if (g_settings_open)
+      {
+        // 設定ダイアログ表示中はモーダル（第9.19弾）：四隅＝音量/LED輝度調整、
+        // 中央＝閉じる。それ以外のタップと四隅の本来の機能（カテゴリ切替等）は無効
+        g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
+        if (box_vol_up.contain(t.x, t.y)) change_volume(+1);            // 右上＝音量＋
+        else if (box_cat_prev.contain(t.x, t.y)) change_volume(-1);     // 左上＝音量－
+        else if (box_vol_down.contain(t.x, t.y)) change_led_level(+1);  // 右下＝LED輝度＋
+        else if (box_cat_next.contain(t.x, t.y)) change_led_level(-1);  // 左下＝LED輝度－
+        else if (box_stt.contain(t.x, t.y))
+        {
+          g_settings_open = false;
+          sw_tone();
+        }
+      }
+      else
+      {
+      // 右上＝設定ダイアログを開く（第9.19弾）。従来の右上＝音量アップ／
+      // 右下＝音量ダウンのタッチ割り当ては廃止し、右下単独のタップは無効。
+      // 音量・LED輝度の調整はダイアログ表示中の四隅タップで行う
       if (box_vol_up.contain(t.x, t.y))
       {
-        change_volume(+1);
-      }
-      if (box_vol_down.contain(t.x, t.y))
-      {
-        change_volume(-1);
+        g_center_tap_pending = false;
+        g_settings_open = true;
+        g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
+        sw_tone();
       }
       // 左上＝前のカテゴリ、左下＝次のカテゴリ（ニュース選択メニュー）
       if (box_cat_prev.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         menu_step(-1);
       }
       if (box_cat_next.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         menu_step(+1);
       }
       // 中央タップの優先順位：ニュース読み上げ中＝中断（追加D）／
@@ -3539,37 +5243,55 @@ void loop()
       {
         if (g_news_playing || g_pending_news_speech)
         {
+          g_center_tap_pending = false;
           stop_news_speech();
         }
         else if (g_menu_open)
         {
+          g_center_tap_pending = false;
           g_menu_open = false;
           sw_tone();
           if (!audioRunning()) avatar.setSpeechText("");
         }
         else if (!audioRunning())
         {
-          sw_tone();
-          SST_ChatGPT();
+          // 中央ダブルタップで即消灯（第9.19弾）。1回目のタップは保留し、
+          // 判定窓（300ms）内の2回目で消灯する。窓を過ぎたらシングルタップ
+          // として loop 側で会話開始する（発火は最大300ms遅れる）
+          if (g_center_tap_pending &&
+              (int32_t)(millis() - g_center_tap_ms) <= (int32_t)CENTER_TAP_WINDOW_MS)
+          {
+            g_center_tap_pending = false;
+            display_sleep();
+          }
+          else
+          {
+            g_center_tap_pending = true;
+            g_center_tap_ms = millis();
+          }
         }
       }
 #ifdef USE_SERVO
       if (box_servo.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         servo_home = !servo_home;
         sw_tone();
       }
 #endif
       if (box_BtnA.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         sw_tone();
         switch_monologue_mode();
       }
       // 右の帯＝定期通知モードのトグル（物理 BtnC 短押しと同じ挙動）
       if (box_BtnC.contain(t.x, t.y))
       {
+        g_center_tap_pending = false;
         toggle_periodic();
       }
+      }  // 設定ダイアログでない場合の通常タッチ処理ここまで（第9.19弾）
     }
   }
 #endif
@@ -3587,6 +5309,31 @@ void loop()
         g_menu_deadline = millis() + 2500;  // 混んでいる間は確定を少し延ばす
       }
     }
+  }
+
+  // ==== 画面まわり（第9.19弾）: ダイアログ自動クローズ／中央タップ確定／自動消灯 ====
+  if (g_settings_open && (int32_t)(millis() - g_settings_deadline) >= 0) {
+    g_settings_open = false;
+  }
+  // 中央シングルタップの確定（ダブルタップにならなかった場合に会話開始）
+  if (g_center_tap_pending &&
+      (int32_t)(millis() - g_center_tap_ms) > (int32_t)CENTER_TAP_WINDOW_MS) {
+    g_center_tap_pending = false;
+    if (!g_display_off && !g_settings_open && !g_menu_open && !ble_digest_active() &&
+        !g_news_playing && !g_pending_news_speech && !audioRunning() &&
+        speech_text == "" && speech_text_buffer == "") {
+      sw_tone();
+      SST_ChatGPT();
+    }
+  }
+  // 発話・合成中は無操作タイマーを進めない（終わってから5分で消灯する）
+  if (audioRunning() || tts_processing()) note_activity();
+  // 自動消灯: 発話系がすべて止まっている状態で5分間無操作なら消灯する。
+  // ダンス再生中は loop が play_dance_video() の中で回るため、ここへは来ない
+  if (!g_display_off && mode >= 0 && !audioRunning() && !tts_processing() &&
+      speech_text == "" && speech_text_buffer == "" && !g_cap_active &&
+      (int32_t)(millis() - g_last_activity_ms) >= (int32_t)DISPLAY_IDLE_OFF_MS) {
+    display_sleep();
   }
 
   // 音量ゲージの吹き出しを約2秒で消す（発話やニュース表示・メニューが始まっていたら触らない）
@@ -3617,6 +5364,10 @@ void loop()
   }
 
   if(speech_text != ""){
+    // 第9.19弾: 発話セッション開始は「操作」として扱い、消灯中なら点灯する
+    note_activity();
+    g_center_tap_pending = false;
+    if (g_display_off) display_wake();
     avatar.setExpression(Expression::Happy);
     speech_text_buffer = speech_text;
     speech_text = "";

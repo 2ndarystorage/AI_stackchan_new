@@ -41,6 +41,8 @@ class TtsTransportTests(unittest.TestCase):
 #include "TlsGate.h"
 std::recursive_mutex mutex;
 SemaphoreHandle_t g_tls_mutex = &mutex;
+void netActivityBegin() {}
+void netActivityEnd() {}
 std::atomic<int> active{0};
 void request() {
   for(int i=0;i<10000;++i) {
@@ -118,6 +120,12 @@ int main() {
 #include <string>
 #include "TlsGate.h"
 using String=std::string;
+constexpr uint8_t FXK_TTS_BEGIN=6, FXK_TTS_END=7, FXN_TTS=9;
+void fxLog(uint8_t, uint8_t) {}
+void netActivityBegin() {}
+void netActivityEnd() {}
+void netActivityBeginTag(uint8_t) {}
+void netActivityEndTag(uint8_t) {}
 std::recursive_mutex mutex, queueMutex;
 SemaphoreHandle_t g_tls_mutex=&mutex, g_tts_mutex=&queueMutex;
 int xSemaphoreTake(SemaphoreHandle_t m,unsigned) { m->lock(); return 1; }

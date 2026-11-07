@@ -31,7 +31,10 @@ static bool audioRunning();
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <driver/rmt.h>  // rmt_wait_tx_done（RMT アイドル保証、第9.28弾）
 #include "HttpBody.h"  // chunked デコード付き本文読み取り（第9.22弾）
+#include "Forensics.h"   // クラッシュ耐性フォレンジック（第9.28弾）
+#include "NetActivity.h" // 通信アクティブ管理／LED 送信ゲート（第9.28弾）
 #include "rootCACertificate.h"
 #include "rootCAgoogle.h"
 #include "rootCANHK.h"
@@ -531,11 +534,43 @@ struct StorageLedGuard {
   ~StorageLedGuard() { storageLedUnlock(); }
 };
 
+// 第9.28弾: RMT 送信の「完全なアイドル」まで待つ。FastLED.show() は送信を
+// キューするだけで、実際の送信と補充割り込み（フラッシュ上の HAL コード）は
+// show() の復帰後も非同期に続く。そのため第9.27弾の「書き込みと show() の
+// 相互排他」だけでは、書き込み開始時点で送信中だったフレームと重なり得た。
+// IDF の rmt_wait_tx_done は FastLED の RMT4 ドライバ自身が完了判定に使う
+// 正規の経路で、ドライバ未導入のチャネルでは即座にエラーが返るため、
+// 全チャネル（ESP32 は 8）を走査しても安全で速い。
+static void ledRmtDrain() {
+  for (int ch = 0; ch < 8; ch++) {
+    rmt_wait_tx_done((rmt_channel_t)ch, pdMS_TO_TICKS(30));
+  }
+}
+
+// 第9.28弾: フラッシュ書き込み専用のガード。相互排他ロックの取得後に
+// RMT の完全アイドルを待ち、それからフォレンジックへ開始/終了を記録する。
+// ledTask 側も show() の直後に（ロック保持のまま）ledRmtDrain() するため、
+// 「ロックが空いている＝RMT 送信は完全に終わっている」が常に成り立つ。
+struct FlashWriteGuard {
+  uint8_t tag;
+  explicit FlashWriteGuard(uint8_t t) : tag(t) {
+    storageLedLock();
+    ledRmtDrain();
+    fxLog(FXK_WRITE_BEGIN, tag);
+  }
+  ~FlashWriteGuard() {
+    fxLog(FXK_WRITE_END, tag);
+    storageLedUnlock();
+  }
+  FlashWriteGuard(const FlashWriteGuard &) = delete;
+  FlashWriteGuard &operator=(const FlashWriteGuard &) = delete;
+};
+
 uint8_t g_led_level = 4;             // LED輝度レベル（0〜5、既定4。KinakoFace.h から参照）
 static void applyLedLevel(bool save) {
   FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);
   if (save) {
-    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+    FlashWriteGuard guard(FXW_LED_LEVEL);  // NVS 書き込み（第9.28弾: RMT アイドル保証＋記録）
     nvs_handle_t h;
     if (nvs_open("setting", NVS_READWRITE, &h) == ESP_OK) {
       nvs_set_u8(h, "ledlevel", g_led_level);
@@ -581,7 +616,7 @@ static void applyVolLevel(bool save) {
   // Apply user gain only once; keep speech and tone channels at unity.
   setSpeechVolume(M5.Speaker, v);
   if (save) {
-    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+    FlashWriteGuard guard(FXW_VOL_LEVEL);  // NVS 書き込み（第9.28弾: RMT アイドル保証＋記録）
     uint32_t nvs_handle;
     if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
       nvs_set_u8(nvs_handle, "vol", g_vol_level);
@@ -1209,7 +1244,7 @@ void handle_apikey_set() {
 
   uint32_t nvs_handle;
   if (ESP_OK == nvs_open("apikey", NVS_READWRITE, &nvs_handle)) {
-    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+    FlashWriteGuard guard(FXW_APIKEY);
     nvs_set_str(nvs_handle, "openai", openai.c_str());
     nvs_set_str(nvs_handle, "voicevox", voicevox.c_str());
     nvs_set_str(nvs_handle, "sttapikey", sttapikey.c_str());
@@ -1224,14 +1259,14 @@ void handle_role() {
 }
 
 bool save_json(){
+  // 第9.28弾: マウント（失敗時のフォーマット含む）から書き込み全体を
+  // フラッシュ書き込みガードで囲む
+  FlashWriteGuard guard(FXW_DATA_JSON);
   // SPIFFSをマウントする
   if(!SPIFFS.begin(true)){
     Serial.println("An Error has occurred while mounting SPIFFS");
     return false;
   }
-
-  // 第9.27弾: フラッシュ書き込みと LED(RMT) の相互排他
-  StorageLedGuard guard;
   // JSONファイルを作成または開く
   File file = SPIFFS.open("/data.json", "w");
   if(!file){
@@ -1338,7 +1373,7 @@ void handle_setting() {
   uint8_t led_onoff = 0;
   uint32_t nvs_handle;
   if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
-    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+    FlashWriteGuard guard(FXW_SETTING_WEB);
     if(volume > 255) volume = 255;
     nvs_set_u32(nvs_handle, "volume", volume);
     if(led != "") {
@@ -1523,14 +1558,69 @@ static bool g_news_seen_loaded = false;
 static bool g_seen_on_sd = false;   // 第9.27弾: 既読ストアの保存先（true=SD / false=SPIFFS）
 static bool g_news_seen_dirty = false;  // メモリ上の記録が保存先とずれていれば true（宣言は newsSeenSave 節から前倒し）
 
-// digest_open / memfs_open と同じ作法（SD 優先・なければ SPIFFS）
+// ==== SD カードの健全性管理（第9.28弾） ====
+// v9.27 実機で、劣化した SD カードがニュース取得中に Select Failed を
+// 繰り返し、その近傍でパニックが再発した。SD.begin はカード異常時に
+// ライブラリ内部でリトライを繰り返して長時間ブロックするため、
+// 「一度使えたカードが失敗したら、その起動中は SD を二度と触らない」
+// ことを全体で保証する。カード未挿入（最初から使えない）場合は従来
+// どおり SPIFFS 側で動く（これは異常ではなく通常構成）。
+static bool g_sd_present_once = false;  // この起動で SD.begin が一度でも成功した
+static bool g_sd_dead = false;          // 一度使えた SD が失敗した（セッション中無効）
+
+static bool sdBeginCounted() {
+  if (g_sd_dead) return false;
+  bool ok = SD.begin(GPIO_NUM_4, SPI, 25000000);
+  if (ok) {
+    if (!g_sd_present_once) {
+      g_sd_present_once = true;
+      fxLog(FXK_SD, FXSD_MOUNT_OK);
+    }
+  } else if (g_sd_present_once) {
+    g_sd_dead = true;
+    fxLog(FXK_SD, FXSD_DEAD);
+    Serial.println("[SD] card stopped responding; SD disabled for this session");
+  }
+  return ok;
+}
+
+// 既読ストアの保存先（第9.28弾で状態機械化）
+// SEEN_UNDECIDED: 初回ロード時に一度だけ決める / SEEN_SD / SEEN_SPIFFS /
+// SEEN_MEMORY: SD を失った場合のメモリのみ動作（書き込みを増やす
+// SPIFFS への途中フォールバックはしない。保存自体を見送る）
+enum SeenBackend : uint8_t { SEEN_UNDECIDED = 0, SEEN_SD, SEEN_SPIFFS, SEEN_MEMORY };
+static SeenBackend g_seen_backend = SEEN_UNDECIDED;
+
 static fs::FS *seenfs_open(bool &use_sd) {
   use_sd = false;
-  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+  if (g_seen_backend == SEEN_MEMORY) return nullptr;
+  if (g_seen_backend == SEEN_SPIFFS) {
+    if (!SPIFFS.begin(false)) return nullptr;
+    return &SPIFFS;
+  }
+  if (g_seen_backend == SEEN_SD) {
+    if (sdBeginCounted()) { use_sd = true; return &SD; }
+    // SD で確定していたのにマウントできなくなった → メモリのみへ移行
+    g_seen_backend = SEEN_MEMORY;
+    fxLog(FXK_SD, FXSD_SEEN_MEMORY_ONLY);
+    Serial.println("[News] seen store: SD lost; memory-only for this session (saves skipped)");
+    return nullptr;
+  }
+  // SEEN_UNDECIDED: 初回だけ保存先を決める
+  if (sdBeginCounted()) {
+    g_seen_backend = SEEN_SD;
     use_sd = true;
     return &SD;
   }
+  if (g_sd_dead) {  // 起動時に使えていたカードが初回選択までに死んでいた
+    g_seen_backend = SEEN_MEMORY;
+    fxLog(FXK_SD, FXSD_SEEN_MEMORY_ONLY);
+    Serial.println("[News] seen store: SD unavailable; memory-only for this session");
+    return nullptr;
+  }
   if (!SPIFFS.begin(false)) return nullptr;
+  g_seen_backend = SEEN_SPIFFS;
+  fxLog(FXK_SD, FXSD_SEEN_SPIFFS);
   return &SPIFFS;
 }
 static void seenfs_close(bool use_sd) { if (use_sd) SD.end(); }
@@ -1541,7 +1631,12 @@ static void newsSeenLoad() {
   g_news_seen_count = 0;
   bool use_sd;
   fs::FS *fsys = seenfs_open(use_sd);
-  if (!fsys) { Serial.println("[News] seen store: fs open failed"); return; }
+  if (!fsys) {
+    Serial.println(g_seen_backend == SEEN_MEMORY
+                       ? "[News] seen store: memory-only (SD unavailable); starting empty"
+                       : "[News] seen store: fs open failed");
+    return;
+  }
   g_seen_on_sd = use_sd;
   File f;
   bool legacy_spiffs = false;
@@ -1587,6 +1682,12 @@ static void newsSeenLoad() {
 // 保持期間（5日）を過ぎた記録を掃除してから全件を書き戻す
 static void newsSeenSave() {
   crumb("store-seen");
+  // 第9.28弾: SD を失ってメモリのみ動作の間は保存自体を見送る
+  if (g_seen_backend == SEEN_MEMORY) {
+    fxLog(FXK_SD, FXSD_SEEN_SAVE_SKIPPED);
+    Serial.println("[News] seen store save skipped (memory-only)");
+    return;
+  }
   time_t now = time(nullptr);
   bool nowOk = newsNowValid(now);
   int w = 0;
@@ -1599,12 +1700,27 @@ static void newsSeenSave() {
   g_news_seen_count = w;
   bool use_sd;
   fs::FS *fsys = seenfs_open(use_sd);
-  if (!fsys) { Serial.println("[News] seen store save failed (fs open)"); return; }
+  if (!fsys) {
+    if (g_seen_backend != SEEN_MEMORY)
+      Serial.println("[News] seen store save failed (fs open)");
+    return;
+  }
   g_seen_on_sd = use_sd;
   {
-    StorageLedGuard guard;  // 第9.27弾: フラッシュ書き込み（SPIFFS時）と LED(RMT) の相互排他
+    FlashWriteGuard guard(FXW_SEEN);  // 書き込み（SPIFFS時）と LED(RMT) の相互排他＋RMT アイドル保証
     File f = fsys->open(NEWS_SEEN_PATH, FILE_WRITE);
-    if (!f) { seenfs_close(use_sd); Serial.println("[News] seen store save failed"); return; }
+    if (!f) {
+      seenfs_close(use_sd);
+      Serial.println("[News] seen store save failed");
+      if (use_sd) {
+        // 第9.28弾: SD への書き込み失敗も「カードを失った」として扱い、
+        // 以後はメモリのみで動く（SPIFFS へ寄せて書き込みを増やさない）
+        g_seen_backend = SEEN_MEMORY;
+        fxLog(FXK_SD, FXSD_WRITE_FAIL);
+        Serial.println("[News] seen store: SD write failed; memory-only for this session");
+      }
+      return;
+    }
     for (int i = 0; i < g_news_seen_count; i++) {
       f.printf("%08lx %lu\n", (unsigned long)g_news_seen[i].hash, (unsigned long)g_news_seen[i].epoch);
     }
@@ -1669,6 +1785,8 @@ static bool newsAcceptArticle(const String& title, time_t pub) {
 // 成否コードは g_nhk_http_code に残す（接続失敗時は負値）。
 static String fetchNhkRssBody(int nhkCat) {
   crumb("news-nhk");
+  newsSeenLoad();  // 第9.28弾: 既読ロードは走査中ではなく取得開始前に済ませる
+  NetActivityScope net_scope(FXN_NHK);
   String payload = "";
   g_nhk_http_code = 0;
   Serial.printf("[NHK RSS] start heap=%u largest=%u\n",
@@ -1797,6 +1915,8 @@ static String stripMediaSuffix(String t) {
 // フィード全文は保持せず、抽出済み見出しだけを outTitles に残す（走査上限 120KB で打ち切り）。
 static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
   crumb("news-google");
+  newsSeenLoad();  // 第9.28弾: 既読ロードは走査中ではなく取得開始前に済ませる
+  NetActivityScope net_scope(FXN_GOOGLE);
   outCount = 0;
   httpCodeOut = 0;
   Serial.printf("[Google RSS] start heap=%u largest=%u\n",
@@ -2168,6 +2288,7 @@ static const char* WEATHER_API_URL =
 // 混ざり、deserializeJson が失敗していた（v9.21 実機で確認）。
 // Content-Length 形式の応答でも同じ経路で読める。
 static bool fetchWeatherJsonOnce(String& out) {
+  NetActivityScope net_scope(FXN_WEATHER);
   out = "";
   g_weather_http_code = 0;
   Serial.printf("[Weather] start heap=%u largest=%u\n",
@@ -2401,6 +2522,7 @@ static int trainEvalStatus(const String& win) {
 
 // 運行情報ページを1回取得し、対象路線の状態を lines[] に埋める
 static bool fetchTrainStatusOnce(TrainLineState* lines, int nLines) {
+  NetActivityScope net_scope(FXN_TRAIN);
   g_train_http_code = 0;
   Serial.printf("[Train] start heap=%u largest=%u\n",
                 (unsigned)ESP.getFreeHeap(),
@@ -2650,10 +2772,11 @@ static bool g_mem_on_sd = false;
 // digest_open と同じ作法（SD 優先・なければ SPIFFS）
 static fs::FS *memfs_open(bool &use_sd) {
 use_sd = false;
-if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+if (sdBeginCounted()) {
 use_sd = true;
 return &SD;
 }
+if (g_sd_dead) Serial.println("[MEM] SD unavailable (card dead); using SPIFFS");
 if (!SPIFFS.begin(false)) return nullptr;
 return &SPIFFS;
 }
@@ -2718,7 +2841,7 @@ Serial.println("[MEM] save: filesystem open failed");
 return;
 }
 g_mem_on_sd = use_sd;
-StorageLedGuard guard;  // 第9.27弾: フラッシュ書き込み（SPIFFS時）と LED(RMT) の相互排他
+FlashWriteGuard guard(FXW_MEMORY);  // 書き込み（SPIFFS時）と LED(RMT) の相互排他＋RMT アイドル保証
 File f = fsys->open(MEM_FACTS_PATH, "w");
 if (f) {
 for (auto& s: g_mem_facts) {
@@ -2805,6 +2928,7 @@ g_mem_ext_pending = true;
 
 static void memory_extract_run() {
 crumb("mem-extract");
+NetActivityScope net_scope(FXN_EXTRACT);
 memory_load();
 // ニュース・天気と同じく、TLS の前に TTS 接続ペアの解放を依頼する
 g_tts_release_req = true;
@@ -3163,6 +3287,7 @@ if (e) Serial.printf("[FC] tools json parse failed: %s\n", e.c_str());
 // 使い方は chatGpt() と同じ（戻り値は読み上げ文）。
 String chatGptWithTools(const String& json_string) {
 crumb("chat-tools");
+NetActivityScope net_scope(FXN_CHAT);
 DynamicJsonDocument req(16384);
 if (deserializeJson(req, json_string)) {
 // リクエストを組み直せない場合は従来経路にフォールバック
@@ -3369,11 +3494,12 @@ server.send(200, "application/json", out);
 // ---- 転送テキストの保存（microSD 優先、なければ SPIFFS） ----
 static fs::FS *digest_open(bool &use_sd) {
   use_sd = false;
-  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+  if (sdBeginCounted()) {
     use_sd = true;
     if (!SD.exists(DIGEST_DIR)) SD.mkdir(DIGEST_DIR);
     return &SD;
   }
+  if (g_sd_dead) Serial.println("[Digest] SD unavailable (card dead); using SPIFFS");
   if (!SPIFFS.begin(false)) return nullptr;
   return &SPIFFS;
 }
@@ -3422,8 +3548,8 @@ static bool digest_store(const uint8_t *data, size_t len, String &out_name) {
   bool use_sd;
   fs::FS *fsys = digest_open(use_sd);
   if (!fsys) return false;
-  // 第9.27弾: SPIFFS 書き込み/削除と LED(RMT) の相互排他（SD 時も短時間で無害）
-  StorageLedGuard guard;
+  // 第9.28弾: 書き込み/削除をフラッシュ書き込みガードで囲む（SD 時も短時間で無害）
+  FlashWriteGuard guard(FXW_DIGEST_STORE);
   DigestEntry entries[24];
   int max_index = 0;
   int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
@@ -3499,7 +3625,7 @@ static int g_digest_read_pending = -1;
 
 static void digest_mark_read(int idx) {
   crumb("store-nvs");
-  StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+  FlashWriteGuard guard(FXW_DIGEST_MARK);
   uint32_t h;
   if (ESP_OK == nvs_open("setting", NVS_READWRITE, &h)) {
     nvs_set_i32(h, "dgread", idx);
@@ -3720,6 +3846,7 @@ static void ble_mode_screen(const char *status) {
 }
 
 static void ble_digest_stop(const char *reason) {
+  netActivityEndTag(FXN_BLE);  // 第9.28弾: フォレンジック（BLE 受信窓の終了）
   Serial.printf("[MODE] BLE -> normal reboot (%s)\n", reason);
   // The one-shot boot token was cleared before BLE initialization. Reboot also
   // handles an unresponsive host safely, without freeing live callback buffers.
@@ -3761,6 +3888,7 @@ static void ble_boot_task(void *) {
   Serial.printf("[BLE] advertising as %s (BLE-only boot) heap=%u largest=%u\n",
                 BLE_DG_DEVICE_NAME, (unsigned)ESP.getFreeHeap(),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  netActivityBeginTag(FXN_BLE);  // 第9.28弾: フォレンジック（BLE 受信窓の開始）
   g_ble_boot_result.store(1);
   vTaskDelete(nullptr);
 }
@@ -3884,7 +4012,7 @@ void handle_voice() {
       TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
       uint32_t nvs_handle;
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
-        StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+        FlashWriteGuard guard(FXW_VOICE_SPEAKER);
         nvs_set_u8(nvs_handle, "speaker", (uint8_t)n);
         nvs_close(nvs_handle);
       }
@@ -3900,7 +4028,7 @@ void handle_voice() {
       TTS_SPEED_RATE = sx / 100.0f;
       uint32_t nvs_handle;
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
-        StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+        FlashWriteGuard guard(FXW_VOICE_SPEED);
         nvs_set_u8(nvs_handle, "speed_x100", (uint8_t)sx);
         nvs_close(nvs_handle);
       }
@@ -3964,7 +4092,7 @@ void handle_model() {
       CHAT_MODEL = set;
       uint32_t nvs_handle;
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
-        StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+        FlashWriteGuard guard(FXW_MODEL);
         nvs_set_str(nvs_handle, "model", set.c_str());
         nvs_close(nvs_handle);
       }
@@ -4000,7 +4128,7 @@ static void schedule_apply_arg(const char* argName, bool& flag, const char* nvsK
     flag = (v == "on");
     uint32_t nvs_handle;
     if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
-      StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
+      FlashWriteGuard guard(FXW_SCHEDULE);
       nvs_set_u8(nvs_handle, nvsKey, flag ? 1 : 0);
       nvs_close(nvs_handle);
     }
@@ -4210,10 +4338,12 @@ void ttsSynthTask(void *args)
       delay(30);
       continue;
     }
+    fxLog(FXK_TTS_BEGIN, 0);  // 第9.28弾: フォレンジック（合成セッション開始）
     uint8_t *dlData = nullptr;
     size_t dlLen = 0;
     {
       TlsGateGuard tls_guard;
+      NetActivityScope net_scope(FXN_TTS);
       String url;
       if (WiFi.status() == WL_CONNECTED) url = voicevox_synth_url(chunk.text.c_str(), chunk.parms.c_str());
       else Serial.println("[TTS] synth skipped: WiFi disconnected");
@@ -4223,6 +4353,7 @@ void ttsSynthTask(void *args)
       }
       voicevox_release_connection();
     }
+    fxLog(FXK_TTS_END, 0);  // 第9.28弾: フォレンジック（合成セッション終了）
     xSemaphoreTake(g_tts_mutex, portMAX_DELAY);
     // 中断などで世代が進んでいたら、この合成結果は破棄する（再生させない）
     if (gen == g_tts_gen && dlData != nullptr && dlLen > 0) {
@@ -4624,14 +4755,30 @@ void ledTask(void *args)
     // 変化でしか show() しなかったため、静止フレーム（聞き取り中の青一色・音量
     // ゲージ等）では FastLED.setBrightness() の変更が LED に届かなかった。
     uint8_t cur_brightness = FastLED.getBrightness();
-    if (!prev_valid || cur_brightness != shown_brightness ||
-        memcmp(prev_frame, frame, sizeof(frame)) != 0) {
+    // 第9.28弾（対策A）: 通信中は LED 送信を全面停止する。キャッシュ
+    // 無効化が起き得る通信フェーズの最中に RMT 補充割り込み（フラッシュ
+    // 上のコード）を実行させないため。LED は直前の表示を保持し、通信
+    // 終了後はフレーム比較（prev_frame を更新しない）で自動再開する。
+    bool net_gated = netActivityActive();
+    {
+      static bool fx_gate_prev = false;
+      if (net_gated != fx_gate_prev) {
+        fx_gate_prev = net_gated;
+        fxLog(net_gated ? FXK_LED_GATE_CLOSE : FXK_LED_GATE_OPEN, 0);
+      }
+    }
+    if (!net_gated && (!prev_valid || cur_brightness != shown_brightness ||
+        memcmp(prev_frame, frame, sizeof(frame)) != 0)) {
       // 第9.27弾: show()（RMT送信）をフラッシュ書き込みと相互排他にする。
       // 書き込み側が StorageLedGuard を保持している間はここで待ち、
       // 書き込みと RMT 補充割り込みが重ならないことを保証する
       StorageLedGuard led_guard;
       for (int i = 0; i < SIDE_LED_COUNT; i++) g_side_leds[i] = frame[i];
       FastLED.show();
+      // 第9.28弾: ロックを離す前に RMT 送信の完了まで待つ。これにより
+      // 「ロックが空いている＝RMT は完全にアイドル」が常に成り立ち、
+      // 書き込み開始時点で送信中だったフレームとの重なりも消える
+      ledRmtDrain();
       memcpy(prev_frame, frame, sizeof(frame));
       prev_valid = true;
       shown_brightness = cur_brightness;
@@ -4787,6 +4934,7 @@ String SpeechToText(bool isGoogle){
     Serial.println("音声認識開始");
     avatar.setSpeechText("わかりました");  
     CloudSpeechClient* cloudSpeechClient = new CloudSpeechClient(root_ca_google, STT_API_KEY.c_str());
+    NetActivityScope stt_scope(FXN_STT);  // 第9.28弾: STT は TlsGate を通らないため個別に囲む
     ret = cloudSpeechClient->Transcribe(audio);
     delete cloudSpeechClient;
     delete audio;
@@ -4797,6 +4945,7 @@ String SpeechToText(bool isGoogle){
     Serial.println("音声認識開始");
     avatar.setSpeechText("わかりました");  
     Whisper* cloudSpeechClient = new Whisper(root_ca_openai, OPENAI_API_KEY.c_str());
+    NetActivityScope stt_scope(FXN_STT);  // 第9.28弾: STT は TlsGate を通らないため個別に囲む
     ret = cloudSpeechClient->Transcribe(audio);
     delete cloudSpeechClient;
     delete audio;
@@ -4825,6 +4974,8 @@ void setup()
     M5.begin(ble_cfg);
     Serial.println("[BOOT] Firmware " STACKCHAN_FIRMWARE_LABEL);
     Serial.println("[MODE] BLE-only: Wi-Fi/TLS/audio/Avatar/scheduler not started");
+    fxInit(esp_reset_reason());  // 第9.28弾: フォレンジック（BLE モードでも記録する）
+    fxDump();
     ble_mode_setup();
     return;
   }
@@ -4866,6 +5017,11 @@ void setup()
   voicevox_log_ca();
   drawFirmwareVersionBadge(M5.Display);
   M5.Display.setCursor(0, 22);
+
+  // 第9.28弾: フォレンジック初期化と前回セッション分のダンプ（リセット
+  // 要因の表示に先立って、前回クラッシュ直前のイベント列を残す）
+  fxInit(esp_reset_reason());
+  fxDump();
 
   // 起動時診断（第8弾）: リセット要因と空きヒープを Serial と画面に出す。
   // 異常リセット（パニック/ウォッチドッグ/電圧低下）の切り分けを
@@ -5014,7 +5170,7 @@ void setup()
   STT_API_KEY = String(STT_APIKEY);
 #else
   /// settings
-  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+  if (sdBeginCounted()) {
     /// wifi
     auto fs = SD.open("/wifi.txt", FILE_READ);
     if(fs) {
@@ -5184,6 +5340,11 @@ void setup()
   server.on("/role_set", HTTP_POST, handle_role_set);
   server.on("/role_get", handle_role_get);
   server.onNotFound(handleNotFound);
+
+  // 第9.28弾: 既読ストアの初回ロードは起動時に済ませる（従来は初回の
+  // ニュース取得の走査中、最初の新着記事で遅延ロードされ、SD の
+  // マウント処理が走査の最中に走っていた）
+  newsSeenLoad();
 
   init_chat_doc(json_ChatString.c_str());
   // SPIFFSをマウントする
@@ -5701,7 +5862,7 @@ static void change_led_level(int delta) {
 // 状態で返し、呼び出し側は使い終わったら shots_close() で閉じること
 static fs::FS *shots_open(bool &use_sd) {
   use_sd = false;
-  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+  if (sdBeginCounted()) {
     use_sd = true;
     if (!SD.exists(SHOTS_DIR)) SD.mkdir(SHOTS_DIR);
     return &SD;
@@ -5761,8 +5922,8 @@ static bool shots_valid_name(const String &name) {
 static bool capture_screen(String &out_where, String &out_name) {
   bool use_sd;
   fs::FS *fsys = shots_open(use_sd);
-  // 第9.27弾: SPIFFS への削除/書き込みと LED(RMT) の相互排他（SD 時も無害）
-  StorageLedGuard guard;
+  // 第9.28弾: 削除/書き込みをフラッシュ書き込みガードで囲む（SD 時も無害）
+  FlashWriteGuard guard(FXW_SHOT_SAVE);
   int count, max_index;
   String oldest;
   shots_scan(*fsys, use_sd, count, max_index, oldest);
@@ -5940,7 +6101,7 @@ static void handle_shot_delete() {
   String path = String(SHOTS_DIR) + "/" + name;
   bool ok;
   {
-    StorageLedGuard guard;  // 第9.27弾: SPIFFS 削除と LED(RMT) の相互排他
+    FlashWriteGuard guard(FXW_SHOT_DELETE);  // 削除と LED(RMT) の相互排他＋RMT アイドル保証
     ok = fsys->exists(path) && fsys->remove(path);
   }
   shots_close(use_sd);
@@ -6044,10 +6205,11 @@ void loop()
     if (hb_now - hb_last >= 15000) {
       hb_last = hb_now;
       const char *crumb_snapshot = (const char *)g_crumb;
-      Serial.printf("[HB] t=%lu heap=%u largest=%u crumb=%s mode=%d seen_dirty=%d\n",
+      Serial.printf("[HB] t=%lu heap=%u largest=%u crumb=%s mode=%d seen_dirty=%d net=%d\n",
                     (unsigned long)hb_now, (unsigned)ESP.getFreeHeap(),
                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                    crumb_snapshot, mode, g_news_seen_dirty ? 1 : 0);
+                    crumb_snapshot, mode, g_news_seen_dirty ? 1 : 0,
+                    netActivityCount());
     }
   }
   // 第9.27弾: ストレージ書き込みの制御点。自動系のフラッシュ書き込み
@@ -6056,7 +6218,7 @@ void loop()
   // 各保存関数の StorageLedGuard で LED(RMT) と相互排他にしてある。
   // 第9.26弾までは取得系の出口でも書き戻していたが、発話開始直前で
   // LED アニメーション（RMT送信中）と重なり得たため集約した。
-  if (!tts_processing() && !audioRunning() &&
+  if (!tts_processing() && !audioRunning() && !netActivityActive() &&
       speech_text == "" && speech_text_buffer == "" && !ble_digest_active()) {
     if (g_news_seen_dirty) newsSeenFlush();
     if (g_digest_read_pending >= 0) {

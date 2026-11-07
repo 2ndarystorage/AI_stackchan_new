@@ -153,6 +153,8 @@ int main() {
 #include <cassert>
 #include <cstdint>
 constexpr int ESP_OK=0,MALLOC_CAP_INTERNAL=1,DG_WAIT=1;
+constexpr uint8_t FXN_BLE=10;
+void netActivityBeginTag(uint8_t) {}
 constexpr uint32_t BLE_DG_WINDOW_MS=180000;
 const char *BLE_DG_DEVICE_NAME="test",*BLE_DG_SERVICE_UUID="svc",*BLE_DG_CTRL_UUID="ctrl",
  *BLE_DG_DATA_UUID="data",*BLE_DG_STATUS_UUID="status";

@@ -31,6 +31,7 @@ static bool audioRunning();
 
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <WiFiMulti.h>  // Wi-Fi 複数 AP 対応（第9.29弾）
 #include <driver/rmt.h>  // rmt_wait_tx_done（RMT アイドル保証、第9.28弾）
 #include "HttpBody.h"  // chunked デコード付き本文読み取り（第9.22弾）
 #include "Forensics.h"   // クラッシュ耐性フォレンジック（第9.28弾）
@@ -898,6 +899,48 @@ static void tts_enqueue(const String& text, const String& parms) {
   Serial.printf("[TTS] enqueue %u chunk(s)\n", (unsigned)chunks.size());
 }
 
+// ==== Wi-Fi 複数 AP 対応（第9.29弾） ====
+// /wifi.txt は「SSID 行／パスワード行」の組を最大4組まで書ける（区切りや
+// 見出しは無し。空行は無視し、末尾にパスワード行が無い不完全な組は無視）。
+// 読めた組は全て WiFiMulti へ登録し、接続時は電波の最も強い既知 AP を選ぶ。
+// 1組だけのファイルでも従来どおり動く。wifi.txt が無い／組が0件の場合は
+// 従来どおり WiFi.begin()（引数なし＝保存済み資格情報）へフォールバックする。
+// パスワードはログに絶対に出さない（SSID と件数のみ出す）。
+static const int WIFI_AP_MAX = 4;
+static WiFiMulti g_wifi_multi;
+static bool g_wifi_multi_mode = false;   // wifi.txt から1組以上を登録できた
+static int g_wifi_multi_count = 0;       // 登録できた組数
+static String g_wifi_current_ssid = "";  // 最後に観測した接続中 SSID（切替検出用）
+
+// wifi.txt の内容全体（buf[sz] まで NUL 終端済み）から SSID/パスワードの
+// 組を取り出して WiFiMulti へ登録する。戻り値は登録できた組数。
+static int wifi_parse_and_register(char *buf, size_t sz) {
+  int registered = 0;
+  const char *pending = nullptr;  // パスワード行待ちの SSID
+  size_t pos = 0;
+  while (pos < sz && registered < WIFI_AP_MAX) {
+    size_t start = pos;
+    while (pos < sz && buf[pos] != '\n' && buf[pos] != '\r') pos++;
+    char saved = (pos < sz) ? buf[pos] : 0;
+    buf[pos] = 0;  // pos==sz の場合も呼び出し側が sz+1 バイト確保済み
+    if (buf[start] != 0) {  // 空行は無視
+      if (!pending) {
+        pending = &buf[start];
+      } else {
+        if (g_wifi_multi.addAP(pending, &buf[start])) {
+          registered++;
+        } else {
+          Serial.printf("[WiFi] wifi.txt: skipped an invalid AP entry (ssid=%s)\n", pending);
+        }
+        pending = nullptr;
+      }
+    }
+    if (!saved) break;
+    pos++;
+  }
+  return registered;
+}
+
 // ==== Wi-Fi 切断監視と自動再接続（第8弾） ====
 // 起動後に AP が落ちたり電波が途切れても復帰できるよう、loop から定期的に
 // 接続状態を確認し、切断が続く場合はバックオフ付きで再接続を試みる。
@@ -912,13 +955,36 @@ static void wifi_watchdog() {
   g_wifi_last_check = now;
   if (WiFi.status() == WL_CONNECTED) {
     if (g_wifi_next_retry != 0) Serial.println("[WiFi] reconnected");
+    if (g_wifi_multi_mode) {
+      // 第9.29弾: 接続中 SSID を観測し、AP 切替があればログ＋フォレンジックへ残す
+      String ssid = WiFi.SSID();
+      if (ssid.length() > 0 && ssid != g_wifi_current_ssid) {
+        if (g_wifi_current_ssid.length() > 0) {
+          Serial.printf("[WiFi] AP switched: %s -> %s\n",
+                        g_wifi_current_ssid.c_str(), ssid.c_str());
+          fxLog(FXK_WIFI, FXWIFI_SWITCH);
+        } else {
+          Serial.printf("[WiFi] connected: ssid=%s rssi=%d\n",
+                        ssid.c_str(), (int)WiFi.RSSI());
+          fxLog(FXK_WIFI, FXWIFI_CONNECT);
+        }
+        g_wifi_current_ssid = ssid;
+      }
+    }
     g_wifi_next_retry = 0;
     g_wifi_backoff_ms = 10000;
     return;
   }
   if (g_wifi_next_retry != 0 && (int32_t)(now - g_wifi_next_retry) < 0) return;
-  Serial.println("[WiFi] disconnected; trying reconnect...");
-  WiFi.reconnect();
+  if (g_wifi_multi_mode) {
+    // 第9.29弾: 複数 AP モードでは再スキャンして最強の既知 AP へつなぎ直す
+    // （別 AP への切替を含む）。接続の成否は次回チェック時の接続中分岐で記録する。
+    Serial.println("[WiFi] disconnected; rescanning (multi-AP)...");
+    g_wifi_multi.run(5000);
+  } else {
+    Serial.println("[WiFi] disconnected; trying reconnect...");
+    WiFi.reconnect();
+  }
   g_wifi_next_retry = now + g_wifi_backoff_ms;
   if (g_wifi_backoff_ms < 60000) g_wifi_backoff_ms *= 2;
 }
@@ -5180,14 +5246,19 @@ void setup()
       buf[sz] = 0;
       fs.close();
 
-      int y = 0;
-      for(int x = 0; x < sz; x++) {
-        if(buf[x] == 0x0a || buf[x] == 0x0d)
-          buf[x] = 0;
-        else if (!y && x > 0 && !buf[x - 1] && buf[x])
-          y = x;
+      // 第9.29弾: 「SSID 行／パスワード行」の組を最大4組まで WiFiMulti へ登録する。
+      // 初回接続は SD を閉じた後段（#endif の直後）で WiFiMulti.run() が行う。
+      g_wifi_multi_count = wifi_parse_and_register(buf, sz);
+      if (g_wifi_multi_count > 0) {
+        g_wifi_multi_mode = true;
+        Serial.printf("[WiFi] wifi.txt: %d AP(s) registered (multi-AP mode)\n",
+                      g_wifi_multi_count);
+        fxLog(FXK_WIFI, FXWIFI_MULTI);
+      } else {
+        // 組が1つも無い（空ファイル／不完全な組のみ）場合は従来の保存済み資格情報へ
+        Serial.println("[WiFi] wifi.txt: no complete SSID/password pair; using stored credentials");
+        WiFi.begin();
       }
-      WiFi.begin(buf, &buf[y]);
     } else {
        WiFi.begin();
     }
@@ -5261,6 +5332,22 @@ void setup()
   }
   
 #endif
+
+  // 第9.29弾: 複数 AP モードの初回接続。WiFiMulti がスキャンして電波の最も
+  // 強い既知 AP へ接続する。ここで接続できなくても、続く Wifi_setup() の
+  // 接続待ち＋SmartConfig フォールバックが従来どおり働く。
+  if (g_wifi_multi_mode) {
+    uint8_t st = g_wifi_multi.run(5000);
+    if (st == WL_CONNECTED) {
+      g_wifi_current_ssid = WiFi.SSID();
+      Serial.printf("[WiFi] connected: ssid=%s rssi=%d\n",
+                    WiFi.SSID().c_str(), (int)WiFi.RSSI());
+      fxLog(FXK_WIFI, FXWIFI_CONNECT);
+    } else {
+      Serial.printf("[WiFi] multi-AP initial connect pending (status=%d); continuing\n",
+                    (int)st);
+    }
+  }
 
   M5.Lcd.print("Connecting");
   Wifi_setup();

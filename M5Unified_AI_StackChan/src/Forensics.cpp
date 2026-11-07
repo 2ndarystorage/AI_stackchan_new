@@ -49,6 +49,7 @@ const char *kindName(uint8_t k) {
     case FXK_LED_GATE_CLOSE: return "LED-GATE-CLOSE";
     case FXK_LED_GATE_OPEN: return "LED-GATE-OPEN";
     case FXK_SD: return "SD";
+    case FXK_WIFI: return "WIFI";
     default: return "?";
   }
 }
@@ -100,6 +101,15 @@ const char *sdTagName(uint8_t t) {
     default: return "sd";
   }
 }
+
+const char *wifiTagName(uint8_t t) {
+  switch (t) {
+    case FXWIFI_MULTI: return "multi-ap-registered";
+    case FXWIFI_CONNECT: return "connect";
+    case FXWIFI_SWITCH: return "ap-switch";
+    default: return "wifi";
+  }
+}
 }  // namespace
 
 void fxLog(uint8_t kind, uint8_t tag) {
@@ -148,6 +158,8 @@ void fxDump() {
       tn = netTagName(e.tag);
     else if (e.kind == FXK_SD)
       tn = sdTagName(e.tag);
+    else if (e.kind == FXK_WIFI)
+      tn = wifiTagName(e.tag);
     Serial.printf("[FX] #%u t=%lu %s %s\n", (unsigned)e.seq,
                   (unsigned long)e.ms, kindName(e.kind), tn);
   }

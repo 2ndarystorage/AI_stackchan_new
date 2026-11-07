@@ -20,6 +20,7 @@ enum FxKind : uint8_t {
   FXK_LED_GATE_CLOSE = 8,  // 通信開始で LED 送信ゲートが閉じた
   FXK_LED_GATE_OPEN = 9,   // 通信終了で LED 送信ゲートが開いた
   FXK_SD = 10,           // tag = FxSdTag
+  FXK_WIFI = 11,         // tag = FxWifiTag（第9.29弾）
 };
 
 // フラッシュ書き込み箇所の識別タグ（FlashWriteGuard の引数）
@@ -64,6 +65,13 @@ enum FxSdTag : uint8_t {
   FXSD_SEEN_MEMORY_ONLY = 4, // 既読ストアがメモリのみ動作へ移行（SD を失った）
   FXSD_SEEN_SAVE_SKIPPED = 5,  // メモリのみのため既読保存を見送った
   FXSD_WRITE_FAIL = 6,       // 既読ストアの SD 書き込みに失敗した
+};
+
+// Wi-Fi イベントの識別タグ（第9.29弾：複数 AP 対応）
+enum FxWifiTag : uint8_t {
+  FXWIFI_MULTI = 1,    // wifi.txt から1組以上を登録し複数 AP モードになった
+  FXWIFI_CONNECT = 2,  // AP へ接続した（初回／再接続）
+  FXWIFI_SWITCH = 3,   // 接続中 AP が別の AP へ切り替わった
 };
 
 void fxInit(esp_reset_reason_t reason);

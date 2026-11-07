@@ -583,6 +583,11 @@ static const NewsCatDef NEWS_CATS[6] = {
   // 第9.23弾: BLE で転送されたテキスト（exec_news_category で特別処理。nhkCat=-2 が目印）
   {"転送ニュース", "転送ニュースです。",      -2, ""},
 };
+// カテゴリ表示名のアクセサ（KinakoFace.h のメニュー合成描画から使う、第9.26弾）
+const char *newsCatLabel(int idx) {
+  if (idx < 0 || idx > 5) return "";
+  return NEWS_CATS[idx].label;
+}
 // カテゴリごとの側面LED色（トピックス=白、AI=水色、芸能=ピンク、テック=緑、その他=黄、転送=紫）
 static const CRGB NEWS_CAT_COLORS[6] = {
   CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0), CRGB(170, 90, 255),
@@ -644,6 +649,15 @@ uint32_t g_periodic_next_ms = 0;     // 次回ニュース読み上げの発火�
 bool g_sched_morning = true;         // モーニング読み上げ（NVS "setting"/"s_morning"）
 bool g_sched_hourly = true;          // 時報（NVS "setting"/"s_hourly"）
 extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり）で定義
+
+// ==== 第9.26弾: パンくずログ（ウォッチドッグ・リセットの箇所特定用） ====
+// loop の主要区間の入口で現在の区間名を g_crumb に残し、loop が15秒ごとに
+// [HB] としてヒープ残量とともに出力する。TG1WDT リセットが再発した場合、
+// リセット直前の [HB] の crumb が「最後にいた区間」を示す。
+// 代入は文字列リテラルへのポインタ差し替えのみ（確保なし・軽量）。
+static volatile const char *g_crumb = "boot";
+static inline void crumb(const char *section) { g_crumb = section; }
+
 String exec_news(bool automatic = false);  // 実体は後方（ニュース読み上げの節）で定義
 static void exec_digest_category();    // 第9.23弾: 転送ニュースの読み上げ（実体は後方）
 static void append_unread_digest();    // 第9.23弾: 自動読み上げへの未読転送テキスト連結（実体は後方）
@@ -1072,6 +1086,7 @@ void handle_chat() {
 }
 
 void exec_chatGPT(String text) {
+  crumb("chat");
   captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する
   static String response = "";
   Serial.println(InitBuffer);
@@ -1493,8 +1508,17 @@ static void newsSeenLoad() {
   Serial.printf("[News] seen store loaded: %d entries\n", g_news_seen_count);
 }
 
+// 第9.26弾: 既読ストアの保存は「ダーティーフラグ＋後段で一括保存」に変更した。
+// 従来は記事が採用されるたびに（＝Google RSS のストリーム走査の最中に）
+// SPIFFS へ全件書き戻しをしていた。ESP32 のフラッシュ書き込み/消去は他コアを
+// キャッシュ無効化で止めるため、走査中の書き込みは割り込みウォッチドッグ
+// （TG1WDT）を踏む経路になり得る（v9.25 初回セッションのリセットの最有力候補）。
+// 保存自体は取得完了後（TLS を閉じた後）に1回だけ行う。
+static bool g_news_seen_dirty = false;
+
 // 保持期間（5日）を過ぎた記録を掃除してから全件を書き戻す
 static void newsSeenSave() {
+  crumb("spiffs-seen");
   time_t now = time(nullptr);
   bool nowOk = newsNowValid(now);
   int w = 0;
@@ -1533,6 +1557,15 @@ static void newsSeenAdd(uint32_t h) {
   g_news_seen[g_news_seen_count].hash = h;
   g_news_seen[g_news_seen_count].epoch = newsNowValid(now) ? (uint32_t)now : 0;
   g_news_seen_count++;
+  // 第9.26弾: ここではメモリ上の記録だけ更新し、SPIFFS への書き戻しは
+  // 取得完了後に newsSeenFlush() が一括で行う（走査中のフラッシュ書き込み回避）
+  g_news_seen_dirty = true;
+}
+
+// ダーティーなら既読ストアを1回だけ書き戻す（取得系の出口と loop の空きで呼ぶ）
+static void newsSeenFlush() {
+  if (!g_news_seen_dirty) return;
+  g_news_seen_dirty = false;
   newsSeenSave();
 }
 
@@ -1556,6 +1589,7 @@ static bool newsAcceptArticle(const String& title, time_t pub) {
 // NHKニュースRSS（カテゴリ nhkCat）の本文を取得する（第9.6弾で分離）。
 // 成否コードは g_nhk_http_code に残す（接続失敗時は負値）。
 static String fetchNhkRssBody(int nhkCat) {
+  crumb("news-nhk");
   String payload = "";
   g_nhk_http_code = 0;
   Serial.printf("[NHK RSS] start heap=%u largest=%u\n",
@@ -1584,6 +1618,7 @@ static String fetchNhkRssBody(int nhkCat) {
           const uint32_t deadline = millis() + 12000;
           const size_t MAX_BYTES = 200 * 1024;
           uint8_t rbuf[512];
+          int readChunks = 0;
           while ((int32_t)(millis() - deadline) < 0 && payload.length() < MAX_BYTES) {
             size_t avail = stream->available();
             if (avail == 0) {
@@ -1594,6 +1629,9 @@ static String fetchNhkRssBody(int nhkCat) {
             int n = stream->read(rbuf, avail < sizeof(rbuf) ? avail : sizeof(rbuf));
             if (n > 0) {
               payload.concat((const char*)rbuf, (unsigned int)n);
+              // 第9.26弾: データが流れ続ける場合でも loop を独占しないよう、
+              // 約4KB 読むごとに短く譲る（アイドルタスクと他処理の飢餓防止）
+              if ((++readChunks & 7) == 0) delay(1);
             } else {
               delay(1);
             }
@@ -1679,6 +1717,7 @@ static String stripMediaSuffix(String t) {
 // GoogleニュースRSSをストリームで少しずつ読みながら、<item> の <title> を最大 want 件抽出する。
 // フィード全文は保持せず、抽出済み見出しだけを outTitles に残す（走査上限 120KB で打ち切り）。
 static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitles, int& outCount, int& httpCodeOut) {
+  crumb("news-google");
   outCount = 0;
   httpCodeOut = 0;
   Serial.printf("[Google RSS] start heap=%u largest=%u\n",
@@ -1723,6 +1762,7 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
           uint32_t scanned = 0;
           uint32_t startMs = millis();
           uint8_t buf[256];
+          int readChunks = 0;
           // 第8弾: 走査の締切は 25 秒→15 秒に短縮（見出しはフィード先頭にあるため十分）
           while (outCount < want && scanned < MAX_SCAN && (millis() - startMs) < 15000) {
             size_t avail = stream->available();
@@ -1733,6 +1773,9 @@ static bool fetchGoogleHeadlinesOnce(const char* url, int want, String* outTitle
             }
             int n = stream->read(buf, avail < sizeof(buf) ? avail : sizeof(buf));
             if (n <= 0) { delay(1); continue; }
+            // 第9.26弾: 高速に流れ込む場合でも約1KB ごとに譲り、loop の
+            // 独占を避ける（従来はデータがある間 delay なしで回り続けていた）
+            if ((++readChunks & 3) == 0) delay(1);
             for (int i = 0; i < n && outCount < want && scanned < MAX_SCAN; i++) {
               char c = (char)buf[i];
               scanned++;
@@ -1835,6 +1878,7 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
 // あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
 String exec_news(bool automatic) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+  crumb("news");
   // 第9.8弾: ニュース取得（TLS）の前に、TTS接続ペアの解放を合成タスクへ
   // 依頼し、少し待って内蔵ヒープ（最大連続ブロック）を回復させてから
   // 取得する。前セッションの TLS バッファが残っていると、Google RSS の
@@ -1870,9 +1914,14 @@ String exec_news(bool automatic) {
   }
   bool hasGeneral = (text != "");
   // AIニュース：Google検索フィードの見出し（失敗しても一般ニュースだけ読み上げる）
+  // 第9.26弾: 2本目の TLS ハンドシェイクはヒープに余裕があるときだけ行う。
+  // v9.25 初回セッションでは1本目の取得開始時点で free=51432 / largest=49140
+  // まで逼迫していた。largest が 40000 を切る状態では無理に繋がず、一般
+  // ニュースだけで読み上げる（安全弁。閾値は実測の動作点 49140 に余裕を持たせた）。
   String aiHeads[2];
   int aiCount = 0;
-  {
+  if (ESP.getFreeHeap() >= 45000 &&
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) >= 40000) {
     String heads[2];
     int n = 0;
     if (fetchGoogleHeadlines("https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja", 2, heads, n, g_google_ai_http_code)) {
@@ -1882,6 +1931,10 @@ String exec_news(bool automatic) {
         aiHeads[aiCount++] = heads[i];
       }
     }
+  } else {
+    Serial.printf("[News] AI feed skipped: low heap (free=%u largest=%u)\n",
+                  (unsigned)ESP.getFreeHeap(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   }
   if (text != "") {
     // 字幕キューを構築する（発話の再生開始時に字幕表示を開始）
@@ -1920,6 +1973,8 @@ String exec_news(bool automatic) {
     g_info_msg_until = millis() + 4000;
     g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
+  newsSeenFlush();  // 第9.26弾: 既読ストアの書き戻しは取得完了後（TLS終了後）に1回だけ
+  crumb("loop");
   return text;
 }
 
@@ -1929,6 +1984,7 @@ String exec_news(bool automatic) {
 // 従来の exec_news()（トピックス＋AI連結）とは独立した読み上げにする
 void exec_news_category(int cat) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return; }
+  crumb("news-cat");
   if (cat < 0 || cat > 5) cat = 0;
   if (cat == 5) { exec_digest_category(); return; }  // 第9.23弾: 転送ニュース
   const NewsCatDef& c = NEWS_CATS[cat];
@@ -1994,6 +2050,8 @@ void exec_news_category(int cat) {
     g_info_msg_until = millis() + 4000;
     g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
+  newsSeenFlush();  // 第9.26弾: 既読ストアの書き戻しは取得完了後に1回だけ
+  crumb("loop");
 }
 
 void handle_news() {
@@ -2665,6 +2723,7 @@ g_mem_ext_pending = true;
 }
 
 static void memory_extract_run() {
+crumb("mem-extract");
 memory_load();
 // ニュース・天気と同じく、TLS の前に TTS 接続ペアの解放を依頼する
 g_tts_release_req = true;
@@ -2941,6 +3000,7 @@ if (text == "") {
 if (g_news_nothing_new) return "新しいニュースはありません（古い記事と読み上げ済みの記事を除いた結果です）。";
 return "エラー：ニュースを取得できませんでした。";
 }
+newsSeenFlush();  // 第9.26弾: 既読ストアの書き戻しは取得完了後に1回だけ
 return text;
 }
 
@@ -3021,6 +3081,7 @@ if (e) Serial.printf("[FC] tools json parse failed: %s\n", e.c_str());
 // tools 付きで ChatGPT を呼び、tool_calls を実行しながら最終応答文を返す。
 // 使い方は chatGpt() と同じ（戻り値は読み上げ文）。
 String chatGptWithTools(const String& json_string) {
+crumb("chat-tools");
 DynamicJsonDocument req(16384);
 if (deserializeJson(req, json_string)) {
 // リクエストを組み直せない場合は従来経路にフォールバック
@@ -5031,20 +5092,22 @@ void setup()
   // SPIFFSをマウントする
   if(SPIFFS.begin(true)){
     // JSONファイルを開く
+    // 第9.26弾: ファイル不在・空ファイルは正常系（設定未保存）として扱い、
+    // 警告も内容ダンプも出さない。従来は未保存でも毎回
+    // 「Failed to deserialize JSON」と設定 JSON のダンプが出ていた。
+    // 中身があるのに解釈できない場合だけ、理由を1行で知らせる。
     File file = SPIFFS.open("/data.json", "r");
-    if(file){
+    if(file && file.size() > 0){
       DeserializationError error = deserializeJson(chat_doc, file);
+      file.close();
       if(error){
-        Serial.println("Failed to deserialize JSON");
+        Serial.printf("[BOOT] data.json: parse failed (%s); using defaults\n", error.c_str());
         init_chat_doc(json_ChatString.c_str());
       }
       serializeJson(chat_doc, InitBuffer);
       Role_JSON = InitBuffer;
-      String json_str; 
-      serializeJsonPretty(chat_doc, json_str);  // 文字列をシリアルポートに出力する
-      Serial.println(json_str);
     } else {
-      Serial.println("Failed to open file for reading");
+      if(file) file.close();
       init_chat_doc(json_ChatString.c_str());
     }
   } else {
@@ -5255,6 +5318,7 @@ static bool jpeg_frame_size(const uint8_t *f, uint32_t flen,
 }
 
 static bool play_dance_video() {
+  crumb("dance");
   const uint8_t *data = dance_mjpeg;
   const uint32_t len = dance_mjpeg_len;
   if (data == nullptr || len < 1024) {
@@ -5369,13 +5433,32 @@ static void dance_guard_tick() {
   }
 }
 
+// TLS ゲートが空いているかを副作用なく調べる（取れたらすぐ返す）。
+// 起動時ダンスの「穏やかな瞬間」判定に使う（第9.26弾）。
+static bool tls_gate_free() {
+  if (!g_tls_mutex) return true;
+  if (xSemaphoreTakeRecursive(g_tls_mutex, 0) == pdTRUE) {
+    xSemaphoreGiveRecursive(g_tls_mutex);
+    return true;
+  }
+  return false;
+}
+
 // 起動時の自動再生（第9.1弾で setup() から loop() 初回へ移設）。
-// 起動後 3 秒経過して通常タスクが回り始めてから、Wi-Fi 接続済みなら
-// 1 回だけ再生する。前回起動で再生中〜再生直後に panic していた場合
-// （RTC フラグが立ったまま）は、フラグを下ろして今回の自動再生だけを
-// スキップし、無限ブートループを断つ（音声トリガーの再生は通常どおり可能）。
+// 前回起動で再生中〜再生直後に panic していた場合（RTC フラグが立ったまま）は、
+// フラグを下ろして今回の自動再生だけをスキップし、無限ブートループを断つ
+// （音声トリガーの再生は通常どおり可能）。
+// 第9.26弾: 発火条件を「起動3秒後・Wi-Fi接続」だけから「穏やかな瞬間」へ変更。
+// v9.25 初回セッションでは起動直後のヒープが約52KBまで逼迫しており、他処理
+// （ニュース取得・スケジューラ挨拶）と重なる自動再生はリスクが大きい。そこで
+// 起動10秒以降・ヒープに余裕（自動再生専用の下限80KB、再生ガード自体は60KB）・
+// 発話なし・TLS 空き・メニュー/ダイアログなし、が揃うまで最大120秒待つ。
+// 揃わなければ自動再生だけ見送る（音声トリガーは従来どおり）。
+static const uint32_t DANCE_BOOT_HEAP_MIN = 80000;   // 自動再生専用のヒープ下限
+static const uint32_t DANCE_BOOT_WINDOW_MS = 120000; // 自動再生の判断窓（起動後）
 static void dance_boot_check() {
   static bool decided = false;
+  static bool defer_logged = false;
   if (decided) return;
   if (g_dance_playing_rtc) {
     g_dance_playing_rtc = false;
@@ -5384,15 +5467,34 @@ static void dance_boot_check() {
     return;
   }
   uint32_t now = millis();
-  if (now > 30000) { decided = true; return; }  // 条件が揃わなければ見送る
-  if (now < 3000) return;                       // 起動直後はまだ待つ
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (now < 10000) return;  // 起動直後はまだ待つ（第9.26弾: 3秒→10秒）
+  const char *blocker = nullptr;
+  if (WiFi.status() != WL_CONNECTED) blocker = "wifi";
+  else if (ESP.getFreeHeap() < DANCE_BOOT_HEAP_MIN) blocker = "heap";
+  else if (audioRunning() || tts_processing() ||
+           speech_text != "" || speech_text_buffer != "") blocker = "speech";
+  else if (!tls_gate_free()) blocker = "tls";
+  else if (g_menu_open || g_settings_open) blocker = "ui";
+  if (blocker != nullptr) {
+    if (!defer_logged) {
+      defer_logged = true;
+      Serial.printf("[DANCE] boot autoplay deferred: %s (heap=%u)\n",
+                    blocker, (unsigned)ESP.getFreeHeap());
+    }
+    if (now > DANCE_BOOT_WINDOW_MS) {
+      decided = true;
+      Serial.printf("[DANCE] boot autoplay skipped: no calm moment (%s)\n", blocker);
+    }
+    return;
+  }
   decided = true;
   Serial.println("[DANCE] boot autoplay");
   play_dance_video();
+  crumb("loop");
 }
 
 void SST_ChatGPT() {
+        crumb("stt");
         if (tts_processing()) return;
         captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する（ニュース分岐では exec_news が再構築する）
         g_pose_state = POSE_WAVE;  // 第9弾: 会話開始（挨拶〜聞き取り中）は「手振り」
@@ -5448,6 +5550,7 @@ void SST_ChatGPT() {
               // ダンス動画も ChatGPT を経由しない特例（会話履歴には入れない）
               Serial.println("[DANCE] voice trigger");
               play_dance_video();
+              crumb("loop");
               g_pending_pose = POSE_LAUGH;
               speech_text = "踊ってみたよ。";
             } else {
@@ -5784,23 +5887,10 @@ static void menuShowBalloon() {
   avatar.setSpeechText(s.c_str());
 }
 
-// メニューのカテゴリ一覧を画面左側へ描く。
-// Avatar の再描画で上書きされるため、メニュー表示中は loop のたびに描き直す
-// 第9.3弾: LCD への直接描画はグラフィックス直列化ロックの中で行う
-// （描画タスクのパネル transaction と begin/end が競合しないように）。
-static void drawMenuList() {
-  GfxLockGuard gfx_guard;
-  M5.Lcd.fillRect(0, 76, 176, 118, TFT_BLACK);
-  M5.Lcd.setFont(&fonts::efontJA_16);
-  M5.Lcd.setTextSize(1);
-  M5.Lcd.setTextColor(TFT_WHITE, TFT_BLACK);
-  for (int i = 0; i < 6; i++) {
-    M5.Lcd.setCursor(4, 79 + i * 19);
-    M5.Lcd.print((i == g_menu_sel) ? "▶ " : "  ");
-    M5.Lcd.print(NEWS_CATS[i].label);
-  }
-  drawFirmwareVersionBadge(M5.Lcd);
-}
+// メニューのカテゴリ一覧描画は第9.26弾で KinakoFace.h の顔合成キャンバス
+// へ移設した（旧 drawMenuList は M5.Lcd への直接描画で、顔スプライトの
+// 毎フレーム転写に上書きされて点滅していた）。ここに残るのは選択状態と
+// 確定判定（menu_step / loop の締切処理）のみ。
 
 // 左上/左下タップ：メニューを開く／前後のカテゴリへ移動する
 static void menu_step(int delta) {
@@ -5841,6 +5931,27 @@ void loop()
     return;
   }
   static int lastms = 0;
+
+  // 第9.26弾: パンくずハートビート。15秒ごとに現在区間（crumb）とヒープを出す。
+  // TG1WDT リセットが再発したら、直前の [HB] が最後にいた区間と残量を示す。
+  {
+    static uint32_t hb_last = 0;
+    uint32_t hb_now = millis();
+    if (hb_now - hb_last >= 15000) {
+      hb_last = hb_now;
+      const char *crumb_snapshot = (const char *)g_crumb;
+      Serial.printf("[HB] t=%lu heap=%u largest=%u crumb=%s mode=%d seen_dirty=%d\n",
+                    (unsigned long)hb_now, (unsigned)ESP.getFreeHeap(),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                    crumb_snapshot, mode, g_news_seen_dirty ? 1 : 0);
+    }
+  }
+  // 第9.26弾: 既読ストア書き戻しの保険（本筋は取得系の出口での一括保存。
+  // ダーティーが残っていたらアイドル時に保存する）
+  if (g_news_seen_dirty && !tts_processing() &&
+      speech_text == "" && speech_text_buffer == "") {
+    newsSeenFlush();
+  }
 
   wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続
 
@@ -6100,10 +6211,10 @@ void loop()
   }
 #endif
 
-  // ニュースカテゴリ選択メニュー：表示中は一覧を描き続け、
-  // 最後のタップから約2.5秒操作がなければ選択中カテゴリを読み上げて閉じる
+  // ニュースカテゴリ選択メニュー：一覧の描画は顔合成側（KinakoFace.h）。
+  // ここでは、最後のタップから約2.5秒操作がなければ選択中カテゴリを
+  // 読み上げて閉じる確定判定だけを行う
   if (g_menu_open) {
-    drawMenuList();
     if ((int32_t)(millis() - g_menu_deadline) >= 0) {
       if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "" && !g_cap_active) {
         g_menu_open = false;

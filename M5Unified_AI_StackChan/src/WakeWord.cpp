@@ -6,9 +6,21 @@
 #include <SPIFFS.h>
 
 #include "simplevox.h"
+#include "FlashWriteGuard.h"  // フラッシュ書き込みガード（第9.31弾）
+#include "SdCardAccess.h"     // SD 健全性管理の共有窓口（第9.32弾）
+#include <SD.h>               // テンプレートの SD 保存確認（第9.32弾）
 
 #define base_path "/spiffs"
 #define file_name "/wakeword.bin"
+// 第9.32弾: SD 上のテンプレートへの stdio パス。根拠: arduino-esp32
+// 2.0.11 の SDFS::begin() の既定マウントポイントは "/sdcard" ではなく
+// "/sd"（ライブラリ SD/src/SD.h のデフォルト引数）で、本プロジェクトの
+// SD.begin（sdBeginCounted）はその既定値のまま使う。よってマウント中は
+// VFS パス "/sd/wakeword.bin" で stdio（SimpleVox の saveFile/loadFile）
+// から SD に読み書きできる。マウントは sdAccessBegin()/sdAccessEnd() の
+// 内側でのみ触ること。万一この前提が崩れても、saveFile は false を返し、
+// SD 保存は失敗として記録され、SPIFFS 保存で登録が完了する（安全側）。
+#define sd_base_path "/sd"
 constexpr int kSampleRate = 16000;
 constexpr int audioLength = kSampleRate * 3;  // 3 seconds
 constexpr int kRxBufferNum = 3;
@@ -19,6 +31,45 @@ ns_handle_t nsInst;
 simplevox::VadEngine vadEngine;
 simplevox::MfccEngine mfccEngine;
 simplevox::MfccFeature* mfcc = nullptr;
+
+// 第9.32弾: テンプレートファイルのサイズ（存在しなければ -1）。
+// 保存結果のログ用。fs は SD / SPIFFS のどちらでもよい（SD は要マウント）。
+static long wwFileSize(fs::FS &fs)
+{
+  File f = fs.open(file_name, "r");
+  if (!f) { return -1; }
+  long sz = (long)f.size();
+  f.close();
+  return sz;
+}
+
+// 第9.32弾: 登録モード中の診断ログ（約1秒に1回へ間引き）。
+// v9.31 実機で「登録モードに入るが音声検出が反応しない」事象があり、
+// 検出経路にはログが一切なかったため切り分けできなかった。フレームが
+// 届いているか（frames/nulls）とピーク音量があれば、「マイクに音が
+// 届いていない」のか「音はあるが VAD が検出しない」のかを分けられる。
+// VAD の内部状態は SimpleVox の公開 API では取得できない（detect() が
+// 内部で process() を呼ぶため、状態取得のために process() を追加で
+// 呼ぶと二重にフレームを食わせてしまう）ので、無理に出さない。
+// 本カウンタは wakeword_regist()（登録モードでのみ呼ばれる）からのみ
+// 更新され、比較モード等の通常時にはログは出ない。
+static uint32_t g_ww_diag_last_ms = 0;
+static uint32_t g_ww_diag_frames = 0;  // rxMic がフレームを返した回数
+static uint32_t g_ww_diag_nulls = 0;   // rxMic が nullptr を返した回数
+static int32_t  g_ww_diag_peak = 0;    // 期間内の最大ピーク（絶対値）
+
+static void wwRegistDiagFlush(bool detected)
+{
+  uint32_t now = millis();
+  if (!detected && now - g_ww_diag_last_ms < 1000) { return; }
+  g_ww_diag_last_ms = now;
+  Serial.printf("[WW] regist frames=%lu nulls=%lu peak=%ld detected=%s\n",
+                (unsigned long)g_ww_diag_frames, (unsigned long)g_ww_diag_nulls,
+                (long)g_ww_diag_peak, detected ? "yes" : "no");
+  g_ww_diag_frames = 0;
+  g_ww_diag_nulls = 0;
+  g_ww_diag_peak = 0;
+}
 
 LGFX_Button regButton;
 LGFX_Button cmpButton;
@@ -169,11 +220,49 @@ void wakeword_init(){
   }
   
   SPIFFS.begin(true);
-  if (SPIFFS.exists(file_name))
+  // 第9.32弾: テンプレートの読み込みは SD を主、SPIFFS を保険とする。
+  // SD 側はファーム書き込みでも消えないため、書き込みをまたいで登録が
+  // 残る。SD アクセスは健全性管理（sdAccessBegin/End）の枠組みに従い、
+  // 応答停止したカードへは繰り返し試行しない。wakeword_init() は
+  // setup 内（LED タスク起動前・ミューテックス生成後）から呼ばれる
+  // 単独実行区間で、ここでの読み取りに書き込みガードは要らない。
+  bool ww_loaded = false;
+  if (sdAccessBegin())
+  {
+    if (SD.exists(file_name))
+    {
+      long sz = wwFileSize(SD);
+      mfcc = mfccEngine.loadFile(sd_base_path file_name);
+      if (mfcc != nullptr)
+      {
+        Serial.printf("[WW] template loaded from SD (%ld bytes)\n", sz);
+        ww_loaded = true;
+      } else {
+        Serial.println("[WW] SD template failed validation; falling back to SPIFFS");
+      }
+    }
+    sdAccessEnd();
+  } else if (sdAccessDead()) {
+    Serial.println("[WW] SD unavailable (card dead); trying SPIFFS");
+  }
+  if (!ww_loaded && SPIFFS.exists(file_name))
+  {
+    long sz = wwFileSize(SPIFFS);
+    mfcc = mfccEngine.loadFile(base_path file_name);
+    if (mfcc != nullptr)
+    {
+      Serial.printf("[WW] template loaded from SPIFFS (%ld bytes)\n", sz);
+      ww_loaded = true;
+    } else {
+      Serial.println("[WW] SPIFFS template failed validation");
+    }
+  }
+  if (ww_loaded)
   {
     M5.Display.println("File exists !!");
-    mfcc = mfccEngine.loadFile(base_path file_name);
     //mode = 1;
+  } else {
+    Serial.println("[WW] no wakeword template (not registered)");
   }
 }
 
@@ -185,11 +274,33 @@ bool wakeword_regist() // 検出した音声を再生しMFCCを登録及びフ�
   auto* data = rxMic();
   // M5.Mic.end();
   // M5.Speaker.begin();
-  if (data == nullptr) { return ret; }
+  if (data == nullptr) {
+    g_ww_diag_nulls++;  // 第9.32弾: 診断ログ用カウンタ
+    wwRegistDiagFlush(false);
+    return ret;
+  }
+  // 第9.32弾: 診断用に生フレームのピークを測る（ns_process の前＝
+  // マイクに届いたままの音量）。検出のしきい値自体は変えていない。
+  {
+    const int frameLength = vadEngine.config().frame_length();
+    int32_t peak = 0;
+    for (int i = 0; i < frameLength; i++) {
+      int32_t v = data[i];
+      if (v < 0) { v = -v; }
+      if (v > peak) { peak = v; }
+    }
+    g_ww_diag_frames++;
+    if (peak > g_ww_diag_peak) { g_ww_diag_peak = peak; }
+  }
   ns_process(nsInst, data, data);
 
   int length = vadEngine.detect(rawAudio, audioLength, data);
-  if (length <= 0) { return ret; }
+  if (length <= 0) {
+    wwRegistDiagFlush(false);
+    return ret;
+  }
+  Serial.printf("[WW] regist: utterance detected (%d samples)\n", length);  // 第9.32弾
+  wwRegistDiagFlush(true);
 //  if (length <= 100) { return ret; }
   M5.Mic.end();
   if (M5.Speaker.begin())
@@ -203,9 +314,38 @@ bool wakeword_regist() // 検出した音声を再生しMFCCを登録及びフ�
   mfcc = mfccEngine.create(rawAudio, length);
   if (mfcc)
   {
-    mfccEngine.saveFile(base_path file_name, *mfcc);
+    // 第9.31弾: SPIFFS へのテンプレート保存をフラッシュ書き込みガードで
+    // 囲む。従来はガードの対象外で、保存中のキャッシュ無効化と側面LED
+    // （RMT）送信が重なり、登録中に "Cache disabled" パニックが発生した
+    // （v9.30 実機）。保存は "wb" で開き直すため、前回パニックで中途半端に
+    // 残ったファイルも次回登録でそのまま上書きされる。
+    // 第9.32弾: 保存先を SD（主）＋ SPIFFS（保険）に二重化し、ファーム
+    // 書き込みで SPIFFS が消えても SD から登録が残るようにした。両保存
+    // とも同じガードの内側で行う。片方でも成功すれば登録は完了として
+    // 扱い、両方失敗したときだけ登録失敗（ret=false）とする。
+    FlashWriteGuard guard(FXW_WAKEWORD);
+    bool saved_any = false;
+    if (sdAccessBegin())
+    {
+      bool ok_sd = mfccEngine.saveFile(sd_base_path file_name, *mfcc);
+      long sz_sd = ok_sd ? wwFileSize(SD) : -1;
+      Serial.printf("[WW] save to SD: %s (%ld bytes)\n", ok_sd ? "ok" : "FAILED", sz_sd);
+      saved_any = saved_any || ok_sd;
+      sdAccessEnd();
+    } else {
+      Serial.printf("[WW] save to SD: skipped (%s)\n",
+                    sdAccessDead() ? "card dead" : "not mounted");
+    }
+    bool ok_spiffs = mfccEngine.saveFile(base_path file_name, *mfcc);
+    long sz_spiffs = ok_spiffs ? wwFileSize(SPIFFS) : -1;
+    Serial.printf("[WW] save to SPIFFS: %s (%ld bytes)\n", ok_spiffs ? "ok" : "FAILED", sz_spiffs);
+    saved_any = saved_any || ok_spiffs;
+    if (saved_any) {
+      ret = true;
+    } else {
+      Serial.println("[WW] regist: save failed on both SD and SPIFFS");
+    }
     //mode = 1;
-    ret = true;
   }
   vadEngine.reset();
 //  mode = 0;

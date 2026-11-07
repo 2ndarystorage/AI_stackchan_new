@@ -1,4 +1,5 @@
 #include <AudioOutput.h>
+#include "SpeakerBackendReady.h"
 
 // 話速倍率（main.cpp で定義）。playRaw に渡すサンプルレートへ乗算して再生速度を変える
 extern float TTS_SPEED_RATE;
@@ -15,14 +16,25 @@ class AudioOutputM5Speaker : public AudioOutput
       _virtual_ch = virtual_sound_channel;
     }
     virtual ~AudioOutputM5Speaker(void) {};
-    virtual bool begin(void) override { return true; }
+    void setAbort(bool value) { _abort = value; }
+    virtual bool begin(void) override {
+      _tri_buffer_index = 0;
+      _tri_index = 0;
+      _submitted_samples = 0;
+      _peak = 0;
+      _fault = !_m5sound->begin() || !speakerBackendReady(*_m5sound);
+      return !_fault;
+    }
     virtual bool ConsumeSample(int16_t sample[2]) override
     {
+      if (_fault || !speakerBackendReady(*_m5sound)) { _fault = true; return false; }
       if (_tri_buffer_index < tri_buf_size)
       {
         _tri_buffer[_tri_index][_tri_buffer_index  ] = sample[0];
         _tri_buffer[_tri_index][_tri_buffer_index+1] = sample[0];
         _tri_buffer_index += 2;
+        uint32_t magnitude = sample[0] < 0 ? -int32_t(sample[0]) : sample[0];
+        if (magnitude > _peak) _peak = magnitude;
 
         return true;
       }
@@ -32,9 +44,12 @@ class AudioOutputM5Speaker : public AudioOutput
     }
     virtual void flush(void) override
     {
+      if (_fault || !speakerBackendReady(*_m5sound)) { _fault = true; return; }
       if (_tri_buffer_index)
       {
-        _m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, (uint32_t)(hertz * TTS_SPEED_RATE), true, 1, _virtual_ch);
+        if (!_m5sound->playRaw(_tri_buffer[_tri_index], _tri_buffer_index, (uint32_t)(hertz * TTS_SPEED_RATE), true, 1, _virtual_ch)) return;
+        if (!speakerBackendReady(*_m5sound)) { _fault = true; return; }
+        _submitted_samples += _tri_buffer_index;
         _tri_index = _tri_index < 2 ? _tri_index + 1 : 0;
         _tri_buffer_index = 0;
         ++_update_count;
@@ -42,22 +57,35 @@ class AudioOutputM5Speaker : public AudioOutput
     }
     virtual bool stop(void) override
     {
-      flush();
+      if (!_abort && !_fault) {
+        // Do not discard the final queued PCM or overwrite buffers still in use.
+        uint32_t start = millis();
+        while (_tri_buffer_index && millis() - start < 1000) { flush(); delay(1); }
+        while (_m5sound->isPlaying(_virtual_ch) && millis() - start < 1000) delay(1);
+      }
       _m5sound->stop(_virtual_ch);
+      _tri_buffer_index = 0;
       for (size_t i = 0; i < 3; ++i)
       {
         memset(_tri_buffer[i], 0, tri_buf_size * sizeof(int16_t));
       }
       ++_update_count;
-      return true;
+      return !_fault;
     }
 
     const int16_t* getBuffer(void) const { return _tri_buffer[(_tri_index + 2) % 3]; }
     const uint32_t getUpdateCount(void) const { return _update_count; }
+    bool hasFault() const { return _fault; }
+    uint32_t submittedSamples() const { return _submitted_samples; }
+    uint32_t peak() const { return _peak; }
 
   protected:
     m5::Speaker_Class* _m5sound;
     uint8_t _virtual_ch;
+    bool _abort = false;
+    bool _fault = false;
+    uint32_t _submitted_samples = 0;
+    uint32_t _peak = 0;
     static constexpr size_t tri_buf_size = 640;
     int16_t _tri_buffer[3][tri_buf_size];
     size_t _tri_buffer_index = 0;

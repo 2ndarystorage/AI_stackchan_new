@@ -4,6 +4,8 @@
 
 #ifndef AVATAR_H_
 #define AVATAR_H_
+#define STACKCHAN_AVATAR_GFX_LOCKED 0x0913
+extern "C" unsigned stackchan_avatar_gfx_lock_revision();
 #include "ColorPalette.h"
 #include "Face.h"
 #include <M5GFX.h>

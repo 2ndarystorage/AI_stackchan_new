@@ -508,10 +508,34 @@ bool g_led_enable = true;            // 全体の有効/無効（NVS "setting"/"
 // 第9.23弾: 低い側の刻みが 1/255 単位で見分けられなかったため、レベル3を 3→4 に
 // 見直し（既定レベル4=6 と上限レベル5=12 は従来どおり）
 static const uint8_t LED_LEVEL_VALUES[6] = {0, 1, 2, 4, 6, 12};
+// ==== フラッシュ書き込みと側面LED（RMT）の相互排他（第9.27弾） ====
+// ESP32 のフラッシュ書き込み/消去中はキャッシュが無効化され、その間に
+// フラッシュ上のコードを実行すると "Cache disabled but cached memory
+// region accessed" パニックになる。FastLED 3.10 / IDF 4.4 の RMT 補充
+// 割り込み経路はフラッシュ上の HAL コードに触れるため、SPIFFS / NVS への
+// 書き込みと FastLED.show()（RMT 送信）が重なると踏み得る（v9.26 実機で
+// カテゴリ選択直後に発生）。対策として、フラッシュ書き込みは必ず
+// StorageLedGuard で囲み、ledTask 側の show() も同じミューテックスで
+// 囲むことで「書き込みと RMT 送信が同時に走らない」ことを保証する。
+// ミューテックスは setup のタスク起動前に生成する。生成前（起動初期の
+// 単独実行区間）や未生成時はロックなしで通す（競合相手が存在しない）。
+static SemaphoreHandle_t g_storage_led_mutex = nullptr;
+static inline void storageLedLock() {
+  if (g_storage_led_mutex) xSemaphoreTake(g_storage_led_mutex, portMAX_DELAY);
+}
+static inline void storageLedUnlock() {
+  if (g_storage_led_mutex) xSemaphoreGive(g_storage_led_mutex);
+}
+struct StorageLedGuard {
+  StorageLedGuard() { storageLedLock(); }
+  ~StorageLedGuard() { storageLedUnlock(); }
+};
+
 uint8_t g_led_level = 4;             // LED輝度レベル（0〜5、既定4。KinakoFace.h から参照）
 static void applyLedLevel(bool save) {
   FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);
   if (save) {
+    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
     nvs_handle_t h;
     if (nvs_open("setting", NVS_READWRITE, &h) == ESP_OK) {
       nvs_set_u8(h, "ledlevel", g_led_level);
@@ -557,6 +581,7 @@ static void applyVolLevel(bool save) {
   // Apply user gain only once; keep speech and tone channels at unity.
   setSpeechVolume(M5.Speaker, v);
   if (save) {
+    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
     uint32_t nvs_handle;
     if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
       nvs_set_u8(nvs_handle, "vol", g_vol_level);
@@ -1184,6 +1209,7 @@ void handle_apikey_set() {
 
   uint32_t nvs_handle;
   if (ESP_OK == nvs_open("apikey", NVS_READWRITE, &nvs_handle)) {
+    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
     nvs_set_str(nvs_handle, "openai", openai.c_str());
     nvs_set_str(nvs_handle, "voicevox", voicevox.c_str());
     nvs_set_str(nvs_handle, "sttapikey", sttapikey.c_str());
@@ -1204,6 +1230,8 @@ bool save_json(){
     return false;
   }
 
+  // 第9.27弾: フラッシュ書き込みと LED(RMT) の相互排他
+  StorageLedGuard guard;
   // JSONファイルを作成または開く
   File file = SPIFFS.open("/data.json", "w");
   if(!file){
@@ -1310,6 +1338,7 @@ void handle_setting() {
   uint8_t led_onoff = 0;
   uint32_t nvs_handle;
   if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+    StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
     if(volume > 255) volume = 255;
     nvs_set_u32(nvs_handle, "volume", volume);
     if(led != "") {
@@ -1384,8 +1413,11 @@ static String xmlExtract(const String& xml, const char* tag, int startPos) {
 // (a) 鮮度: 記事の pubDate が48時間より古いものは読み上げ対象から外す。
 //     日付が取れない記事は除外しない（重複防止側で繰り返しを防ぐ）。
 //     未来日時の異常値（現在+24時間より先）は「日付なし」として扱う。
-// (b) 重複: 読み上げ済み記事のタイトルハッシュを SPIFFS に記録し、
-//     次回以降はスキップする。保持は最大60件・5日で自動的に掃除する。
+// (b) 重複: 読み上げ済み記事のタイトルハッシュを記録し、次回以降は
+//     スキップする。保持は最大60件・5日で自動的に掃除する。
+//     第9.27弾: 保存先は SD 優先（/news_seen.txt）・SPIFFS フォールバックに
+//     変更（SD 書き込みはフラッシュキャッシュを止めないため、通常運用では
+//     フラッシュ書き込み自体が発生しない）。
 // (c) すべて古い/既読で新しい記事がなかった場合は g_news_nothing_new を立て、
 //     手動では「新しいニュースはありません」と読み上げ、自動読み上げ
 //     （定期通知・スケジューラ）では無言でスキップする（exec_news 側）。
@@ -1488,24 +1520,58 @@ struct NewsSeenEntry { uint32_t hash; uint32_t epoch; };
 static NewsSeenEntry g_news_seen[NEWS_SEEN_MAX];
 static int g_news_seen_count = 0;
 static bool g_news_seen_loaded = false;
+static bool g_seen_on_sd = false;   // 第9.27弾: 既読ストアの保存先（true=SD / false=SPIFFS）
+static bool g_news_seen_dirty = false;  // メモリ上の記録が保存先とずれていれば true（宣言は newsSeenSave 節から前倒し）
+
+// digest_open / memfs_open と同じ作法（SD 優先・なければ SPIFFS）
+static fs::FS *seenfs_open(bool &use_sd) {
+  use_sd = false;
+  if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+    use_sd = true;
+    return &SD;
+  }
+  if (!SPIFFS.begin(false)) return nullptr;
+  return &SPIFFS;
+}
+static void seenfs_close(bool use_sd) { if (use_sd) SD.end(); }
 
 static void newsSeenLoad() {
   if (g_news_seen_loaded) return;
   g_news_seen_loaded = true;
   g_news_seen_count = 0;
-  File f = SPIFFS.open(NEWS_SEEN_PATH, FILE_READ);
-  if (!f) return;
-  while (f.available() && g_news_seen_count < NEWS_SEEN_MAX) {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    int sp = line.indexOf(' ');
-    if (sp <= 0) continue;
-    g_news_seen[g_news_seen_count].hash = (uint32_t)strtoul(line.substring(0, sp).c_str(), nullptr, 16);
-    g_news_seen[g_news_seen_count].epoch = (uint32_t)line.substring(sp + 1).toInt();
-    g_news_seen_count++;
+  bool use_sd;
+  fs::FS *fsys = seenfs_open(use_sd);
+  if (!fsys) { Serial.println("[News] seen store: fs open failed"); return; }
+  g_seen_on_sd = use_sd;
+  File f;
+  bool legacy_spiffs = false;
+  if (use_sd && !fsys->exists(NEWS_SEEN_PATH)) {
+    // 第9.27弾: SD 優先へ移行する初回だけ、従来の SPIFFS 側ファイルを引き継ぐ
+    if (SPIFFS.begin(false) && SPIFFS.exists(NEWS_SEEN_PATH)) {
+      f = SPIFFS.open(NEWS_SEEN_PATH, FILE_READ);
+      legacy_spiffs = (bool)f;
+    }
   }
-  f.close();
-  Serial.printf("[News] seen store loaded: %d entries\n", g_news_seen_count);
+  if (!f) f = fsys->open(NEWS_SEEN_PATH, FILE_READ);
+  if (f) {
+    while (f.available() && g_news_seen_count < NEWS_SEEN_MAX) {
+      String line = f.readStringUntil('\n');
+      line.trim();
+      int sp = line.indexOf(' ');
+      if (sp <= 0) continue;
+      g_news_seen[g_news_seen_count].hash = (uint32_t)strtoul(line.substring(0, sp).c_str(), nullptr, 16);
+      g_news_seen[g_news_seen_count].epoch = (uint32_t)line.substring(sp + 1).toInt();
+      g_news_seen_count++;
+    }
+    f.close();
+  }
+  seenfs_close(use_sd);
+  if (legacy_spiffs) {
+    g_news_seen_dirty = true;  // 次の制御点で SD へ書き直して移行を完了する
+    Serial.println("[News] seen store: legacy SPIFFS data loaded (will migrate to SD)");
+  }
+  Serial.printf("[News] seen store loaded: %d entries (%s)\n",
+                g_news_seen_count, g_seen_on_sd ? "SD" : "SPIFFS");
 }
 
 // 第9.26弾: 既読ストアの保存は「ダーティーフラグ＋後段で一括保存」に変更した。
@@ -1513,12 +1579,14 @@ static void newsSeenLoad() {
 // SPIFFS へ全件書き戻しをしていた。ESP32 のフラッシュ書き込み/消去は他コアを
 // キャッシュ無効化で止めるため、走査中の書き込みは割り込みウォッチドッグ
 // （TG1WDT）を踏む経路になり得る（v9.25 初回セッションのリセットの最有力候補）。
-// 保存自体は取得完了後（TLS を閉じた後）に1回だけ行う。
-static bool g_news_seen_dirty = false;
+// 第9.27弾: 保存先を SD 優先に変え、実行タイミングも「取得完了後」から
+// 「loop の制御点（取得・合成・再生がすべて空いた時点）」へさらに寄せた。
+// 書き込み自体も StorageLedGuard で LED(RMT) と相互排他にする。
+// （g_news_seen_dirty の宣言は newsSeenLoad より前へ移動済み）
 
 // 保持期間（5日）を過ぎた記録を掃除してから全件を書き戻す
 static void newsSeenSave() {
-  crumb("spiffs-seen");
+  crumb("store-seen");
   time_t now = time(nullptr);
   bool nowOk = newsNowValid(now);
   int w = 0;
@@ -1529,12 +1597,22 @@ static void newsSeenSave() {
     g_news_seen[w++] = g_news_seen[i];
   }
   g_news_seen_count = w;
-  File f = SPIFFS.open(NEWS_SEEN_PATH, FILE_WRITE);
-  if (!f) { Serial.println("[News] seen store save failed"); return; }
-  for (int i = 0; i < g_news_seen_count; i++) {
-    f.printf("%08lx %lu\n", (unsigned long)g_news_seen[i].hash, (unsigned long)g_news_seen[i].epoch);
+  bool use_sd;
+  fs::FS *fsys = seenfs_open(use_sd);
+  if (!fsys) { Serial.println("[News] seen store save failed (fs open)"); return; }
+  g_seen_on_sd = use_sd;
+  {
+    StorageLedGuard guard;  // 第9.27弾: フラッシュ書き込み（SPIFFS時）と LED(RMT) の相互排他
+    File f = fsys->open(NEWS_SEEN_PATH, FILE_WRITE);
+    if (!f) { seenfs_close(use_sd); Serial.println("[News] seen store save failed"); return; }
+    for (int i = 0; i < g_news_seen_count; i++) {
+      f.printf("%08lx %lu\n", (unsigned long)g_news_seen[i].hash, (unsigned long)g_news_seen[i].epoch);
+    }
+    f.close();
   }
-  f.close();
+  seenfs_close(use_sd);
+  Serial.printf("[News] seen store saved: %d entries (%s)\n",
+                g_news_seen_count, use_sd ? "SD" : "SPIFFS");
 }
 
 static bool newsSeenContains(uint32_t h) {
@@ -1557,12 +1635,13 @@ static void newsSeenAdd(uint32_t h) {
   g_news_seen[g_news_seen_count].hash = h;
   g_news_seen[g_news_seen_count].epoch = newsNowValid(now) ? (uint32_t)now : 0;
   g_news_seen_count++;
-  // 第9.26弾: ここではメモリ上の記録だけ更新し、SPIFFS への書き戻しは
-  // 取得完了後に newsSeenFlush() が一括で行う（走査中のフラッシュ書き込み回避）
+  // 第9.26弾: ここではメモリ上の記録だけ更新し、保存先への書き戻しは
+  // loop の制御点で newsSeenFlush() が一括で行う（走査中の書き込み回避。
+  // 第9.27弾で制御点方式に集約）
   g_news_seen_dirty = true;
 }
 
-// ダーティーなら既読ストアを1回だけ書き戻す（取得系の出口と loop の空きで呼ぶ）
+// ダーティーなら既読ストアを1回だけ書き戻す（第9.27弾: loop の制御点からのみ呼ぶ）
 static void newsSeenFlush() {
   if (!g_news_seen_dirty) return;
   g_news_seen_dirty = false;
@@ -1973,7 +2052,7 @@ String exec_news(bool automatic) {
     g_info_msg_until = millis() + 4000;
     g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
-  newsSeenFlush();  // 第9.26弾: 既読ストアの書き戻しは取得完了後（TLS終了後）に1回だけ
+  // 第9.27弾: 既読の書き戻しは loop の制御点（取得・合成・再生が空いた時点）に集約
   crumb("loop");
   return text;
 }
@@ -2050,7 +2129,7 @@ void exec_news_category(int cat) {
     g_info_msg_until = millis() + 4000;
     g_pending_news_speech = true;  // この発話はニュース由来（中央タップで中断可能）
   }
-  newsSeenFlush();  // 第9.26弾: 既読ストアの書き戻しは取得完了後に1回だけ
+  // 第9.27弾: 既読の書き戻しは loop の制御点（取得・合成・再生が空いた時点）に集約
   crumb("loop");
 }
 
@@ -2622,6 +2701,7 @@ Serial.printf("[MEM] loaded %u fact(s) from %s\n",
 }
 
 static void memory_save() {
+crumb("store-mem");
 memory_load();
 // 上限（40件・約4KB）を超えたら古い順に捨てる
 while (g_mem_facts.size() > MEM_FACTS_MAX) g_mem_facts.pop_front();
@@ -2638,6 +2718,7 @@ Serial.println("[MEM] save: filesystem open failed");
 return;
 }
 g_mem_on_sd = use_sd;
+StorageLedGuard guard;  // 第9.27弾: フラッシュ書き込み（SPIFFS時）と LED(RMT) の相互排他
 File f = fsys->open(MEM_FACTS_PATH, "w");
 if (f) {
 for (auto& s: g_mem_facts) {
@@ -3000,7 +3081,7 @@ if (text == "") {
 if (g_news_nothing_new) return "新しいニュースはありません（古い記事と読み上げ済みの記事を除いた結果です）。";
 return "エラー：ニュースを取得できませんでした。";
 }
-newsSeenFlush();  // 第9.26弾: 既読ストアの書き戻しは取得完了後に1回だけ
+// 第9.27弾: 既読の書き戻しは loop の制御点に集約（ここでは dirty フラグのみ）
 return text;
 }
 
@@ -3341,6 +3422,8 @@ static bool digest_store(const uint8_t *data, size_t len, String &out_name) {
   bool use_sd;
   fs::FS *fsys = digest_open(use_sd);
   if (!fsys) return false;
+  // 第9.27弾: SPIFFS 書き込み/削除と LED(RMT) の相互排他（SD 時も短時間で無害）
+  StorageLedGuard guard;
   DigestEntry entries[24];
   int max_index = 0;
   int count = digest_scan(*fsys, use_sd, entries, 24, max_index);
@@ -3410,7 +3493,13 @@ static int digest_last_read_index() {
   }
   return v;
 }
+// 第9.27弾: 既読マークの NVS 書き込みは発話開始と重ねず、loop の制御点
+// （取得・合成・再生が空いた時点）へ遅延する。ここには保留中の連番だけ置く
+static int g_digest_read_pending = -1;
+
 static void digest_mark_read(int idx) {
+  crumb("store-nvs");
+  StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
   uint32_t h;
   if (ESP_OK == nvs_open("setting", NVS_READWRITE, &h)) {
     nvs_set_i32(h, "dgread", idx);
@@ -3471,7 +3560,7 @@ static void exec_digest_category() {
   if (g_cap_count > 0) g_cap_armed = true;
   speech_text = "転送ニュースです。" + speech;
   g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
-  digest_mark_read(idx);
+  g_digest_read_pending = idx;  // 第9.27弾: 既読マーク（NVS書き込み）は loop の制御点で実行
   Serial.printf("[Digest] speak latest #%d (%u chars)\n", idx, (unsigned)speech.length());
 }
 
@@ -3492,7 +3581,7 @@ static void append_unread_digest() {
   if (was_empty) g_led_news_color = NEWS_CAT_COLORS[DIGEST_CAT_INDEX];
   if (g_cap_count > 0) g_cap_armed = true;
   g_pending_news_speech = true;
-  digest_mark_read(idx);
+  g_digest_read_pending = idx;  // 第9.27弾: 既読マーク（NVS書き込み）は loop の制御点で実行
   Serial.printf("[Digest] appended unread #%d to automatic speech\n", idx);
 }
 
@@ -3795,6 +3884,7 @@ void handle_voice() {
       TTS_PARMS = TTS_SPEAKER + TTS_SPEAKER_NO;
       uint32_t nvs_handle;
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+        StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
         nvs_set_u8(nvs_handle, "speaker", (uint8_t)n);
         nvs_close(nvs_handle);
       }
@@ -3810,6 +3900,7 @@ void handle_voice() {
       TTS_SPEED_RATE = sx / 100.0f;
       uint32_t nvs_handle;
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+        StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
         nvs_set_u8(nvs_handle, "speed_x100", (uint8_t)sx);
         nvs_close(nvs_handle);
       }
@@ -3873,6 +3964,7 @@ void handle_model() {
       CHAT_MODEL = set;
       uint32_t nvs_handle;
       if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+        StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
         nvs_set_str(nvs_handle, "model", set.c_str());
         nvs_close(nvs_handle);
       }
@@ -3908,6 +4000,7 @@ static void schedule_apply_arg(const char* argName, bool& flag, const char* nvsK
     flag = (v == "on");
     uint32_t nvs_handle;
     if (ESP_OK == nvs_open("setting", NVS_READWRITE, &nvs_handle)) {
+      StorageLedGuard guard;  // 第9.27弾: NVS 書き込みと LED(RMT) の相互排他
       nvs_set_u8(nvs_handle, nvsKey, flag ? 1 : 0);
       nvs_close(nvs_handle);
     }
@@ -4533,6 +4626,10 @@ void ledTask(void *args)
     uint8_t cur_brightness = FastLED.getBrightness();
     if (!prev_valid || cur_brightness != shown_brightness ||
         memcmp(prev_frame, frame, sizeof(frame)) != 0) {
+      // 第9.27弾: show()（RMT送信）をフラッシュ書き込みと相互排他にする。
+      // 書き込み側が StorageLedGuard を保持している間はここで待ち、
+      // 書き込みと RMT 補充割り込みが重ならないことを保証する
+      StorageLedGuard led_guard;
       for (int i = 0; i < SIDE_LED_COUNT; i++) g_side_leds[i] = frame[i];
       FastLED.show();
       memcpy(prev_frame, frame, sizeof(frame));
@@ -5152,6 +5249,7 @@ void setup()
     }
   }
 //  mp3->RegisterStatusCB(StatusCallback, (void*)"mp3");
+  g_storage_led_mutex = xSemaphoreCreateMutex();  // 第9.27弾: フラッシュ書き込みとLED送信の相互排他
   g_decoder_mutex = xSemaphoreCreateMutex();
   if (!g_decoder_mutex || xTaskCreatePinnedToCore(audioDecodeTask, "mp3Decode", 8192,
                                                nullptr, 2, nullptr, 1) != pdPASS) {
@@ -5663,6 +5761,8 @@ static bool shots_valid_name(const String &name) {
 static bool capture_screen(String &out_where, String &out_name) {
   bool use_sd;
   fs::FS *fsys = shots_open(use_sd);
+  // 第9.27弾: SPIFFS への削除/書き込みと LED(RMT) の相互排他（SD 時も無害）
+  StorageLedGuard guard;
   int count, max_index;
   String oldest;
   shots_scan(*fsys, use_sd, count, max_index, oldest);
@@ -5838,7 +5938,11 @@ static void handle_shot_delete() {
   bool use_sd;
   fs::FS *fsys = shots_open(use_sd);
   String path = String(SHOTS_DIR) + "/" + name;
-  bool ok = fsys->exists(path) && fsys->remove(path);
+  bool ok;
+  {
+    StorageLedGuard guard;  // 第9.27弾: SPIFFS 削除と LED(RMT) の相互排他
+    ok = fsys->exists(path) && fsys->remove(path);
+  }
   shots_close(use_sd);
   if (ok) {
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -5946,11 +6050,20 @@ void loop()
                     crumb_snapshot, mode, g_news_seen_dirty ? 1 : 0);
     }
   }
-  // 第9.26弾: 既読ストア書き戻しの保険（本筋は取得系の出口での一括保存。
-  // ダーティーが残っていたらアイドル時に保存する）
-  if (g_news_seen_dirty && !tts_processing() &&
-      speech_text == "" && speech_text_buffer == "") {
-    newsSeenFlush();
+  // 第9.27弾: ストレージ書き込みの制御点。自動系のフラッシュ書き込み
+  // （既読ストアの書き戻し・転送テキストの既読マーク）は、取得・合成・
+  // 再生のどれも動いていないアイドル時にここだけで行う。書き込み自体も
+  // 各保存関数の StorageLedGuard で LED(RMT) と相互排他にしてある。
+  // 第9.26弾までは取得系の出口でも書き戻していたが、発話開始直前で
+  // LED アニメーション（RMT送信中）と重なり得たため集約した。
+  if (!tts_processing() && !audioRunning() &&
+      speech_text == "" && speech_text_buffer == "" && !ble_digest_active()) {
+    if (g_news_seen_dirty) newsSeenFlush();
+    if (g_digest_read_pending >= 0) {
+      int dg_idx = g_digest_read_pending;
+      g_digest_read_pending = -1;
+      digest_mark_read(dg_idx);
+    }
   }
 
   wifi_watchdog();  // 第8弾: Wi-Fi 切断の検出と自動再接続

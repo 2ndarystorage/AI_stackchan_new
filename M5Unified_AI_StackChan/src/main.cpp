@@ -647,6 +647,9 @@ extern AudioGeneratorMP3 *mp3;       // 実体は後方（音声再生まわり�
 String exec_news(bool automatic = false);  // 実体は後方（ニュース読み上げの節）で定義
 static void exec_digest_category();    // 第9.23弾: 転送ニュースの読み上げ（実体は後方）
 static void append_unread_digest();    // 第9.23弾: 自動読み上げへの未読転送テキスト連結（実体は後方）
+String chatGptWithTools(const String& json_string);  // 第9.25弾: Function Calling 対応の会話（実体は後方）
+static void memory_inject_facts();                   // 第9.25弾: 長期記憶をシステムプロンプトへ差し込む（実体は後方）
+static void memory_note_exchange(const String& user_text, const String& asst_text);  // 第9.25弾: 長期記憶の自動抽出キュー（実体は後方）
 static bool ble_digest_active();       // 第9.23弾: BLE 受信モード中か（実体は後方）
 void sw_tone();                        // 実体は後方（音まわり）
 static bool play_dance_video();      // 実体は後方（SST_ChatGPT の直前）で定義。第9弾
@@ -863,7 +866,7 @@ bool init_chat_doc(const char *data)
 }
 
 void handleRoot() {
-  server.send(200, "text/html", "<html><head><meta charset=\"UTF-8\"/></head><body><pre>hello from m5stack!\n&boxdr;&boxh;&boxh;&boxh;&boxdl;\n&boxv;&#729;_&#729;&boxv;\n&boxur;&boxh;&boxh;&boxh;&boxul;</pre><p><a href=\"/mode\">動作モード設定（通常 / BLE転送専用）</a></p></body></html>");
+  server.send(200, "text/html", "<html><head><meta charset=\"UTF-8\"/></head><body><pre>hello from m5stack!\n&boxdr;&boxh;&boxh;&boxh;&boxdl;\n&boxv;&#729;_&#729;&boxv;\n&boxur;&boxh;&boxh;&boxh;&boxul;</pre><p><a href=\"/mode\">動作モード設定（通常 / BLE転送専用）</a></p><p><a href=\"/memory\">長期記憶メモリ（覚えていること）</a></p></body></html>");
 }
 
 void handleNotFound(){
@@ -906,8 +909,9 @@ void handle_speech() {
   server.send(200, "text/plain", String("OK"));
 }
 
-String https_post_json(const char* url, const char* json_string, const char* root_ca) {
+String https_post_json(const char* url, const char* json_string, const char* root_ca, int* out_http_code = nullptr) {
   String payload = "";
+  if (out_http_code) *out_http_code = 0;
   TlsGateGuard tls_guard;
   WiFiClientSecure *client = new WiFiClientSecure;
   if(client) {
@@ -924,6 +928,7 @@ String https_post_json(const char* url, const char* json_string, const char* roo
         https.addHeader("Content-Type", "application/json");
         https.addHeader("Authorization", String("Bearer ") + OPENAI_API_KEY);
         int httpCode = https.POST((uint8_t *)json_string, strlen(json_string));
+        if (out_http_code) *out_http_code = httpCode;
   
         // httpCode will be negative on error
         if (httpCode > 0) {
@@ -1014,6 +1019,7 @@ void handle_chat() {
   Serial.println(InitBuffer);
   init_chat_doc(InitBuffer.c_str());
   applyChatSpeedSettings();
+  memory_inject_facts();  // 第9.25弾: 長期記憶をシステムプロンプトへ追加
   // 質問をチャット履歴に追加
   chatHistory.push_back(text);
    // チャット履歴が最大数を超えた場合、古い質問と回答を削除
@@ -1038,7 +1044,7 @@ void handle_chat() {
   String json_string;
   serializeJson(chat_doc, json_string);
   if(speech_text=="" && speech_text_buffer == "") {
-    response = chatGpt(json_string);
+    response = chatGptWithTools(json_string);
     speech_text = response;
     g_pending_pose = POSE_LAUGH;  // 第9弾: 会話応答の再生中は「笑う」ポーズ
     // 会話応答文も2行字幕の対象にする（発話の再生開始時に表示）
@@ -1071,6 +1077,7 @@ void exec_chatGPT(String text) {
   Serial.println(InitBuffer);
   init_chat_doc(InitBuffer.c_str());
   applyChatSpeedSettings();
+  memory_inject_facts();  // 第9.25弾: 長期記憶をシステムプロンプトへ追加
   // 質問をチャット履歴に追加
   chatHistory.push_back(text);
    // チャット履歴が最大数を超えた場合、古い質問と回答を削除
@@ -1095,7 +1102,7 @@ void exec_chatGPT(String text) {
   String json_string;
   serializeJson(chat_doc, json_string);
   if(speech_text=="" && speech_text_buffer == "") {
-    response = chatGpt(json_string);
+    response = chatGptWithTools(json_string);
     speech_text = response;
     g_pending_pose = POSE_LAUGH;  // 第9弾: 会話応答の再生中は「笑う」ポーズ
     // 会話応答文も2行字幕の対象にする（発話の再生開始時に表示）
@@ -1104,6 +1111,7 @@ void exec_chatGPT(String text) {
     if (g_cap_count > 0) g_cap_armed = true;
     // 返答をチャット履歴に追加
     chatHistory.push_back(response);
+    memory_note_exchange(text, response);  // 第9.25弾: 長期記憶の自動抽出キューへ（発話後にアイドル時実行）
   } else {
     response = "busy";
   }
@@ -2123,14 +2131,13 @@ static int weatherWeekday(const String& dateStr) {
 
 static const char* WEATHER_WDAYS[] = {"日曜日", "月曜日", "火曜日", "水曜日", "木曜日", "金曜日", "土曜日"};
 
-// 天気の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）。
+// 天気の読み上げ文を組み立てる（発話の副作用なし。第9.25弾で Function Calling の
+// get_weather ツールからも使うため、取得＋文生成だけを分離した）
 // dayOffset >= 0: その日（0=今日 1=明日 2=明後日）／ dayOffset < 0: 週間（7日分）
-static String exec_weather_impl(int dayOffset) {
-  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+static String buildWeatherText(int dayOffset) {
   // ニュース取得と同様、TLS の前に TTS 接続ペアの解放を依頼してヒープを回復させる
   g_tts_release_req = true;
   for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
-  captionReset();  // 前回の表示キューが残っていたら破棄する
   String text = "";
   String payload;
   if (fetchWeatherJson(payload)) {
@@ -2175,6 +2182,14 @@ static String exec_weather_impl(int dayOffset) {
                     jerr.c_str(), (unsigned)payload.length(), payload.c_str());
     }
   }
+  return text;
+}
+
+// 天気の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）
+static String exec_weather_impl(int dayOffset) {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  String text = buildWeatherText(dayOffset);
   if (text != "") {
     // 会話応答と同じく、読み上げ文を2行字幕の対象にする
     capBuildFromText(text);
@@ -2412,13 +2427,12 @@ static bool fetchTrainStatus(TrainLineState* lines, int nLines) {
   return ok;
 }
 
-// 運行情報の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）
-static String exec_train() {
-  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+// 運行情報の読み上げ文を組み立てる（発話の副作用なし。第9.25弾で Function Calling の
+// get_train_delays ツールからも使うため、取得＋文生成だけを分離した）
+static String buildTrainText() {
   // ニュース取得と同様、TLS の前に TTS 接続ペアの解放を依頼してヒープを回復させる
   g_tts_release_req = true;
   for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
-  captionReset();  // 前回の表示キューが残っていたら破棄する
   TrainLineState lines[] = {
     {"田園都市線", "田園都市線", TRAIN_ST_NONE, 0, 0, 0},
     {"大井町線",   "大井町線",   TRAIN_ST_NONE, 0, 0, 0},
@@ -2444,6 +2458,14 @@ static String exec_train() {
       text = "田園都市線、大井町線、南武線に遅れはありません。";
     }
   }
+  return text;
+}
+
+// 運行情報の読み上げ文を組み立てて speech_text にセットする（ニュースと同じ発話経路）
+static String exec_train() {
+  if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
+  captionReset();  // 前回の表示キューが残っていたら破棄する
+  String text = buildTrainText();
   if (text != "") {
     // 会話応答と同じく、読み上げ文を2行字幕の対象にする
     capBuildFromText(text);
@@ -2468,6 +2490,701 @@ void handle_train() {
     server.send(200, "text/plain", String("運行情報を取得できませんでした") + diag);
   }
 }
+
+// ==== 第9.25弾: Function Calling ＋ 長期記憶メモリ ====
+// 会話（exec_chatGPT / handle_chat の共通経路）で ChatGPT に tools を渡し、
+// モデルからの tool_calls を本体が実行して結果を返す。実行できるのは
+// タイマー登録・天気・運行情報・ニュース・現在日時・長期記憶への保存。
+// あわせて、会話の内容から「次回以降も役立つ事実」を抽出して長期記憶に
+// 保存し（SD 優先）、次の会話のシステムプロンプトへ差し込む。
+// 既存のキーワード分岐（天気・電車・ニュース）は速い経路として従来どおり
+// チャット前に処理され、ここはその対象外の会話だけが通る。
+
+// ---------- 長期記憶メモリ ----------
+#define MEM_FACTS_PATH "/memory_facts.txt"
+#define MEM_FACTS_MAX 40
+#define MEM_FACTS_BYTES 4096
+#define MEM_FACT_LINE_MAX 200
+
+static std::deque<String> g_mem_facts;
+static bool g_mem_loaded = false;
+static bool g_mem_on_sd = false;
+
+// digest_open と同じ作法（SD 優先・なければ SPIFFS）
+static fs::FS *memfs_open(bool &use_sd) {
+use_sd = false;
+if (SD.begin(GPIO_NUM_4, SPI, 25000000)) {
+use_sd = true;
+return &SD;
+}
+if (!SPIFFS.begin(false)) return nullptr;
+return &SPIFFS;
+}
+static void memfs_close(bool use_sd) { if (use_sd) SD.end();}
+
+// UTF-8 の文字境界を壊さないように最大バイト数で切り詰める
+static String mem_truncate_utf8(const String& s, size_t max_bytes) {
+size_t len = (size_t)s.length();
+if (len <= max_bytes) return s;
+size_t total = 0, i = 0;
+while (i < len) {
+uint8_t b = (uint8_t)s[i];
+size_t cl = (b < 0x80)? 1: ((b & 0xE0) == 0xC0)? 2: ((b & 0xF0) == 0xE0)? 3: ((b & 0xF8) == 0xF0)? 4: 1;
+if (total + cl > max_bytes) break;
+total += cl;
+i += cl;
+}
+return s.substring(0, (unsigned)i);
+}
+
+static void memory_load() {
+if (g_mem_loaded) return;
+g_mem_loaded = true;
+bool use_sd;
+fs::FS *fsys = memfs_open(use_sd);
+if (!fsys) {
+Serial.println("[MEM] load: filesystem open failed");
+return;
+}
+g_mem_on_sd = use_sd;
+if (fsys->exists(MEM_FACTS_PATH)) {
+File f = fsys->open(MEM_FACTS_PATH, "r");
+if (f) {
+while (f.available() && g_mem_facts.size() < MEM_FACTS_MAX) {
+String line = f.readStringUntil('\n');
+line.trim();
+if (line!= "") g_mem_facts.push_back(mem_truncate_utf8(line, MEM_FACT_LINE_MAX));
+}
+f.close();
+}
+}
+memfs_close(use_sd);
+Serial.printf("[MEM] loaded %u fact(s) from %s\n",
+(unsigned)g_mem_facts.size(), use_sd? "SD": "SPIFFS");
+}
+
+static void memory_save() {
+memory_load();
+// 上限（40件・約4KB）を超えたら古い順に捨てる
+while (g_mem_facts.size() > MEM_FACTS_MAX) g_mem_facts.pop_front();
+size_t total = 0;
+for (auto& s: g_mem_facts) total += (size_t)s.length() + 1;
+while (total > MEM_FACTS_BYTES &&!g_mem_facts.empty()) {
+total -= (size_t)g_mem_facts.front().length() + 1;
+g_mem_facts.pop_front();
+}
+bool use_sd;
+fs::FS *fsys = memfs_open(use_sd);
+if (!fsys) {
+Serial.println("[MEM] save: filesystem open failed");
+return;
+}
+g_mem_on_sd = use_sd;
+File f = fsys->open(MEM_FACTS_PATH, "w");
+if (f) {
+for (auto& s: g_mem_facts) {
+f.print(s);
+f.print('\n');
+}
+f.close();
+} else {
+Serial.println("[MEM] save: file open failed");
+}
+memfs_close(use_sd);
+Serial.printf("[MEM] saved %u fact(s) to %s\n",
+(unsigned)g_mem_facts.size(), use_sd? "SD": "SPIFFS");
+}
+
+// 1件追加する。既に同じ内容があれば false（保存済み）を返す
+static bool memory_add_fact(const String& raw) {
+memory_load();
+String fact = raw;
+fact.trim();
+if (fact == "") return false;
+fact = mem_truncate_utf8(fact, MEM_FACT_LINE_MAX);
+for (auto& s: g_mem_facts) {
+if (s == fact) return false;
+}
+g_mem_facts.push_back(fact);
+memory_save();
+return true;
+}
+
+static bool memory_delete_fact(int idx) {
+memory_load();
+if (idx < 0 || idx >= (int)g_mem_facts.size()) return false;
+g_mem_facts.erase(g_mem_facts.begin() + idx);
+memory_save();
+return true;
+}
+
+// init_chat_doc 直後に呼び、保存済みの事実をシステムプロンプトへ差し込む
+static void memory_inject_facts() {
+memory_load();
+if (g_mem_facts.empty()) return;
+String block = "\n\n\n";
+for (auto& s: g_mem_facts) {
+block += "・";
+block += s;
+block += "\n";
+}
+block += "これらを踏まえて自然に会話してください。聞かれたら内容を答えても構いません。";
+JsonArray messages = chat_doc["messages"];
+if (messages.size() > 0) {
+JsonObject first = messages[0];
+if (first["role"] == "system") {
+String cur = first["content"].as<String>();
+first["content"] = cur + block;
+Serial.printf("[MEM] injected %u fact(s) into system prompt\n", (unsigned)g_mem_facts.size());
+return;
+}
+}
+JsonObject sys = messages.createNestedObject();
+if (sys.isNull()) {
+Serial.println("[MEM] inject: chat_doc full, skipped");
+return;
+}
+sys["role"] = "system";
+sys["content"] = block;
+Serial.printf("[MEM] injected %u fact(s) as system message\n", (unsigned)g_mem_facts.size());
+}
+
+// ---------- 長期記憶の自動抽出（会話後・アイドル時に1回だけ） ----------
+static bool g_mem_ext_pending = false;
+static String g_mem_ext_user = "";
+static String g_mem_ext_asst = "";
+
+static void memory_note_exchange(const String& user_text, const String& asst_text) {
+if (user_text == "" || asst_text == "") return;
+// エラー応答やビジー応答は抽出対象にしない
+if (asst_text == "わかりません" || asst_text == "エラーです" ||
+asst_text == "うまくできませんでした" || asst_text == "busy") return;
+g_mem_ext_user = user_text;
+g_mem_ext_asst = asst_text;
+g_mem_ext_pending = true;
+}
+
+static void memory_extract_run() {
+memory_load();
+// ニュース・天気と同じく、TLS の前に TTS 接続ペアの解放を依頼する
+g_tts_release_req = true;
+for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+
+DynamicJsonDocument doc(8192);
+doc["model"] = (CHAT_MODEL!= "")? CHAT_MODEL: String("gpt-4o-mini");
+doc["max_tokens"] = 700;
+doc["temperature"] = 0;
+JsonArray msgs = doc.createNestedArray("messages");
+JsonObject sys = msgs.createNestedObject();
+sys["role"] = "system";
+sys["content"] =
+"あなたは音声アシスタントの長期記憶マネージャです。与えられた『現在の記憶』と『新しい会話』から、"
+"次回以降の会話でも役立つユーザーの事実（好み、名前、家族、仕事、予定、体調、持ち物、決めたこと等）"
+"だけを抽出・統合し、更新後の記憶一覧を返してください。ルール：1件は短い文（40字程度まで、日本語）。"
+"一時的な話題、挨拶、質問そのもの、ニュースや天気の内容は含めない。重複は統合し、矛盾する場合は"
+"新しい会話を優先して書き換える。最大40件。出力はJSON配列（文字列の配列）のみ。"
+"前置き、説明、コードフェンスは禁止。";
+JsonObject usr = msgs.createNestedObject();
+usr["role"] = "user";
+String u = "現在の記憶:\n";
+if (g_mem_facts.empty()) {
+u += "（なし）\n";
+} else {
+for (auto& s: g_mem_facts) {
+u += "・";
+u += s;
+u += "\n";
+}
+}
+u += "\n新しい会話:\nユーザー: " + g_mem_ext_user + "\nアシスタント: " + g_mem_ext_asst +
+"\n\n更新後の記憶一覧をJSON配列で返してください。";
+usr["content"] = u;
+
+String json_string;
+serializeJson(doc, json_string);
+int http_code = 0;
+String ret = https_post_json("https://api.openai.com/v1/chat/completions",
+json_string.c_str(), root_ca_openai, &http_code);
+if (ret == "") {
+Serial.printf("[MEM] extract failed (http=%d)\n", http_code);
+return;
+}
+DynamicJsonDocument rdoc(8192);
+if (deserializeJson(rdoc, ret)) {
+Serial.println("[MEM] extract: response parse failed");
+return;
+}
+const char* content = rdoc["choices"][0]["message"]["content"];
+if (!content) {
+Serial.println("[MEM] extract: no content");
+return;
+}
+String c = content;
+// コードフェンスや前置きが混ざっても、配列部分だけを取り出す
+int b = c.indexOf('[');
+int e = c.lastIndexOf(']');
+if (b < 0 || e <= b) {
+Serial.println("[MEM] extract: no JSON array in response");
+return;
+}
+c = c.substring(b, e + 1);
+DynamicJsonDocument fdoc(6144);
+if (deserializeJson(fdoc, c)) {
+Serial.println("[MEM] extract: array parse failed");
+return;
+}
+JsonArray arr = fdoc.as<JsonArray>();
+if (arr.isNull()) {
+Serial.println("[MEM] extract: not an array");
+return;
+}
+// 検証（配列・文字列のみ・件数・総バイト数）を通った場合だけ書き戻す
+std::deque<String> next;
+size_t total = 0;
+for (JsonVariant v: arr) {
+if (!v.is<const char*>()) continue;
+String s = v.as<String>();
+s.trim();
+if (s == "") continue;
+s = mem_truncate_utf8(s, MEM_FACT_LINE_MAX);
+total += (size_t)s.length() + 1;
+next.push_back(s);
+if (next.size() >= MEM_FACTS_MAX) break;
+}
+if (total > MEM_FACTS_BYTES) {
+Serial.printf("[MEM] extract: result too large (%u bytes), rejected\n", (unsigned)total);
+return;
+}
+g_mem_facts = next;
+memory_save();
+Serial.printf("[MEM] extract ok: %u fact(s)\n", (unsigned)g_mem_facts.size());
+}
+
+// loop から呼ぶ。発話・合成・BLE受信が終わっているアイドル時のみ実行する
+void memory_extract_tick() {
+if (!g_mem_ext_pending) return;
+if (mode < 0 || audioRunning() || speech_text!= "" || speech_text_buffer!= "" ||
+tts_processing() || ble_digest_active()) {
+return; // 空きを待つ（キューしたまま）
+}
+g_mem_ext_pending = false; // 成否にかかわらず1会話につき1回だけ試す
+if (WiFi.status()!= WL_CONNECTED) {
+Serial.println("[MEM] extract skipped (Wi-Fi disconnected)");
+return;
+}
+memory_extract_run();
+}
+
+// ---------- Function Calling: タイマー ----------
+#define FC_TIMER_MAX 4
+#define FC_TIMER_MAX_DEFER_MS (10UL * 60UL * 1000UL)
+
+struct FcTimerSlot {
+bool active = false;
+bool absolute = false; // false: target は発火 millis / true: target は発火 epoch 秒
+uint32_t target = 0;
+uint32_t due_since_ms = 0;
+String message;
+};
+static FcTimerSlot g_fc_timers[FC_TIMER_MAX];
+
+static void fc_timer_speak(const String& msg) {
+captionReset();
+capBuildFromText(msg);
+g_led_news_color = CRGB::White;
+if (g_cap_count > 0) g_cap_armed = true;
+speech_text = msg;
+g_pending_news_speech = true; // ニュースと同じく中央タップで中断可能にする
+}
+
+static void fc_timer_poll(int slot) {
+FcTimerSlot& t = g_fc_timers[slot];
+if (!t.active) return;
+bool due;
+if (t.absolute) {
+due = (time(nullptr) >= (time_t)t.target);
+} else {
+due = ((int32_t)(millis() - t.target) >= 0);
+}
+if (!due) return;
+if (scheduler_ready()) {
+t.active = false;
+Serial.printf("[FC] timer fired slot=%d\n", slot);
+fc_timer_speak(t.message);
+} else {
+// 発話中などは終わるまで待つ（上限を超えたら破棄してログに残す）
+if (t.due_since_ms == 0) t.due_since_ms = millis();
+if (millis() - t.due_since_ms > FC_TIMER_MAX_DEFER_MS) {
+t.active = false;
+Serial.printf("[FC] timer dropped (busy too long) slot=%d\n", slot);
+}
+}
+}
+
+// Scheduler 基盤への単発タスク登録（run_schedule からも発火判定される）
+class ScheduleTimerOnce: public ScheduleBase {
+int slot_;
+public:
+explicit ScheduleTimerOnce(int slot): slot_(slot) { sched_type = SCHED_REMINDER;}
+void run(struct tm now_time) override {
+(void)now_time;
+fc_timer_poll(slot_);
+if (!g_fc_timers[slot_].active) destroy = true;
+}
+};
+
+static int fc_timer_register(bool absolute, uint32_t target, const String& message) {
+for (int i = 0; i < FC_TIMER_MAX; i++) {
+if (g_fc_timers[i].active) continue;
+g_fc_timers[i].active = true;
+g_fc_timers[i].absolute = absolute;
+g_fc_timers[i].target = target;
+g_fc_timers[i].due_since_ms = 0;
+g_fc_timers[i].message = message;
+add_schedule(new ScheduleTimerOnce(i));
+return i;
+}
+return -1;
+}
+
+// loop から呼ぶ。run_schedule は NTP 未同期だと早期 return するため、
+// 相対タイマーはこちらでも判定する（ポーリングは冪等で二重発火しない）
+void fc_timers_tick() {
+for (int i = 0; i < FC_TIMER_MAX; i++) fc_timer_poll(i);
+}
+
+// ---------- Function Calling: ツール実装 ----------
+static String fc_tool_set_timer(JsonObject args) {
+int minutes = args["minutes"] | -1;
+String timestr = args["time"] | "";
+String message = args["message"] | "";
+message.trim();
+if (message == "") message = "タイマーの時間です";
+message = mem_truncate_utf8(message, 120);
+bool has_min = minutes > 0;
+bool has_time = timestr!= "";
+if (has_min && has_time) {
+return "エラー：minutes と time はどちらか一方だけを指定してください。";
+}
+if (!has_min &&!has_time) {
+return "エラー：minutes（何分後）か time（HH:MM）のどちらかを指定してください。";
+}
+if (has_min) {
+if (minutes > 24 * 60) return "エラー：タイマーは24時間以内で指定してください。";
+int slot = fc_timer_register(false, millis() + (uint32_t)minutes * 60000UL, message);
+if (slot < 0) return "エラー：タイマーは同時に4件までです。";
+Serial.printf("[FC] timer set slot=%d in %d min\n", slot, minutes);
+return String(minutes) + "分後にタイマーをセットしました。時間になったら「" + message + "」と読み上げます。";
+}
+// 絶対指定 HH:MM
+if (timestr.length()!= 5 || timestr[2]!= ':' ||
+!isDigit(timestr[0]) ||!isDigit(timestr[1]) ||!isDigit(timestr[3]) ||!isDigit(timestr[4])) {
+return "エラー：時刻は HH:MM 形式（例 07:30）で指定してください。";
+}
+int hh = timestr.substring(0, 2).toInt();
+int mm = timestr.substring(3, 5).toInt();
+if (hh > 23 || mm > 59) return "エラー：時刻が範囲外です。";
+struct tm now_tm;
+if (!getLocalTime(&now_tm)) {
+return "エラー：現在時刻が未同期のため、時刻指定のタイマーは使えません。何分後かの相対指定を使ってください。";
+}
+struct tm tgt = now_tm;
+tgt.tm_hour = hh;
+tgt.tm_min = mm;
+tgt.tm_sec = 0;
+time_t target = mktime(&tgt);
+if (target <= time(nullptr)) target += 24 * 60 * 60; // 過ぎていれば翌日
+int slot = fc_timer_register(true, (uint32_t)target, message);
+if (slot < 0) return "エラー：タイマーは同時に4件までです。";
+Serial.printf("[FC] timer set slot=%d at %02d:%02d\n", slot, hh, mm);
+char buf[192];
+snprintf(buf, sizeof(buf), "%d時%d分にタイマーをセットしました。時間になったら「%s」と読み上げます。",
+hh, mm, message.c_str());
+return String(buf);
+}
+
+static String fc_tool_datetime() {
+struct tm t;
+if (!getLocalTime(&t)) {
+return "現在時刻は未同期です（Wi-Fi接続直後など）。少し経ってから聞いてください。";
+}
+static const char* wday[] = {"日", "月", "火", "水", "木", "金", "土"};
+char buf[128];
+snprintf(buf, sizeof(buf), "%d年%d月%d日（%s曜日）%d時%d分%d秒です。",
+t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, wday[t.tm_wday % 7],
+t.tm_hour, t.tm_min, t.tm_sec);
+return String(buf);
+}
+
+// ニュースをモデルへ返す形（見出し＋説明。鮮度フィルタ・既読スキップ込み）
+static String buildNewsTextForTool() {
+g_tts_release_req = true;
+for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+g_news_nothing_new = false;
+g_news_feed_ok = false;
+g_news_skip_old = 0;
+g_news_skip_seen = 0;
+String dispItems[5];
+String dispTitles[5];
+String dispDescs[5];
+int dispCount = 0;
+String text = fetchNewsText(0, "", dispItems, dispTitles, dispDescs, 5, dispCount);
+if (text == "") {
+String heads[3];
+int n = 0;
+if (fetchGoogleHeadlines("https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja",
+3, heads, n, g_google_top_http_code)) {
+for (int i = 0; i < n; i++) text += heads[i] + "。";
+}
+}
+if (text == "") {
+if (g_news_nothing_new) return "新しいニュースはありません（古い記事と読み上げ済みの記事を除いた結果です）。";
+return "エラー：ニュースを取得できませんでした。";
+}
+return text;
+}
+
+static void fc_execute_tool(const char* name, const String& args_json,
+String& result, int& args_error_count, bool& fatal) {
+fatal = false;
+DynamicJsonDocument adoc(1024);
+DeserializationError aerr = deserializeJson(adoc, args_json);
+if (aerr) {
+args_error_count++;
+Serial.printf("[FC] tool=%s args parse failed (%d)\n", name, args_error_count);
+if (args_error_count >= 2) {
+fatal = true;
+result = "引数エラー";
+return;
+}
+result = "エラー：引数のJSONが不正です。形式を直してもう一度呼び出してください。";
+return;
+}
+JsonObject args = adoc.as<JsonObject>();
+if (!strcmp(name, "set_timer")) {
+result = fc_tool_set_timer(args);
+} else if (!strcmp(name, "get_weather")) {
+int off = args["day_offset"] | 1;
+String text;
+if (off == 7) {
+text = buildWeatherText(-1);
+} else {
+if (off < 0) off = 0;
+if (off > 2) off = 2;
+text = buildWeatherText(off);
+}
+result = (text!= "")? text: String("エラー：天気予報を取得できませんでした。");
+} else if (!strcmp(name, "get_train_delays")) {
+String text = buildTrainText();
+result = (text!= "")? text: String("エラー：運行情報を取得できませんでした。");
+} else if (!strcmp(name, "get_news")) {
+result = buildNewsTextForTool();
+} else if (!strcmp(name, "get_current_datetime")) {
+result = fc_tool_datetime();
+} else if (!strcmp(name, "remember_fact")) {
+String fact = args["fact"] | "";
+fact.trim();
+if (fact == "") {
+result = "エラー：覚える内容が空です。";
+} else if (memory_add_fact(fact)) {
+result = "長期記憶に保存しました：「" + mem_truncate_utf8(fact, MEM_FACT_LINE_MAX) + "」";
+} else {
+result = "すでに覚えています：「" + mem_truncate_utf8(fact, MEM_FACT_LINE_MAX) + "」";
+}
+} else {
+result = "エラー：未知の関数です。";
+}
+Serial.printf("[FC] tool=%s done result_len=%u\n", name, (unsigned)result.length());
+}
+
+// ---------- Function Calling: ツール定義と会話ループ ----------
+static const char FC_TOOLS_JSON[] PROGMEM = R"FCJSON(
+{"tools":[
+{"type":"function","function":{"name":"set_timer","description":"指定した時間後に、メッセージを声で知らせるタイマーをセットします。お知らせ・目覚まし・リマインダーに使います。","parameters":{"type":"object","properties":{"minutes":{"type":"integer","description":"何分後に知らせるか（相対指定）。timeとは同時指定不可"},"time":{"type":"string","description":"知らせる時刻 HH:MM 形式（絶対指定）。minutesとは同時指定不可"},"message":{"type":"string","description":"時間になったら読み上げる文（例：お薬の時間です）"}},"required":["message"]}}},
+{"type":"function","function":{"name":"get_weather","description":"東京の天気予報を取得します。","parameters":{"type":"object","properties":{"day_offset":{"type":"integer","description":"0=今日、1=明日、2=明後日、7=週間予報の要約"}}}}},
+{"type":"function","function":{"name":"get_train_delays","description":"田園都市線・大井町線・南武線の運行情報（遅延・運転見合わせ等）を取得します。","parameters":{"type":"object","properties":{}}}},
+{"type":"function","function":{"name":"get_news","description":"最新のニュース見出しを取得します（古い記事と読み上げ済みの記事は除きます）。","parameters":{"type":"object","properties":{}}}},
+{"type":"function","function":{"name":"get_current_datetime","description":"現在の日付・曜日・時刻を取得します。","parameters":{"type":"object","properties":{}}}},
+{"type":"function","function":{"name":"remember_fact","description":"ユーザーについて次回以降も覚えておくべき事実（好み・名前・予定・決めたこと等）を長期記憶に保存します。ユーザーに『覚えて』と言われたときに使います。","parameters":{"type":"object","properties":{"fact":{"type":"string","description":"覚える事実を短い文で"}},"required":["fact"]}}}
+]}
+)FCJSON";
+
+static DynamicJsonDocument g_fc_tools_doc(4096);
+static bool g_fc_tools_ready = false;
+static void fc_ensure_tools_doc() {
+if (g_fc_tools_ready) return;
+g_fc_tools_ready = true;
+DeserializationError e = deserializeJson(g_fc_tools_doc, FC_TOOLS_JSON);
+if (e) Serial.printf("[FC] tools json parse failed: %s\n", e.c_str());
+}
+
+// tools 付きで ChatGPT を呼び、tool_calls を実行しながら最終応答文を返す。
+// 使い方は chatGpt() と同じ（戻り値は読み上げ文）。
+String chatGptWithTools(const String& json_string) {
+DynamicJsonDocument req(16384);
+if (deserializeJson(req, json_string)) {
+// リクエストを組み直せない場合は従来経路にフォールバック
+Serial.println("[FC] request parse failed; fallback to plain chat");
+return chatGpt(json_string);
+}
+fc_ensure_tools_doc();
+req["tools"] = g_fc_tools_doc["tools"];
+req["tool_choice"] = "auto";
+
+g_led_thinking = true; // 側面LED：応答待ち（紫パルス）
+avatar.setExpression(Expression::Doubt);
+avatar.setSpeechText("考え中…");
+
+String response = "";
+bool tools_enabled = true;
+bool retried_without_tools = false;
+int args_error_count = 0;
+bool done = false;
+for (int round = 0; round < 4 &&!done; round++) {
+String out;
+serializeJson(req, out);
+int http_code = 0;
+uint32_t t0 = millis();
+String ret = https_post_json("https://api.openai.com/v1/chat/completions",
+out.c_str(), root_ca_openai, &http_code);
+Serial.printf("[FC] round=%d http=%d in %lu ms\n", round, http_code,
+(unsigned long)(millis() - t0));
+if (ret == "") {
+if (tools_enabled && http_code >= 400 &&!retried_without_tools) {
+// モデルが tools 非対応（400等）: tools を外して1回だけ再試行する
+req.remove("tools");
+req.remove("tool_choice");
+tools_enabled = false;
+retried_without_tools = true;
+Serial.println("[FC] retry without tools");
+continue;
+}
+response = (http_code < 0)? "わかりません": "エラーです";
+done = true;
+break;
+}
+DynamicJsonDocument resp(8192);
+if (deserializeJson(resp, ret)) {
+Serial.println("[FC] response parse failed");
+response = "エラーです";
+done = true;
+break;
+}
+JsonObject msg = resp["choices"][0]["message"];
+if (msg.isNull()) {
+response = "エラーです";
+done = true;
+break;
+}
+JsonArray calls = msg["tool_calls"];
+if (!calls.isNull() && calls.size() > 0) {
+if (round >= 3) {
+// ツール往復の上限（3回）に達した
+Serial.println("[FC] tool loop limit reached");
+response = "うまくできませんでした";
+done = true;
+break;
+}
+JsonArray messages = req["messages"];
+messages.add(msg); // tool_calls 付きの assistant メッセージを履歴へ（v6 は深コピー）
+for (JsonObject call: calls) {
+const char* cid = call["id"];
+const char* fname = call["function"]["name"];
+String fargs = call["function"]["arguments"].as<String>();
+String result;
+bool fatal = false;
+fc_execute_tool(fname? fname: "", fargs, result, args_error_count, fatal);
+JsonObject toolmsg = messages.createNestedObject();
+toolmsg["role"] = "tool";
+toolmsg["tool_call_id"] = cid? cid: "";
+toolmsg["content"] = result;
+if (fatal) {
+response = "うまくできませんでした";
+done = true;
+break;
+}
+}
+continue;
+}
+const char* content = msg["content"];
+response = content? String(content): "";
+std::replace(response.begin(), response.end(), '\n', ' ');
+if (response == "") response = "わかりません";
+done = true;
+}
+
+avatar.setExpression(Expression::Neutral);
+avatar.setSpeechText("");
+g_led_thinking = false;
+return response;
+}
+
+// ---------- 長期記憶の管理ページ（本体 Web） ----------
+static String mem_html_escape(const String& s) {
+String o = s;
+o.replace("&", "&amp;");
+o.replace("<", "&lt;");
+o.replace(">", "&gt;");
+o.replace("\"", "&quot;");
+return o;
+}
+
+static void handle_memory_page() {
+memory_load();
+String html = String(HEAD) + String("<body><h1>長期記憶メモリ</h1>");
+html += "<p>保存先: " + String(g_mem_on_sd? "SDカード": "SPIFFS") + " ／ " +
+String((unsigned)g_mem_facts.size()) + "件（上限40件・約4KB）</p>";
+if (g_mem_facts.empty()) {
+html += "<p>（まだ何も覚えていません）</p>";
+}
+for (size_t i = 0; i < g_mem_facts.size(); i++) {
+html += "<div>" + mem_html_escape(g_mem_facts[i]) +
+" <form method=\"POST\" action=\"/memory_del\" style=\"display:inline\">"
+"<input type=\"hidden\" name=\"idx\" value=\"" + String((unsigned)i) +
+"\"><button type=\"submit\">削除</button></form></div>";
+}
+html += "<h2>追加</h2><form method=\"POST\" action=\"/memory_add\">"
+"<input type=\"text\" name=\"fact\" size=\"48\">"
+"<button type=\"submit\">追加</button></form>";
+html += "<p><a href=\"/\">本体ホーム</a></p></body></html>";
+server.send(200, "text/html", html);
+}
+
+static void handle_memory_add() {
+if (server.method()!= HTTP_POST) {
+server.send(405, "text/plain", "POST only");
+return;
+}
+String fact = server.arg("fact");
+fact.trim();
+if (fact!= "") memory_add_fact(fact);
+server.sendHeader("Location", "/memory");
+server.send(303, "text/plain", "");
+}
+
+static void handle_memory_del() {
+if (server.method()!= HTTP_POST) {
+server.send(405, "text/plain", "POST only");
+return;
+}
+memory_delete_fact(server.arg("idx").toInt());
+server.sendHeader("Location", "/memory");
+server.send(303, "text/plain", "");
+}
+
+// テスト用: 記憶一覧を JSON で返す
+static void handle_memory_json() {
+memory_load();
+DynamicJsonDocument doc(6144);
+doc["storage"] = g_mem_on_sd? "SD": "SPIFFS";
+JsonArray arr = doc.createNestedArray("facts");
+for (auto& s: g_mem_facts) arr.add(s);
+String out;
+serializeJson(doc, out);
+server.sendHeader("Access-Control-Allow-Origin", "*");
+server.send(200, "application/json", out);
+}
+
 
 // ==== BLE テキスト転送「転送ニュース」（第9.23弾） ====
 // Muse／ChatGPT／Codex が要約したテキスト（ITニュース、GitHub／
@@ -4299,6 +5016,10 @@ void setup()
   server.on("/ble", HTTP_GET, handle_mode);  // Read-only settings; never initialize BLE here.
   server.on("/ble", HTTP_POST, handle_ble);
   server.on("/digest", HTTP_GET, handle_digest);    // 第9.23弾: 転送ニュース読み上げ（テスト用）
+  server.on("/memory", HTTP_GET, handle_memory_page);      // 第9.25弾: 長期記憶の一覧・追加・削除
+  server.on("/memory_add", HTTP_POST, handle_memory_add);  // 第9.25弾
+  server.on("/memory_del", HTTP_POST, handle_memory_del);  // 第9.25弾
+  server.on("/memory_json", HTTP_GET, handle_memory_json); // 第9.25弾: 記憶一覧（テスト用）
   server.on("/schedule", handle_schedule);
   server.on("/apikey_set", HTTP_POST, handle_apikey_set);
   server.on("/role", handle_role);
@@ -5160,6 +5881,8 @@ void loop()
   // で判定し、混雑時の延期・スキップは Scheduler 側で処理する。
   // 定期通知モードとは独立に動作する
   run_schedule();
+  fc_timers_tick();       // 第9.25弾: Function Calling のタイマー判定（相対指定は NTP 未同期でも発火させる）
+  memory_extract_tick();  // 第9.25弾: 長期記憶の自動抽出（アイドル時のみ・1会話1回）
 
   M5.update();
 

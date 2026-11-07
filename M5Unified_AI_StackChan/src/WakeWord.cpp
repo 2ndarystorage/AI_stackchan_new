@@ -6,6 +6,7 @@
 #include <SPIFFS.h>
 
 #include "simplevox.h"
+#include "FlashWriteGuard.h"  // フラッシュ書き込みガード（第9.31弾）
 
 #define base_path "/spiffs"
 #define file_name "/wakeword.bin"
@@ -203,6 +204,12 @@ bool wakeword_regist() // 検出した音声を再生しMFCCを登録及びフ�
   mfcc = mfccEngine.create(rawAudio, length);
   if (mfcc)
   {
+    // 第9.31弾: SPIFFS へのテンプレート保存をフラッシュ書き込みガードで
+    // 囲む。従来はガードの対象外で、保存中のキャッシュ無効化と側面LED
+    // （RMT）送信が重なり、登録中に "Cache disabled" パニックが発生した
+    // （v9.30 実機）。保存は "wb" で開き直すため、前回パニックで中途半端に
+    // 残ったファイルも次回登録でそのまま上書きされる。
+    FlashWriteGuard guard(FXW_WAKEWORD);
     mfccEngine.saveFile(base_path file_name, *mfcc);
     //mode = 1;
     ret = true;

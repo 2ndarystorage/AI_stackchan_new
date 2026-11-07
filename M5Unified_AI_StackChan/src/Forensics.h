@@ -41,6 +41,8 @@ enum FxWriteTag : uint8_t {
   FXW_SCHEDULE = 13,       // /schedule 保存
   FXW_SHOT_SAVE = 14,      // 画面キャプチャ保存（古い分の削除含む）
   FXW_SHOT_DELETE = 15,    // 画面キャプチャ削除
+  FXW_WAKEWORD = 16,       // ウェイクワード登録のテンプレート保存（第9.31弾）
+  FXW_MODE = 17,           // /ble POST の動作モード保存（第9.31弾）
 };
 
 // 通信経路の識別タグ（NetActivityScope の引数）

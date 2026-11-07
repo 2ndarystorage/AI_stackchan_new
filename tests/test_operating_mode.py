@@ -97,6 +97,10 @@ bool audio=false,tts=false,g_mode_switch_pending=false;
 uint32_t g_mode_restart_at=0;
 std::string speech_text,speech_text_buffer;
 bool audioRunning(){return audio;} bool tts_processing(){return tts;}
+// v9.31: handle_ble wraps its NVS save in FlashWriteGuard; offline the guard
+// is a no-op (the mocked NVS layer below still counts the actual writes).
+struct FlashWriteGuard { explicit FlashWriteGuard(int) {} };
+enum { FXW_MODE = 17 };
 struct { template<class... A> void printf(const char*,A...){} } Serial;
 struct {
  std::string intent; int code=0;

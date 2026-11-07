@@ -36,6 +36,7 @@ static bool audioRunning();
 #include "Forensics.h"   // クラッシュ耐性フォレンジック（第9.28弾）
 #include "NetActivity.h" // 通信アクティブ管理／LED 送信ゲート（第9.28弾）
 #include "FlashWriteGuard.h" // フラッシュ書き込みガード（第9.27弾／第9.31弾で共有化）
+#include "SdCardAccess.h" // SD 健全性管理の共有窓口（第9.32弾）
 #include "rootCACertificate.h"
 #include "rootCAgoogle.h"
 #include "rootCANHK.h"
@@ -1600,6 +1601,12 @@ static bool sdBeginCounted() {
   }
   return ok;
 }
+
+// 第9.32弾: SD 健全性管理の共有窓口（SdCardAccess.h）。状態の実体は
+// 上の g_sd_present_once / g_sd_dead のみで、ここは薄いラッパ。
+bool sdAccessBegin() { return sdBeginCounted(); }
+void sdAccessEnd() { SD.end(); }
+bool sdAccessDead() { return g_sd_dead; }
 
 // 既読ストアの保存先（第9.28弾で状態機械化）
 // SEEN_UNDECIDED: 初回ロード時に一度だけ決める / SEEN_SD / SEEN_SPIFFS /
@@ -6374,6 +6381,7 @@ void loop()
       delay(500);
 #endif
     avatar.setSpeechText("ウェイクワード登録開始");
+    Serial.println("[WW] regist: start (BtnB long-press)");  // 第9.32弾: 登録診断ログ
   }
 
   // BtnBを短く押して離したらニュース読み上げ（長押し登録とは競合させない）

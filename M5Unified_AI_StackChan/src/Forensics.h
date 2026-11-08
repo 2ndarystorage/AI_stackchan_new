@@ -43,6 +43,8 @@ enum FxWriteTag : uint8_t {
   FXW_SHOT_DELETE = 15,    // 画面キャプチャ削除
   FXW_WAKEWORD = 16,       // ウェイクワード登録のテンプレート保存（第9.31弾）
   FXW_MODE = 17,           // /ble POST の動作モード保存（第9.31弾）
+  FXW_WW_ENABLE = 18,      // ウェイクワード有効/無効の NVS 保存（第9.34弾）
+  FXW_SCHED_ON = 19,       // 定期通知 ON/OFF の NVS 保存（第9.34弾）
 };
 
 // 通信経路の識別タグ（NetActivityScope の引数）

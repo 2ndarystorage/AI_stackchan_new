@@ -3,6 +3,8 @@
 static bool audioRunning();
 #include <esp_system.h>  // esp_reset_reason（起動時診断、第8弾）
 #include <esp_heap_caps.h>  // 最大連続ブロック計測（メモリ切り分け、第9.6弾）
+#include <esp_core_dump.h>  // コアダンプ保存状態の確認（第9.34弾）
+#include <esp_partition.h>  // coredump パーティションの検索（第9.34弾）
 //#include <FS.h>
 #include <SD.h>
 #include <SPIFFS.h>
@@ -156,6 +158,31 @@ String CHAT_MODEL = "";
 const int CHAT_MAX_TOKENS = 150;
 //---------------------------------------------
 bool wakeword_is_enable = false;
+
+// ==== 第9.34弾: ON/OFF 設定の NVS 永続化ヘルパー ====
+// 書き込みは他の設定保存と同じく FlashWriteGuard 経由（RMT ドレイン＋
+// ストレージ mutex＋フォレンジック記録）。呼び出し側で「値が変わった
+// ときだけ」呼ぶ前提で、無条件に書く（フラッシュ磨耗と書き込み競合の
+// 機会を最小化するため、変更検出は呼び出し側の責務）。
+static void save_bool_setting(const char* key, bool value, uint8_t fx_tag) {
+  FlashWriteGuard guard(fx_tag);
+  nvs_handle_t h;
+  if (ESP_OK == nvs_open("setting", NVS_READWRITE, &h)) {
+    nvs_set_u8(h, key, value ? 1 : 0);
+    nvs_commit(h);
+    nvs_close(h);
+  }
+}
+
+// ウェイクワード有効/無効の変更点は全てここを通す（第9.34弾で永続化）。
+// 値が変わったときだけ NVS "setting"/"ww_enable" へ保存する。
+// mode（待受状態）の遷移は呼び出し側の責務。
+static void wakeword_set_enable(bool enable) {
+  if (wakeword_is_enable == enable) return;
+  wakeword_is_enable = enable;
+  save_bool_setting("ww_enable", enable, FXW_WW_ENABLE);
+  Serial.printf("[WW] enable=%d (saved to NVS)\n", enable ? 1 : 0);
+}
 //---------------------------------------------
 // C++11 multiline string constants are neato...
 static const char HEAD[] PROGMEM = R"KEWL(
@@ -650,7 +677,7 @@ static void display_wake() {
 }
 
 // ==== 定期通知モード（BtnC短押しトグル、5分おきニュース） ====
-// 状態は RAM のみ（再起動で OFF に戻る）
+// 状態は NVS "setting"/"sched_on" に保存され、再起動後も保持される（第9.34弾）
 bool g_periodic_on = false;          // 定期通知モード
 uint32_t g_periodic_next_ms = 0;     // 次回ニュース読み上げの発火時刻
 
@@ -2129,6 +2156,247 @@ static bool fetchGoogleHeadlines(const char* url, int want, String* outTitles, i
 
 // ニュース読み上げ文を組み立てて speech_text にセットする。読み上げ文を返す（全て失敗した場合は空文字）
 // あわせて字幕キュー（見出し＋本文）を構築し、次の発話開始時に表示が始まるよう arm する
+// ==== ニューステキスト表示モード（第9.34弾） ====
+// 画面右下タップで顔表示⇔ニューステキスト表示をトグルする（RAM のみの
+// 状態で、再起動後は顔表示から始まる）。記事データは、取得系
+// （exec_news / exec_news_category / FC の get_news）が最後に取得した
+// 見出し＋本文を newsview_store() で保持したものを使う。
+// 描画は顔合成キャンバス側（KinakoFace.h）が、字幕と同じダブルバッファ
+// 公開方式で「現在ページ」を読むだけにし、描画側に状態を持たせない。
+// 発話（字幕）・設定ダイアログ・カテゴリメニュー表示中は顔側を優先し、
+// テキスト表示を一時的に隠す（モード自体は維持し、終われば自動で戻る）。
+bool g_newsview_open = false;                 // テキスト表示モード中か
+bool g_newsview_show = false;                 // 描画側へ出すか（KinakoFace.h から参照）
+volatile uint8_t g_nv_front = 0;              // 表示中ページバッファ（KinakoFace.h から参照）
+char g_nv_page_buf[2][NV_PAGE_LINES][NV_LINE_BYTES];  // 現在ページの行群（同上）
+char g_nv_head_buf[2][NV_HEAD_BYTES];                 // ページヘッダ（同上）
+
+#define NV_MAX_ITEMS 6        // 保持する記事数（一般最大5＋AI見出しの詰め込み分）
+#define NV_MAX_LINES 128      // 全記事を折り返した行リストの上限
+#define NV_PAGE_MS 4000       // ページ送りの間隔（ms）
+static const float NV_LINE_UNITS = 19.0f;  // 1行の容量（字幕と同じ。全角=1.0/半角=0.5）
+
+static String g_nv_titles[NV_MAX_ITEMS];
+static String g_nv_descs[NV_MAX_ITEMS];
+static int g_nv_count = 0;             // 保持中の記事数（0=未取得）
+static String g_nv_label = "";         // 保持中記事のカテゴリ表示名
+static String g_nv_lines[NV_MAX_LINES];
+static int g_nv_line_count = 0;
+static int g_nv_page = 0;              // 現在のページ（0始まり）
+static int g_nv_page_count = 1;        // 総ページ数
+static uint32_t g_nv_page_next_ms = 0; // 次のページ送り時刻
+static bool g_nv_fetch_pending = false;  // 未取得のままモードに入った際の取得待ち
+
+static void nvPushLine(const String& line) {
+  if (line.length() == 0) return;
+  if (g_nv_line_count < NV_MAX_LINES) g_nv_lines[g_nv_line_count++] = line;
+}
+
+// 字幕の capAddText と同じ折り返し規則（、。！？の直後での改行を優先）で、
+// テキストを行リストへ積む
+static void nvAddText(const String& text) {
+  int n = (int)text.length();
+  int start = 0;
+  float curU = 0;
+  int breakPos = -1;
+  float breakU = 0;
+  int i = 0;
+  while (i < n) {
+    if (text[i] == '\n') {
+      if (i > start) nvPushLine(text.substring(start, i));
+      start = i + 1;
+      curU = 0;
+      breakPos = -1;
+      breakU = 0;
+      i++;
+      continue;
+    }
+    int clen = newsUtf8CharLen((uint8_t)text[i]);
+    if (i + clen > n) clen = 1;
+    float cu = (clen == 1) ? 0.5f : 1.0f;
+    if (curU + cu > NV_LINE_UNITS && i > start) {
+      if (breakPos > start && breakU >= NV_LINE_UNITS * 0.5f) {
+        nvPushLine(text.substring(start, breakPos));
+        start = breakPos;
+        curU -= breakU;
+        breakPos = -1;
+        breakU = 0;
+      } else {
+        nvPushLine(text.substring(start, i));
+        start = i;
+        curU = 0;
+        breakPos = -1;
+        breakU = 0;
+      }
+      continue;
+    }
+    curU += cu;
+    if (clen == 3 && (uint8_t)text[i] == 0xE3 && (uint8_t)text[i + 1] == 0x80 &&
+        ((uint8_t)text[i + 2] == 0x81 || (uint8_t)text[i + 2] == 0x82)) {
+      breakPos = i + clen;  // 、(U+3001) または 。(U+3002) の直後
+      breakU = curU;
+    }
+    if (clen == 3 && (uint8_t)text[i] == 0xEF && (uint8_t)text[i + 1] == 0xBC &&
+        ((uint8_t)text[i + 2] == 0x81 || (uint8_t)text[i + 2] == 0x9F)) {
+      breakPos = i + clen;  // ！(U+FF01) または ？(U+FF1F) の直後
+      breakU = curU;
+    }
+    i += clen;
+  }
+  if (start < n) nvPushLine(text.substring(start, n));
+}
+
+// 現在ページを裏バッファへ組んでから front を切り替える（描画側は front
+// だけを読むため、組み立て途中のページは見えない）
+static void newsview_publish() {
+  uint8_t back = (uint8_t)(g_nv_front ^ 1);
+  if (g_nv_count > 0) {
+    snprintf(g_nv_head_buf[back], NV_HEAD_BYTES, "%s  %d/%d",
+             g_nv_label.c_str(), g_nv_page + 1, g_nv_page_count);
+  } else if (g_nv_fetch_pending) {
+    snprintf(g_nv_head_buf[back], NV_HEAD_BYTES, "ニュース取得中…");
+  } else {
+    snprintf(g_nv_head_buf[back], NV_HEAD_BYTES, "ニュース");
+  }
+  for (int i = 0; i < NV_PAGE_LINES; i++) {
+    const char* src = "";
+    if (g_nv_count > 0) {
+      int li = g_nv_page * NV_PAGE_LINES + i;
+      if (li < g_nv_line_count) src = g_nv_lines[li].c_str();
+    } else if (i == 1) {
+      src = g_nv_fetch_pending ? "しばらくお待ちください" : "表示できるニュースがありません";
+    }
+    strncpy(g_nv_page_buf[back][i], src, NV_LINE_BYTES - 1);
+    g_nv_page_buf[back][i][NV_LINE_BYTES - 1] = '\0';
+  }
+  g_nv_front = back;
+}
+
+// 保持記事から行リストとページ数を組み直す
+static void newsview_rebuild() {
+  g_nv_line_count = 0;
+  for (int i = 0; i < g_nv_count; i++) {
+    nvAddText(String("■") + g_nv_titles[i]);
+    if (g_nv_descs[i] != "") nvAddText(g_nv_descs[i] + "。");
+  }
+  g_nv_page_count = (g_nv_line_count + NV_PAGE_LINES - 1) / NV_PAGE_LINES;
+  if (g_nv_page_count < 1) g_nv_page_count = 1;
+  if (g_nv_page >= g_nv_page_count) g_nv_page = 0;
+  newsview_publish();
+}
+
+// 取得系が新しい記事を得たときに呼ぶ（見出し＋本文の保持を差し替える）。
+// extraTitles は本文なしの見出し追加分（exec_news の AI 見出し用）
+static void newsview_store(const char* label, String* titles, String* descs, int count,
+                           String* extraTitles, int extraCount) {
+  int n = 0;
+  for (int i = 0; i < count && n < NV_MAX_ITEMS; i++) {
+    g_nv_titles[n] = titles[i];
+    g_nv_descs[n] = descs ? descs[i] : "";
+    n++;
+  }
+  for (int i = 0; i < extraCount && n < NV_MAX_ITEMS; i++) {
+    g_nv_titles[n] = extraTitles[i];
+    g_nv_descs[n] = "";
+    n++;
+  }
+  if (n == 0) return;
+  g_nv_count = n;
+  g_nv_label = label;
+  g_nv_fetch_pending = false;
+  newsview_rebuild();
+  Serial.printf("[NV] stored %d articles (label=%s)\n", n, label);
+}
+
+// 未取得のままモードに入った場合の静かな取得（読み上げはしない）。
+// exec_news_category と同じ取得経路・鮮度/既読フィルタを通し、結果を
+// ストアへ入れるだけにする。転送ニュース（カテゴリ5）は RSS が無いため
+// 対象外（取得待ちを解いて「ありません」表示にする）。
+static void newsview_fetch_current() {
+  int cat = g_menu_sel;
+  if (cat < 0 || cat > 4) {
+    g_nv_fetch_pending = false;
+    newsview_publish();
+    return;
+  }
+  const NewsCatDef& c = NEWS_CATS[cat];
+  // exec_news 系と同じく、取得前に TTS 接続ペアの解放を依頼して内蔵ヒープを回復させる
+  g_tts_release_req = true;
+  for (int i = 0; i < 10 && g_tts_release_req; i++) delay(10);
+  g_news_feed_ok = false;
+  g_news_skip_old = 0;
+  g_news_skip_seen = 0;
+  String dispItems[5];
+  String dispTitles[5];
+  String dispDescs[5];
+  int dispCount = 0;
+  String text = "";
+  if (c.nhkCat >= 0) {
+    text = fetchNewsText(c.nhkCat, "", dispItems, dispTitles, dispDescs, 5, dispCount);
+  }
+  if (text == "") {
+    String heads[3];
+    int n = 0;
+    int dummyCode = 0;
+    if (fetchGoogleHeadlines(c.googleUrl, 3, heads, n, dummyCode)) {
+      for (int i = 0; i < n && dispCount < 5; i++) {
+        dispTitles[dispCount] = heads[i];
+        dispDescs[dispCount] = "";
+        dispItems[dispCount++] = heads[i] + "。";
+      }
+      if (dispCount > 0) text = "ok";
+    }
+  }
+  g_nv_fetch_pending = false;
+  if (dispCount > 0) {
+    newsview_store(c.label, dispTitles, dispDescs, dispCount, nullptr, 0);
+  } else {
+    newsview_publish();  // 取得できなかった／新しい記事がなかった → 空表示へ
+  }
+}
+
+// 右下タップのトグル本体。カテゴリメニュー表示中はメニュー側の既存挙動を
+// 優先して何もしない（メニュー表示中に右下は従来も無効だった）。
+// 設定ダイアログ表示中は、呼び出し側（ダイアログ分岐）が先に処理するため
+// ここへは来ない。画面消灯中の初回タップは呼び出し側で復帰専用に消費される
+static void newsview_toggle() {
+  if (g_menu_open) return;
+  if (mode < 0) return;  // ウェイクワード登録中は切り替えない
+  g_newsview_open = !g_newsview_open;
+  sw_tone();
+  if (g_newsview_open) {
+    g_nv_page = 0;
+    g_nv_page_next_ms = millis() + NV_PAGE_MS;
+    if (g_nv_count == 0) g_nv_fetch_pending = true;  // tick が現在カテゴリを取得する
+    newsview_publish();
+    Serial.println("[NV] text view ON");
+  } else {
+    g_newsview_show = false;
+    Serial.println("[NV] text view OFF");
+  }
+}
+
+// loop から毎回呼ぶ：取得待ちの消化・表示抑制の判定・ページ送り
+static void newsview_tick() {
+  if (!g_newsview_open) { g_newsview_show = false; return; }
+  if (g_nv_fetch_pending && mode >= 0 && !tts_processing() && !audioRunning() &&
+      speech_text == "" && speech_text_buffer == "" && !ble_digest_active()) {
+    newsview_fetch_current();  // 内部で publish まで行う（同期取得）
+    g_nv_page_next_ms = millis() + NV_PAGE_MS;
+  }
+  // 発話（字幕）・キャプチャ・設定ダイアログ・メニュー・消灯中は顔側を
+  // 優先し、テキスト表示を一時的に隠す（モード自体は維持する）
+  bool suppress = audioRunning() || speech_text != "" || speech_text_buffer != "" ||
+                  g_cap_active || g_settings_open || g_menu_open || g_display_off;
+  g_newsview_show = !suppress;
+  if (suppress) { g_nv_page_next_ms = millis() + NV_PAGE_MS; return; }  // 送りも止める
+  if (g_nv_page_count > 1 && (int32_t)(millis() - g_nv_page_next_ms) >= 0) {
+    g_nv_page = (g_nv_page + 1) % g_nv_page_count;
+    newsview_publish();
+    g_nv_page_next_ms = millis() + NV_PAGE_MS;
+  }
+}
+
 String exec_news(bool automatic) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return ""; }
   crumb("news");
@@ -2203,6 +2471,8 @@ String exec_news(bool automatic) {
       for (int i = 0; i < aiCount; i++) capAddHeadline(aiHeads[i]);
     }
     capFlushUnit();
+    // 第9.34弾: テキスト表示モード用に、取得した記事（見出し＋本文）を保持する
+    newsview_store("ニュース", dispTitles, dispDescs, dispCount, aiHeads, aiCount);
     g_led_news_color = CRGB::White;  // 通常ニュースのLED色は白
     if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
@@ -2282,6 +2552,8 @@ void exec_news_category(int cat) {
       if (dispDescs[i] != "") capAddText(dispDescs[i] + "。");
     }
     capFlushUnit();
+    // 第9.34弾: テキスト表示モード用に、取得した記事（見出し＋本文）を保持する
+    newsview_store(c.label, dispTitles, dispDescs, dispCount, nullptr, 0);
     g_led_news_color = NEWS_CAT_COLORS[cat];  // カテゴリ色をLEDに使う
     if (g_cap_count > 0) g_cap_armed = true;
     speech_text = text;
@@ -2321,6 +2593,32 @@ void handle_news() {
   } else {
     server.send(200, "text/plain", String("ニュースを取得できませんでした") + diag);
   }
+}
+
+// コアダンプ保存状態の確認（第9.34弾）。プリビルド SDK の設定で
+// 「フラッシュへ ELF 形式・CRC32 チェックサム付き保存」は有効であり、
+// パーティション表にも coredump 領域がある。ここではパーティションの
+// 有無と、保存済みダンプの有無・サイズ（esp_core_dump_image_check 相当）を返す
+void handle_coredump() {
+  String body = "firmware: " STACKCHAN_FIRMWARE_LABEL "\n";
+  const esp_partition_t* part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_COREDUMP, "coredump");
+  if (!part) {
+    body += "coredump partition: NOT FOUND\n";
+  } else {
+    body += "coredump partition: label=" + String(part->label) +
+            " addr=0x" + String(part->address, HEX) +
+            " size=" + String((unsigned)part->size) + "\n";
+    esp_err_t chk = esp_core_dump_image_check();
+    if (chk == ESP_OK) {
+      size_t img_addr = 0, img_size = 0;
+      esp_core_dump_image_get(&img_addr, &img_size);
+      body += "saved dump: YES size=" + String((unsigned)img_size) + " bytes\n";
+    } else {
+      body += "saved dump: none (image check=" + String(esp_err_to_name(chk)) + ")\n";
+    }
+  }
+  server.send(200, "text/plain", body);
 }
 
 // ==== 天気予報（Open-Meteo・第9.20弾） ====
@@ -3259,6 +3557,8 @@ if (text == "") {
 if (g_news_nothing_new) return "新しいニュースはありません（古い記事と読み上げ済みの記事を除いた結果です）。";
 return "エラー：ニュースを取得できませんでした。";
 }
+// 第9.34弾: テキスト表示モード用に、取得した記事（見出し＋本文）を保持する
+if (dispCount > 0) newsview_store("ニュース", dispTitles, dispDescs, dispCount, nullptr, 0);
 // 第9.27弾: 既読の書き戻しは loop の制御点に集約（ここでは dirty フラグのみ）
 return text;
 }
@@ -5214,8 +5514,15 @@ void setup()
       if (ESP_OK == nvs_get_u8(nvs_handle, "s_hourly", &v)) g_sched_hourly = (v != 0);
       if (ESP_OK == nvs_get_u8(nvs_handle, "led", &v)) g_led_enable = (v != 0);
       if (ESP_OK == nvs_get_u8(nvs_handle, "ledlevel", &v) && v <= 5) g_led_level = v;  // 第9.19弾: LED輝度レベル
+      if (ESP_OK == nvs_get_u8(nvs_handle, "sched_on", &v)) g_periodic_on = (v != 0);  // 第9.34弾: 定期通知の復元（未保存なら既定OFF）
       nvs_close(nvs_handle);
     }
+  }
+  // 第9.34弾: 定期通知が ON で復元された場合、初回発火は起動直後の混雑を
+  // 避けて1周期（5分）後に置く（手動トグルの「すぐ1回」とはここだけ違う）
+  if (g_periodic_on) {
+    g_periodic_next_ms = millis() + 300000UL;
+    Serial.println("[SCHED] periodic ON restored from NVS");
   }
 
   M5.Lcd.setTextSize(2);
@@ -5405,6 +5712,7 @@ void setup()
   server.on("/voice", handle_voice);
   server.on("/model", handle_model);
   server.on("/news", handle_news);
+  server.on("/coredump", HTTP_GET, handle_coredump);  // 第9.34弾: コアダンプ保存状態
   server.on("/weather", HTTP_GET, handle_weather);  // 第9.20弾: 天気テスト用（明日の予報）
   server.on("/train", HTTP_GET, handle_train);      // 第9.21弾: 運行情報テスト用（対象3路線）
   server.on("/mode", HTTP_GET, handle_mode);
@@ -5507,6 +5815,29 @@ void setup()
   Serial.println("[BOOT] MP3 decoder task ready (core=1 priority=2 " STACKCHAN_FIRMWARE_LABEL ")");
   wakeword_init();
 
+  // 第9.34弾: ウェイクワード有効/無効を NVS "setting"/"ww_enable" から復元する。
+  // テンプレートが読み込めていない場合は、保存値が有効でも実効は無効のまま
+  // （安全側。テンプレート無しで待受状態に入らない）
+  {
+    uint8_t saved = 0;
+    bool have_saved = false;
+    nvs_handle_t h;
+    if (ESP_OK == nvs_open("setting", NVS_READONLY, &h)) {
+      have_saved = (ESP_OK == nvs_get_u8(h, "ww_enable", &saved));
+      nvs_close(h);
+    }
+    if (have_saved && saved) {
+      if (wakeword_has_template()) {
+        wakeword_is_enable = true;
+        mode = 1;
+        Serial.println("[WW] enable restored: ON (template found); listening");
+      } else {
+        Serial.println("[WW] enable restored: saved ON but no template; stays OFF");
+      }
+    } else {
+      Serial.printf("[WW] enable restored: %s\n", have_saved ? "OFF" : "unset (default OFF)");
+    }
+  }
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動
   FastLED.addLeds<SK6812, SIDE_LED_PIN, GRB>(g_side_leds, SIDE_LED_COUNT);
   FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);  // 第9.19弾: 段階設定（既定レベル4＝従来上限6と同じ）
@@ -5532,7 +5863,7 @@ void setup()
 
 //  M5.Speaker.setVolume(200);
   // タッチレイアウト：右上＝設定ダイアログ（第9.19弾。表示中は四隅が音量/LED調整）、
-  // 左上/左下＝ニュースカテゴリ選択、右下＝単独では無効（旧・音量ダウンは廃止）、
+  // 左上/左下＝ニュースカテゴリ選択、右下＝ニューステキスト表示のトグル（第9.34弾）、
   // 中央＝会話開始(STT)、左右の帯＝独り言切替(box_BtnA)/定期通知トグル(box_BtnC)、
   // 下部中央＝サーボ切替。四隅・中央・帯が重ならないよう配置している
   box_servo.setupBox(130, 185, 60, 50);
@@ -6259,6 +6590,7 @@ static void menu_step(int delta) {
 }
 
 // 定期通知モードの ON/OFF（物理 BtnC 短押し・タッチ box_BtnC 共用）
+// 第9.34弾: トグルのたびに NVS "setting"/"sched_on" へ保存し、再起動後も保持する
 static void toggle_periodic() {
   sw_tone();
   bool speechFree = !audioRunning() && speech_text == "" && speech_text_buffer == "";
@@ -6272,6 +6604,8 @@ static void toggle_periodic() {
     avatar.setSpeechText("定期通知オフ");
     if (speechFree) speech_text = "定期通知モードをオフにしました";
   }
+  save_bool_setting("sched_on", g_periodic_on, FXW_SCHED_ON);
+  Serial.printf("[SCHED] periodic %s (saved to NVS)\n", g_periodic_on ? "ON" : "OFF");
 }
 
 void loop()
@@ -6320,6 +6654,8 @@ void loop()
   pose_prepare_tick();  // 第9.2弾: ポーズ画像の先行デコード（draw タスク外で実施）
 
   battery_icon_tick();  // 第9.6弾: バッテリー残量の定期取得（描画は顔合成側）
+
+  newsview_tick();  // 第9.34弾: ニューステキスト表示（取得待ち・抑制判定・ページ送り）
 
   dance_guard_tick();  // 第9.2弾: 再生後ガードの解除（再生終了から5秒安定したら）
 
@@ -6380,11 +6716,11 @@ void loop()
       if(mode == 0){
         avatar.setSpeechText("ウェイクワード有効");
         mode = 1;
-        wakeword_is_enable = true;
+        wakeword_set_enable(true);   // 第9.34弾: NVS へ保存
       } else {
         avatar.setSpeechText("ウェイクワード無効");
         mode = 0;
-        wakeword_is_enable = false;
+        wakeword_set_enable(false);  // 第9.34弾: NVS へ保存
       }
       delay(1000);
       avatar.setSpeechText("");
@@ -6410,7 +6746,7 @@ void loop()
     audioBeginMicrophone();
     random_time = -1;           //独り言停止
     random_speak = true;
-    wakeword_is_enable = false; //wakeword 無効
+    wakeword_set_enable(false); //wakeword 無効（第9.34弾: NVS へ保存）
     mode = -1;
 #ifdef USE_SERVO
       servo_home = true;
@@ -6495,8 +6831,8 @@ void loop()
       else
       {
       // 右上＝設定ダイアログを開く（第9.19弾）。従来の右上＝音量アップ／
-      // 右下＝音量ダウンのタッチ割り当ては廃止し、右下単独のタップは無効。
-      // 音量・LED輝度の調整はダイアログ表示中の四隅タップで行う
+      // 右下＝音量ダウンのタッチ割り当ては廃止（音量・LED輝度はダイアログ内で
+      // 調整）。右下は第9.34弾でニューステキスト表示のトグルに割り当てた
       if (box_vol_up.contain(t.x, t.y))
       {
         g_center_tap_pending = false;
@@ -6514,6 +6850,14 @@ void loop()
       {
         g_center_tap_pending = false;
         menu_step(+1);
+      }
+      // 右下＝ニューステキスト表示モードのトグル（第9.34弾）。設定ダイアログ
+      // 表示中は右下＝LED輝度＋のまま（上のダイアログ分岐が先に処理する）。
+      // カテゴリメニュー表示中は newsview_toggle 側で無効化する
+      if (box_vol_down.contain(t.x, t.y))
+      {
+        g_center_tap_pending = false;
+        newsview_toggle();
       }
       // 中央タップの優先順位：ニュース読み上げ中＝中断（追加D）／
       // メニュー表示中＝キャンセル／それ以外＝会話開始
@@ -6727,7 +7071,7 @@ void loop()
       delay(1000);
       avatar.setSpeechText("");
       mode = 0;
-      wakeword_is_enable = false;
+      wakeword_set_enable(false);  // 登録直後は無効（第9.34弾: 登録開始時に保存済みのため通常は書き込みなし）
 #ifdef USE_SERVO
       servo_home = false;
 #endif

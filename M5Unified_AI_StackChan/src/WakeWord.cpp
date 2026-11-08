@@ -266,6 +266,11 @@ void wakeword_init(){
   }
 }
 
+// 登録テンプレートが利用可能か（第9.34弾: 起動時の有効設定の復元判定に使う）
+bool wakeword_has_template(){
+  return mfcc != nullptr;
+}
+
 bool wakeword_regist() // 検出した音声を再生しMFCCを登録及びファイルに保存します
 {
   bool ret =false;

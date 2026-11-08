@@ -73,6 +73,8 @@ const char *writeTagName(uint8_t t) {
     case FXW_SHOT_DELETE: return "shot-delete";
     case FXW_WAKEWORD: return "wakeword-save";
     case FXW_MODE: return "mode-save";
+    case FXW_WW_ENABLE: return "ww-enable-save";
+    case FXW_SCHED_ON: return "sched-save";
     default: return "write";
   }
 }

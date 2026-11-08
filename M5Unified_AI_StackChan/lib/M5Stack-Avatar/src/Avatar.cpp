@@ -9,9 +9,16 @@
 // 理由は VENDORED.md を参照。
 #include "../../../src/GfxLock.h"
 
+extern "C" unsigned stackchan_avatar_gfx_lock_revision() {
+  return STACKCHAN_AVATAR_GFX_LOCKED;
+}
+
 #ifndef PI
 #define PI 3.1415926535897932384626433832795
 #endif
+
+// 第9.23弾 (vendored change): バッジ描画は Face::draw 内（合成キャンバス）へ移設。
+// 以前のようなパネルへの直接描画は Avatar::draw から行わない（VENDORED.md 参照）。
 
 namespace m5avatar {
 
@@ -214,9 +221,9 @@ void Avatar::draw() {
 bool Avatar::isDrawing() { return _isDrawing; }
 
 void Avatar::setExpression(Expression expression) {
-  suspend();
+  // Wait for the frame boundary instead of suspending a task holding the SPI lock.
+  GfxLockGuard gfx_guard;
   this->expression = expression;
-  resume();
 }
 
 Expression Avatar::getExpression() {

@@ -61,6 +61,24 @@ extern char g_caption_buf[2][2][128];
 extern volatile int g_batt_pct;        // 残量 %（-1=未取得・アイコンを出さない）
 extern volatile bool g_batt_charging;  // 充電中か
 extern uint8_t g_vol_level;            // 音量レベル（0〜5、第8弾の6段階）
+extern bool g_settings_open;           // 設定ダイアログ表示中（第9.19弾）
+extern uint8_t g_led_level;            // LED輝度レベル（0〜5、第9.19弾）
+extern bool g_menu_open;               // ニュースカテゴリメニュー表示中（第9.26弾）
+extern int g_menu_sel;                 // 選択中のカテゴリ番号（第9.26弾）
+const char *newsCatLabel(int idx);     // カテゴリ表示名（実体は main.cpp、第9.26弾）
+
+// ニューステキスト表示の共有状態（実体は main.cpp、第9.34弾）
+// main.cpp が現在ページの行群を裏バッファへ組んでから front を切り替え、
+// 描画側は front のバッファを読む（字幕と同じダブルバッファ公開方式）。
+// 表示するか否か（発話・ダイアログ等との優先）は main.cpp 側の
+// g_newsview_show が決め、描画側はそれに従うだけにする。
+#define NV_PAGE_LINES 11   // 1ページの本文行数（ヘッダ下に 19px 間隔で 11 行）
+#define NV_LINE_BYTES 128  // 1行のバイト容量（全角19文字相当＋見出し記号分）
+#define NV_HEAD_BYTES 64   // ページヘッダのバイト容量
+extern bool g_newsview_show;           // ニューステキストを表示するか
+extern volatile uint8_t g_nv_front;    // 表示中ページバッファ番号
+extern char g_nv_page_buf[2][NV_PAGE_LINES][NV_LINE_BYTES];
+extern char g_nv_head_buf[2][NV_HEAD_BYTES];
 
 // ポーズ切り替えの共有状態（実体は main.cpp、優先順位管理も main.cpp 側）
 extern volatile int g_pose_state;            // 状態ポーズ (-1=なし)
@@ -225,6 +243,73 @@ class KinakoImage : public Drawable {
       spi->print(line1);
       spi->setCursor(8, 218);
       spi->print(line2);
+    }
+    // 設定ダイアログ（第9.19弾）：右上タップで開き、音量（上段）と
+    // LED輝度（下段）の現在値と四隅タップの操作案内を表示する。
+    // HUD と同じく顔合成のキャンバスへ描くため、閉じれば跡形なく消える。
+    // 操作の割り当て（右上=音量+／左上=音量-／右下=LED+／左下=LED-／中央=閉じる）は main.cpp 側
+    if (g_settings_open) {
+      spi->fillRoundRect(10, 52, 300, 136, 8, 0x000000);
+      spi->drawRoundRect(10, 52, 300, 136, 8, 0xFFFFFF);
+      spi->setFont(&fonts::efontJA_16);
+      spi->setTextSize(1);
+      spi->setTextColor(0xFFFFFF);
+      spi->setCursor(22, 58);
+      spi->print("設定");
+      // 上段：音量（6段階マス）
+      spi->setCursor(22, 84);
+      spi->print("音量");
+      for (int i = 0; i < 6; i++) {
+        spi->fillRect(72 + i * 16, 86, 11, 11, (i < (int)g_vol_level) ? 0xFFFFFFu : 0x404040u);
+      }
+      spi->setCursor(180, 84);
+      spi->print("左上-/右上+");
+      // 下段：LED輝度（6段階マス）
+      spi->setCursor(22, 124);
+      spi->print("LED");
+      for (int i = 0; i < 6; i++) {
+        spi->fillRect(72 + i * 16, 126, 11, 11, (i < (int)g_led_level) ? 0xFFFFFFu : 0x404040u);
+      }
+      spi->setCursor(180, 124);
+      spi->print("左下-/右下+");
+      spi->setCursor(22, 162);
+      spi->print("閉じる: 中央タップ");
+    }
+    // ニュースカテゴリメニュー（第9.26弾）：従来は loop から M5.Lcd へ直接
+    // 描画しており、顔スプライトの毎フレーム転写に上書きされて点滅していた
+    // （第9.23弾で直した版数バッジと同じ病型）。設定ダイアログと同じく、
+    // 顔合成のキャンバスへ描くことで毎フレーム一貫して表示される。
+    // 位置・並びは従来の直接描画版と同じ（画面左側に6カテゴリを縦並び）。
+    if (g_menu_open) {
+      spi->fillRect(0, 76, 176, 118, 0x0000);
+      spi->setFont(&fonts::efontJA_16);
+      spi->setTextSize(1);
+      spi->setTextColor(0xFFFFFF);
+      for (int i = 0; i < 6; i++) {
+        spi->setCursor(4, 79 + i * 19);
+        spi->print((i == g_menu_sel) ? "▶ " : "  ");
+        spi->print(newsCatLabel(i));
+      }
+    }
+    // ニューステキスト表示（第9.34弾）：右下タップで切り替える読み物モード。
+    // 顔写真の全面に不透明パネルを出し、ヘッダ（カテゴリ名とページ番号）と
+    // 記事テキストを表示する。内容は main.cpp が公開した現在ページを読む
+    // だけで、描画側は状態を持たない。発話（字幕）・設定ダイアログ・
+    // メニューとの優先は main.cpp 側の g_newsview_show が決める（競合時は
+    // こちらが隠れ、顔＋字幕が通常どおり表示される）。
+    if (g_newsview_show) {
+      uint8_t f = g_nv_front;
+      spi->fillRect(0, 0, 320, 240, 0x0000);
+      spi->setFont(&fonts::efontJA_16);
+      spi->setTextSize(1);
+      spi->setTextColor(0xFFFFFF);
+      spi->setCursor(8, 4);
+      spi->print(g_nv_head_buf[f]);
+      spi->drawLine(0, 25, 319, 25, 0xFFFFFF);
+      for (int i = 0; i < NV_PAGE_LINES; i++) {
+        spi->setCursor(8, 32 + i * 19);
+        spi->print(g_nv_page_buf[f][i]);
+      }
     }
   }
 };

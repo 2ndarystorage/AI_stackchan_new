@@ -15,10 +15,18 @@ typedef std::string String;
 #endif  // ARDUINO
 
 const int16_t TEXT_HEIGHT = 8;
-const int16_t TEXT_SIZE = 2;
+// 第9.19弾（ベンダリング変更3）: 吹き出し内の文字を小さくした（2 → 1.5、0.75倍。
+// 既定の吹き出しフォント efontJA_16 で約32px相当 → 約24px相当になる。
+// 顔合成側の字幕フォントは変更していない）
+const float TEXT_SIZE = 1.5f;
 const int16_t MIN_WIDTH = 40;
 const int cx = 240;
-const int cy = 220;
+// 第9.19弾（ベンダリング変更3）: 吹き出しを cy=220 → 170 へ 50px 上へ移動した。
+// 顔合成（KinakoFace）が画面下部に描く2行字幕のパネル（y196〜240、字形は
+// y200 始まり）と白い吹き出しが重なっていたため。移動後の吹き出し下端は
+// cy + (TEXT_HEIGHT*TEXT_SIZE*2+2) = 170+26 = 196 で字幕パネルの上端に一致し、
+// 字幕の字形にはかからない
+const int cy = 170;
 
 namespace m5avatar {
 class Balloon final : public Drawable {

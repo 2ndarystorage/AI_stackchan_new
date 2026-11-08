@@ -1099,6 +1099,34 @@ void applyChatSpeedSettings() {
   if (chat_doc["max_tokens"].isNull()) chat_doc["max_tokens"] = CHAT_MAX_TOKENS;
 }
 
+// 第9.33弾: 会話 doc の初期化（handle_chat / exec_chatGPT 共通）。
+// InitBuffer が空、または解釈に失敗した場合は組み込みデフォルトで
+// 初期化し直す。従来は data.json が無い環境で InitBuffer が空のまま
+// init_chat_doc("") が失敗し、ArduinoJson の仕様で chat_doc が事前に
+// 消去されるため、会話リクエストの本文が {"max_tokens":150} だけに
+// なって OpenAI に 400 で弾かれていた。
+static void load_chat_doc_or_default() {
+  if (InitBuffer.length() > 0 && init_chat_doc(InitBuffer.c_str())) return;
+  Serial.println("[CHAT] InitBuffer empty/invalid; using built-in default doc");
+  init_chat_doc(json_ChatString.c_str());
+}
+
+// 第9.33弾: 会話 doc の形の保証（履歴追加・送信の前に呼ぶ）。
+// model が文字列でない／messages が配列でない doc は OpenAI 側で
+// 400 になるため、欠けていれば補う。model の補完は /model ページの
+// 上書き（CHAT_MODEL）を優先し、無ければ既定モデルにする
+// （applyChatSpeedSettings が先に CHAT_MODEL を反映するため競合しない）。
+// messages を実在する配列にすることで、後段の履歴追加ループや
+// memory_inject_facts が null 配列に対して無言で失敗しなくなる。
+static void ensure_chat_request_shape() {
+  if (!chat_doc["model"].is<const char*>()) {
+    chat_doc["model"] = (CHAT_MODEL != "") ? CHAT_MODEL : "gpt-4o-mini";
+  }
+  if (!chat_doc["messages"].is<JsonArray>()) {
+    chat_doc.createNestedArray("messages");
+  }
+}
+
 void handle_chat() {
   captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する
   static String response = "";
@@ -1108,9 +1136,9 @@ void handle_chat() {
   if(speaker != "") {
     TTS_PARMS = TTS_SPEAKER + speaker;
   }
-  Serial.println(InitBuffer);
-  init_chat_doc(InitBuffer.c_str());
+  load_chat_doc_or_default();  // 第9.33弾: 空/不正な InitBuffer のときはデフォルトで初期化
   applyChatSpeedSettings();
+  ensure_chat_request_shape();  // 第9.33弾: model/messages の存在を保証
   memory_inject_facts();  // 第9.25弾: 長期記憶をシステムプロンプトへ追加
   // 質問をチャット履歴に追加
   chatHistory.push_back(text);
@@ -1156,6 +1184,7 @@ void handle_chat() {
   //   Serial.print(i);
   //   Serial.println("= "+chatHistory[i]);
   // }
+  json_string = "";  // 第9.33弾: serializeJsonPretty は String へ追記するため、先に空にして実物どおり表示する
   serializeJsonPretty(chat_doc, json_string);
   Serial.println("====================");
   Serial.println(json_string);
@@ -1167,9 +1196,9 @@ void exec_chatGPT(String text) {
   crumb("chat");
   captionReset();  // 通常会話が始まるのでニュース表示キューは破棄する
   static String response = "";
-  Serial.println(InitBuffer);
-  init_chat_doc(InitBuffer.c_str());
+  load_chat_doc_or_default();  // 第9.33弾: 空/不正な InitBuffer のときはデフォルトで初期化
   applyChatSpeedSettings();
+  ensure_chat_request_shape();  // 第9.33弾: model/messages の存在を保証
   memory_inject_facts();  // 第9.25弾: 長期記憶をシステムプロンプトへ追加
   // 質問をチャット履歴に追加
   chatHistory.push_back(text);
@@ -1215,6 +1244,7 @@ void exec_chatGPT(String text) {
   //   Serial.print(i);
   //   Serial.println("= "+chatHistory[i]);
   // }
+  json_string = "";  // 第9.33弾: serializeJsonPretty は String へ追記するため、先に空にして実物どおり表示する
   serializeJsonPretty(chat_doc, json_string);
   Serial.println("====================");
   Serial.println(json_string);
@@ -5413,8 +5443,6 @@ void setup()
         Serial.printf("[BOOT] data.json: parse failed (%s); using defaults\n", error.c_str());
         init_chat_doc(json_ChatString.c_str());
       }
-      serializeJson(chat_doc, InitBuffer);
-      Role_JSON = InitBuffer;
     } else {
       if(file) file.close();
       init_chat_doc(json_ChatString.c_str());
@@ -5422,6 +5450,14 @@ void setup()
   } else {
     Serial.println("An Error has occurred while mounting SPIFFS");
   }
+  // 第9.33弾: どの分岐でも chat_doc の内容が InitBuffer に入っている
+  // ことを保証する。従来は data.json が存在する分岐でしか格納されず、
+  // ファイルが無いと InitBuffer が空のままになり、会話開始時の
+  // init_chat_doc("") が chat_doc を消去して会話リクエストが空に
+  // なっていた（serialize は String へ追記するため先に空にする）。
+  InitBuffer = "";
+  serializeJson(chat_doc, InitBuffer);
+  Role_JSON = InitBuffer;
 
   server.begin();
   Serial.println("HTTP server started");

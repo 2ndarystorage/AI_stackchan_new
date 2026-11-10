@@ -14,20 +14,6 @@
 typedef std::string String;
 #endif  // ARDUINO
 
-const int16_t TEXT_HEIGHT = 8;
-// 第9.19弾（ベンダリング変更3）: 吹き出し内の文字を小さくした（2 → 1.5、0.75倍。
-// 既定の吹き出しフォント efontJA_16 で約32px相当 → 約24px相当になる。
-// 顔合成側の字幕フォントは変更していない）
-const float TEXT_SIZE = 1.5f;
-const int16_t MIN_WIDTH = 40;
-const int cx = 240;
-// 第9.19弾（ベンダリング変更3）: 吹き出しを cy=220 → 170 へ 50px 上へ移動した。
-// 顔合成（KinakoFace）が画面下部に描く2行字幕のパネル（y196〜240、字形は
-// y200 始まり）と白い吹き出しが重なっていたため。移動後の吹き出し下端は
-// cy + (TEXT_HEIGHT*TEXT_SIZE*2+2) = 170+26 = 196 で字幕パネルの上端に一致し、
-// 字幕の字形にはかからない
-const int cy = 170;
-
 namespace m5avatar {
 class Balloon final : public Drawable {
  public:
@@ -46,23 +32,24 @@ class Balloon final : public Drawable {
     ColorPalette* cp = drawContext->getColorPalette();
     uint16_t primaryColor = cp->get(COLOR_BALLOON_FOREGROUND);
     uint16_t backgroundColor = cp->get(COLOR_BALLOON_BACKGROUND);
-    M5.Lcd.setTextSize(TEXT_SIZE);
-    M5.Lcd.setTextDatum(MC_DATUM);
-    spi->setTextSize(TEXT_SIZE);
+    // Keep the anchor above the captions; shrink the text, body and tail to 80%.
+    constexpr float textSize = 1.2f;  // 1.5 * 0.8
+    constexpr int cx = 220;
+    constexpr int cy = 170;
+    constexpr int ry = static_cast<int>(24 * 0.8f + 0.5f);
+    const auto style = spi->getTextStyle();
+    spi->setTextSize(textSize);
     spi->setTextColor(primaryColor, backgroundColor);
     spi->setTextDatum(MC_DATUM);
-    M5.Lcd.setFont(font);
-    int textWidth = M5.Lcd.textWidth(text.c_str());
-    int textHeight = TEXT_HEIGHT * TEXT_SIZE;
-    spi->fillEllipse(cx - 20, cy,textWidth + 2, textHeight * 2 + 2,
-                     primaryColor);
-    spi->fillTriangle(cx - 62, cy - 42, cx - 8, cy - 10, cx - 41, cy - 8,
+    const int textWidth = spi->textWidth(text.c_str(), font);
+    spi->fillEllipse(cx, cy, textWidth + 2, ry + 2, primaryColor);
+    spi->fillTriangle(cx - 34, cy - 34, cx + 10, cy - 8, cx - 17, cy - 6,
                       primaryColor);
-    spi->fillEllipse(cx - 20, cy, textWidth, textHeight * 2,
-                     backgroundColor);
-    spi->fillTriangle(cx - 60, cy - 40, cx - 10, cy - 10, cx - 40, cy - 10,
+    spi->fillEllipse(cx, cy, textWidth, ry, backgroundColor);
+    spi->fillTriangle(cx - 32, cy - 32, cx + 8, cy - 8, cx - 16, cy - 8,
                       backgroundColor);
-    spi->drawString(text.c_str(), cx - textWidth / 6 - 15, cy, font);  // Continue printing from new x position
+    spi->drawString(text.c_str(), cx - textWidth / 6 + 4, cy, font);
+    spi->setTextStyle(style);
   }
 };
 

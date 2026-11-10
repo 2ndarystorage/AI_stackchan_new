@@ -26,7 +26,7 @@ enum FxKind : uint8_t {
 // フラッシュ書き込み箇所の識別タグ（FlashWriteGuard の引数）
 enum FxWriteTag : uint8_t {
   FXW_NONE = 0,
-  FXW_LED_LEVEL = 1,     // applyLedLevel の NVS 保存
+  FXW_LED_LEVEL = 1,     // saveLedLevel の NVS 保存
   FXW_VOL_LEVEL = 2,     // applyVolLevel の NVS 保存
   FXW_APIKEY = 3,        // /apikey_set の NVS 保存
   FXW_DATA_JSON = 4,     // save_json（/data.json の SPIFFS 書き込み）

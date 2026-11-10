@@ -44,6 +44,7 @@
 #define KINAKO_FACE_H_
 
 #include <Avatar.h>
+#include <atomic>
 #include <string.h>
 #include "kinako_img.h"
 #include "pose_img.h"
@@ -61,11 +62,12 @@ extern char g_caption_buf[2][2][128];
 extern volatile int g_batt_pct;        // 残量 %（-1=未取得・アイコンを出さない）
 extern volatile bool g_batt_charging;  // 充電中か
 extern uint8_t g_vol_level;            // 音量レベル（0〜5、第8弾の6段階）
-extern bool g_settings_open;           // 設定ダイアログ表示中（第9.19弾）
-extern uint8_t g_led_level;            // LED輝度レベル（0〜5、第9.19弾）
+extern std::atomic<bool> g_settings_open;  // 設定ダイアログ表示中
+extern std::atomic<uint8_t> g_led_level;   // LED輝度レベル（0〜5）
 extern bool g_menu_open;               // ニュースカテゴリメニュー表示中（第9.26弾）
 extern int g_menu_sel;                 // 選択中のカテゴリ番号（第9.26弾）
-const char *newsCatLabel(int idx);     // カテゴリ表示名（実体は main.cpp、第9.26弾）
+constexpr int NEWS_MENU_ITEM_COUNT = 6;
+const char *newsMenuLabel(int idx);
 
 // ニューステキスト表示の共有状態（実体は main.cpp、第9.34弾）
 // main.cpp が現在ページの行群を裏バッファへ組んでから front を切り替え、
@@ -267,8 +269,9 @@ class KinakoImage : public Drawable {
       // 下段：LED輝度（6段階マス）
       spi->setCursor(22, 124);
       spi->print("LED");
+      const int ledLevel = g_led_level.load();
       for (int i = 0; i < 6; i++) {
-        spi->fillRect(72 + i * 16, 126, 11, 11, (i < (int)g_led_level) ? 0xFFFFFFu : 0x404040u);
+        spi->fillRect(72 + i * 16, 126, 11, 11, (i < ledLevel) ? 0xFFFFFFu : 0x404040u);
       }
       spi->setCursor(180, 124);
       spi->print("左下-/右下+");
@@ -279,16 +282,22 @@ class KinakoImage : public Drawable {
     // 描画しており、顔スプライトの毎フレーム転写に上書きされて点滅していた
     // （第9.23弾で直した版数バッジと同じ病型）。設定ダイアログと同じく、
     // 顔合成のキャンバスへ描くことで毎フレーム一貫して表示される。
-    // 位置・並びは従来の直接描画版と同じ（画面左側に6カテゴリを縦並び）。
+    // 左上の操作位置を指すしっぽ付きの枠。字幕領域 (y >= 196) は空ける。
     if (g_menu_open) {
-      spi->fillRect(0, 76, 176, 118, 0x0000);
+      spi->fillRoundRect(6, 72, 176, 122, 9, 0x000000);
+      spi->drawRoundRect(6, 72, 176, 122, 9, 0xFFFFFF);
+      spi->fillTriangle(13, 61, 20, 73, 41, 73, 0xFFFFFF);
+      spi->fillTriangle(15, 64, 21, 74, 38, 74, 0x000000);
       spi->setFont(&fonts::efontJA_16);
       spi->setTextSize(1);
       spi->setTextColor(0xFFFFFF);
-      for (int i = 0; i < 6; i++) {
-        spi->setCursor(4, 79 + i * 19);
-        spi->print((i == g_menu_sel) ? "▶ " : "  ");
-        spi->print(newsCatLabel(i));
+      for (int i = 0; i < NEWS_MENU_ITEM_COUNT; i++) {
+        const int y = 79 + i * 19;
+        if (i == g_menu_sel) {
+          spi->fillTriangle(13, y + 4, 13, y + 12, 20, y + 8, 0xFFFFFF);
+        }
+        spi->setCursor(26, y);
+        spi->print(newsMenuLabel(i));
       }
     }
     // ニューステキスト表示（第9.34弾）：右下タップで切り替える読み物モード。

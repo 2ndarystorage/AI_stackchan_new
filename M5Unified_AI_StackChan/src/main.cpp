@@ -546,17 +546,14 @@ static const uint8_t LED_LEVEL_VALUES[6] = {0, 1, 2, 4, 6, 12};
 // 実体の所在はそちらを参照。ここでは従来どおり
 // FlashWriteGuard guard(FXW_...) の形で使う。
 
-uint8_t g_led_level = 4;             // LED輝度レベル（0〜5、既定4。KinakoFace.h から参照）
-static void applyLedLevel(bool save) {
-  FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);
-  if (save) {
-    FlashWriteGuard guard(FXW_LED_LEVEL);  // NVS 書き込み（第9.28弾: RMT アイドル保証＋記録）
-    nvs_handle_t h;
-    if (nvs_open("setting", NVS_READWRITE, &h) == ESP_OK) {
-      nvs_set_u8(h, "ledlevel", g_led_level);
-      nvs_commit(h);
-      nvs_close(h);
-    }
+std::atomic<uint8_t> g_led_level{4};  // Shared by touch input, display and LED task.
+static void saveLedLevel(uint8_t level) {
+  FlashWriteGuard guard(FXW_LED_LEVEL);
+  nvs_handle_t h;
+  if (nvs_open("setting", NVS_READWRITE, &h) == ESP_OK) {
+    nvs_set_u8(h, "ledlevel", level);
+    nvs_commit(h);
+    nvs_close(h);
   }
 }
 bool g_led_listening = false;        // 録音中（青）
@@ -614,26 +611,29 @@ struct NewsCatDef {
   int nhkCat;             // NHK RSS のカテゴリ番号（-1 = NHKなし）
   const char* googleUrl;  // フォールバック／単独取得用の Google ニュース RSS
 };
-static const NewsCatDef NEWS_CATS[6] = {
-  {"トピックス",   "今日のニュースです。",     0,  "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"},
-  {"AIニュース",   "AIニュースです。",        -1, "https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja"},
+static const NewsCatDef NEWS_CATS[] = {
+  {"一般ニュース", "一般ニュースです。",     0,  "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"},
+  {"AI関連ニュース", "AI関連ニュースです。",        -1, "https://news.google.com/rss/search?q=AI&hl=ja&gl=JP&ceid=JP:ja"},
   {"芸能ニュース", "芸能ニュースです。",       6,  "https://news.google.com/rss/search?q=%E8%8A%B8%E8%83%BD&hl=ja&gl=JP&ceid=JP:ja"},
-  {"テック",       "テックニュースです。",    -1, "https://news.google.com/rss/search?q=%E3%83%86%E3%82%AF%E3%83%8E%E3%83%AD%E3%82%B8%E3%83%BC&hl=ja&gl=JP&ceid=JP:ja"},
+  {"経済ニュース", "経済ニュースです。",    -1, "https://news.google.com/rss/search?q=%E7%B5%8C%E6%B8%88&hl=ja&gl=JP&ceid=JP:ja"},
   {"その他",       "その他のニュースです。",   1,  "https://news.google.com/rss/search?q=%E7%A4%BE%E4%BC%9A&hl=ja&gl=JP&ceid=JP:ja"},
-  // 第9.23弾: BLE で転送されたテキスト（exec_news_category で特別処理。nhkCat=-2 が目印）
-  {"転送ニュース", "転送ニュースです。",      -2, ""},
 };
-// カテゴリ表示名のアクセサ（KinakoFace.h のメニュー合成描画から使う、第9.26弾）
-const char *newsCatLabel(int idx) {
-  if (idx < 0 || idx > 5) return "";
-  return NEWS_CATS[idx].label;
+static constexpr int NEWS_CAT_COUNT = sizeof(NEWS_CATS) / sizeof(NEWS_CATS[0]);
+static constexpr int MENU_SETTINGS_INDEX = NEWS_CAT_COUNT;
+static constexpr int MENU_NEWS_LIMIT = 5;
+static_assert(NEWS_MENU_ITEM_COUNT == NEWS_CAT_COUNT + 1, "Menu includes one settings entry");
+const char *newsMenuLabel(int idx) {
+  if (idx == MENU_SETTINGS_INDEX) return "設定";
+  return idx >= 0 && idx < NEWS_CAT_COUNT ? NEWS_CATS[idx].label : "";
 }
-// カテゴリごとの側面LED色（トピックス=白、AI=水色、芸能=ピンク、テック=緑、その他=黄、転送=紫）
-static const CRGB NEWS_CAT_COLORS[6] = {
-  CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0), CRGB(170, 90, 255),
+// カテゴリごとの側面LED色（一般=白、AI=水色、芸能=ピンク、経済=緑、その他=黄）
+static const CRGB NEWS_CAT_COLORS[NEWS_CAT_COUNT] = {
+  CRGB::White, CRGB(0, 180, 220), CRGB(255, 80, 150), CRGB(0, 200, 80), CRGB(240, 200, 0),
 };
-bool g_menu_open = false;        // カテゴリ選択メニュー表示中
-int g_menu_sel = 0;              // 選択中のカテゴリ（0〜4）
+static const CRGB DIGEST_LED_COLOR(170, 90, 255);
+bool g_menu_open = false;
+int g_menu_sel = 0;
+static int g_last_news_cat = 0;
 uint32_t g_menu_deadline = 0;    // 最後のタップから約2.5秒後に確定する時刻
 
 // ==== 画面消灯・設定ダイアログ（第9.19弾） ====
@@ -641,7 +641,7 @@ uint32_t g_menu_deadline = 0;    // 最後のタップから約2.5秒後に確�
 #define CENTER_TAP_WINDOW_MS 300         // 中央ダブルタップの判定窓（ms）。シングルタップ（会話開始）の発火はこの分だけ遅れる
 #define BTNC_TAP_WINDOW_MS 300           // BtnC ダブルタップの判定窓（ms）。短押し（定期通知トグル）の発火はこの分だけ遅れる
 #define SETTINGS_DIALOG_TIMEOUT_MS 5000  // 設定ダイアログの無操作自動クローズ（ms）
-bool g_settings_open = false;            // 設定ダイアログ表示中（KinakoFace.h から参照）
+std::atomic<bool> g_settings_open{false};  // Shared by touch input, display and LED task.
 uint32_t g_settings_deadline = 0;        // ダイアログの自動クローズ時刻
 static bool g_display_off = false;       // 画面が消灯中か
 static uint32_t g_last_activity_ms = 0;  // 最終操作時刻（タッチ/物理ボタン/発話開始で更新）
@@ -649,6 +649,13 @@ static bool g_center_tap_pending = false;  // 中央シングルタップの発�
 static uint32_t g_center_tap_ms = 0;       // 中央タップを受け付けた時刻
 
 static void note_activity() { g_last_activity_ms = millis(); }
+
+static void open_settings_dialog() {
+  g_center_tap_pending = false;
+  g_menu_open = false;
+  g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
+  g_settings_open = true;
+}
 
 // 画面を消灯する。描画タスクと同じ GfxLock の中でパネルを操作し、描画と競合させない
 static void display_sleep() {
@@ -699,7 +706,6 @@ static volatile const char *g_crumb = "boot";
 static inline void crumb(const char *section) { g_crumb = section; }
 
 String exec_news(bool automatic = false);  // 実体は後方（ニュース読み上げの節）で定義
-static void exec_digest_category();    // 第9.23弾: 転送ニュースの読み上げ（実体は後方）
 static void append_unread_digest();    // 第9.23弾: 自動読み上げへの未読転送テキスト連結（実体は後方）
 String chatGptWithTools(const String& json_string);  // 第9.25弾: Function Calling 対応の会話（実体は後方）
 static void memory_inject_facts();                   // 第9.25弾: 長期記憶をシステムプロンプトへ差し込む（実体は後方）
@@ -1924,10 +1930,10 @@ static String fetchNhkRssBody(int nhkCat) {
   return payload;
 }
 
-// NHKニュースRSS（カテゴリ nhkCat）を取得し、先頭3件を読み上げ用テキストにして返す。失敗時は空文字
+// NHKニュースRSS（カテゴリ nhkCat）を取得し、最大 maxArticles 件を読み上げ用テキストにして返す。失敗時は空文字
 // dispItems には表示用に「見出し＋説明」を1件ずつ格納する（吹き出し表示キュー構築用）
 // intro は読み上げ文の導入（例「今日のニュースです。」）
-String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* dispTitles, String* dispDescs, int maxDispItems, int& dispCount) {
+String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* dispTitles, String* dispDescs, int maxDispItems, int& dispCount, int maxArticles = 3) {
   dispCount = 0;
   String payload = fetchNhkRssBody(nhkCat);
   if (payload == "" && g_nhk_http_code < 0) {
@@ -1942,7 +1948,7 @@ String fetchNewsText(int nhkCat, const char* intro, String* dispItems, String* d
   String result = intro;
   int pos = 0;
   int count = 0;
-  while (count < 3) {
+  while (count < maxArticles) {
     int itemPos = payload.indexOf("<item>", pos);
     if (itemPos < 0) break;
     pos = itemPos + 6;
@@ -2310,15 +2316,9 @@ static void newsview_store(const char* label, String* titles, String* descs, int
 
 // 未取得のままモードに入った場合の静かな取得（読み上げはしない）。
 // exec_news_category と同じ取得経路・鮮度/既読フィルタを通し、結果を
-// ストアへ入れるだけにする。転送ニュース（カテゴリ5）は RSS が無いため
-// 対象外（取得待ちを解いて「ありません」表示にする）。
+// ストアへ入れるだけにする。設定を選んでも最後のニュースカテゴリを維持する。
 static void newsview_fetch_current() {
-  int cat = g_menu_sel;
-  if (cat < 0 || cat > 4) {
-    g_nv_fetch_pending = false;
-    newsview_publish();
-    return;
-  }
+  const int cat = g_last_news_cat;
   const NewsCatDef& c = NEWS_CATS[cat];
   // exec_news 系と同じく、取得前に TTS 接続ペアの解放を依頼して内蔵ヒープを回復させる
   g_tts_release_req = true;
@@ -2326,20 +2326,20 @@ static void newsview_fetch_current() {
   g_news_feed_ok = false;
   g_news_skip_old = 0;
   g_news_skip_seen = 0;
-  String dispItems[5];
-  String dispTitles[5];
-  String dispDescs[5];
+  String dispItems[MENU_NEWS_LIMIT];
+  String dispTitles[MENU_NEWS_LIMIT];
+  String dispDescs[MENU_NEWS_LIMIT];
   int dispCount = 0;
   String text = "";
   if (c.nhkCat >= 0) {
-    text = fetchNewsText(c.nhkCat, "", dispItems, dispTitles, dispDescs, 5, dispCount);
+    text = fetchNewsText(c.nhkCat, "", dispItems, dispTitles, dispDescs, MENU_NEWS_LIMIT, dispCount, MENU_NEWS_LIMIT);
   }
   if (text == "") {
-    String heads[3];
+    String heads[MENU_NEWS_LIMIT];
     int n = 0;
     int dummyCode = 0;
-    if (fetchGoogleHeadlines(c.googleUrl, 3, heads, n, dummyCode)) {
-      for (int i = 0; i < n && dispCount < 5; i++) {
+    if (fetchGoogleHeadlines(c.googleUrl, MENU_NEWS_LIMIT, heads, n, dummyCode)) {
+      for (int i = 0; i < n && dispCount < MENU_NEWS_LIMIT; i++) {
         dispTitles[dispCount] = heads[i];
         dispDescs[dispCount] = "";
         dispItems[dispCount++] = heads[i] + "。";
@@ -2502,14 +2502,13 @@ String exec_news(bool automatic) {
 }
 
 // カテゴリ単独のニュース読み上げ（タッチメニュー用）
-// NHKカテゴリがあれば NHK（見出し＋説明×3）を優先し、失敗時は Google 見出し×3 で代替。
-// NHKのないカテゴリ（AI／テック）は最初から Google 見出し×3。
+// NHKカテゴリがあれば NHK を優先し、取得できなければ Google 見出しを使う。
+// 鮮度・既読の条件を満たす記事を、カテゴリごとに最大5件読み上げる。
 // 従来の exec_news()（トピックス＋AI連結）とは独立した読み上げにする
 void exec_news_category(int cat) {
   if (tts_processing()) { avatar.setSpeechText("音声処理の終了を待ってください"); return; }
   crumb("news-cat");
-  if (cat < 0 || cat > 5) cat = 0;
-  if (cat == 5) { exec_digest_category(); return; }  // 第9.23弾: 転送ニュース
+  if (cat < 0 || cat >= NEWS_CAT_COUNT) return;
   const NewsCatDef& c = NEWS_CATS[cat];
   // 第9.8弾: exec_news() と同様、取得前に TTS 接続ペアの解放を依頼する
   g_tts_release_req = true;
@@ -2520,23 +2519,23 @@ void exec_news_category(int cat) {
   g_news_skip_old = 0;
   g_news_skip_seen = 0;
   captionReset();  // 前回の表示キューが残っていたら破棄する
-  String dispItems[5];
-  String dispTitles[5];
-  String dispDescs[5];
+  String dispItems[MENU_NEWS_LIMIT];
+  String dispTitles[MENU_NEWS_LIMIT];
+  String dispDescs[MENU_NEWS_LIMIT];
   int dispCount = 0;
   String text = "";
   if (c.nhkCat >= 0) {
-    text = fetchNewsText(c.nhkCat, c.intro, dispItems, dispTitles, dispDescs, 5, dispCount);
+    text = fetchNewsText(c.nhkCat, c.intro, dispItems, dispTitles, dispDescs, MENU_NEWS_LIMIT, dispCount, MENU_NEWS_LIMIT);
   }
   if (text == "") {
-    String heads[3];
+    String heads[MENU_NEWS_LIMIT];
     int n = 0;
     int dummyCode = 0;
-    if (fetchGoogleHeadlines(c.googleUrl, 3, heads, n, dummyCode)) {
+    if (fetchGoogleHeadlines(c.googleUrl, MENU_NEWS_LIMIT, heads, n, dummyCode)) {
       text = c.intro;
       for (int i = 0; i < n; i++) {
         text += heads[i] + "。";
-        if (dispCount < 5) {
+        if (dispCount < MENU_NEWS_LIMIT) {
           dispTitles[dispCount] = heads[i];
           dispDescs[dispCount] = "";
           dispItems[dispCount++] = heads[i] + "。";
@@ -3843,7 +3842,6 @@ server.send(200, "application/json", out);
 #define DIGEST_MAX_BYTES    (60 * 1024)  // 1件の上限
 #define DIGEST_KEEP_FILES   10           // 保持する最新件数
 #define DIGEST_DIR          "/digest"
-#define DIGEST_CAT_INDEX    5            // NEWS_CATS の「転送ニュース」
 
 // ---- 転送テキストの保存（microSD 優先、なければ SPIFFS） ----
 static fs::FS *digest_open(bool &use_sd) {
@@ -4036,7 +4034,7 @@ static void exec_digest_category() {
   }
   capAddLabel("転送ニュース");
   capBuildFromText(speech);
-  g_led_news_color = NEWS_CAT_COLORS[DIGEST_CAT_INDEX];  // 転送ニュースのLED色は紫
+  g_led_news_color = DIGEST_LED_COLOR;  // 転送ニュースのLED色は紫
   if (g_cap_count > 0) g_cap_armed = true;
   speech_text = "転送ニュースです。" + speech;
   g_pending_news_speech = true;  // ニュースと同じく中央タップで中断可能にする
@@ -4058,7 +4056,7 @@ static void append_unread_digest() {
   bool was_empty = (speech_text == "");
   speech_text += was_empty ? String("転送ニュースです。") : String("続いて、転送ニュースです。");
   speech_text += speech;
-  if (was_empty) g_led_news_color = NEWS_CAT_COLORS[DIGEST_CAT_INDEX];
+  if (was_empty) g_led_news_color = DIGEST_LED_COLOR;
   if (g_cap_count > 0) g_cap_armed = true;
   g_pending_news_speech = true;
   g_digest_read_pending = idx;  // 第9.27弾: 既読マーク（NVS書き込み）は loop の制御点で実行
@@ -5068,7 +5066,10 @@ void ledTask(void *args)
     uint32_t now = millis();
 
     if (g_led_enable) {
-      if (now < g_led_dance_until) {
+      if (g_settings_open.load()) {
+        // Preview a steady color so the idle pulse cannot mask a brightness change.
+        for (int i = 0; i < SIDE_LED_COUNT; i++) frame[i] = CRGB::White;
+      } else if (now < g_led_dance_until) {
         // ダンス動画再生中：色相を回しながら低輝度でサイクル（全体上限でさらに抑制）
         for (int i = 0; i < SIDE_LED_COUNT; i++) {
           frame[i] = CHSV((uint8_t)(now / 12 + i * 25), 210, 120);
@@ -5111,10 +5112,8 @@ void ledTask(void *args)
       }
     }
 
-    // 第9.23弾: 輝度だけが変わった場合も出力する。従来はフレーム（ピクセル値）の
-    // 変化でしか show() しなかったため、静止フレーム（聞き取り中の青一色・音量
-    // ゲージ等）では FastLED.setBrightness() の変更が LED に届かなかった。
-    uint8_t cur_brightness = FastLED.getBrightness();
+    // Compare and transmit the same snapshot, including when only brightness changes.
+    const uint8_t cur_brightness = LED_LEVEL_VALUES[g_led_level.load()];
     // 第9.28弾（対策A）: 通信中は LED 送信を全面停止する。キャッシュ
     // 無効化が起き得る通信フェーズの最中に RMT 補充割り込み（フラッシュ
     // 上のコード）を実行させないため。LED は直前の表示を保持し、通信
@@ -5134,7 +5133,7 @@ void ledTask(void *args)
       // 書き込みと RMT 補充割り込みが重ならないことを保証する
       StorageLedGuard led_guard;
       for (int i = 0; i < SIDE_LED_COUNT; i++) g_side_leds[i] = frame[i];
-      FastLED.show();
+      FastLED.show(cur_brightness);
       // 第9.28弾: ロックを離す前に RMT 送信の完了まで待つ。これにより
       // 「ロックが空いている＝RMT は完全にアイドル」が常に成り立ち、
       // 書き込み開始時点で送信中だったフレームとの重なりも消える
@@ -5840,7 +5839,6 @@ void setup()
   }
   // 側面LED（M5GO Bottom2 の SK6812×10 / GPIO25）初期化と表示タスク起動
   FastLED.addLeds<SK6812, SIDE_LED_PIN, GRB>(g_side_leds, SIDE_LED_COUNT);
-  FastLED.setBrightness(LED_LEVEL_VALUES[g_led_level]);  // 第9.19弾: 段階設定（既定レベル4＝従来上限6と同じ）
   FastLED.clear(true);
   xTaskCreatePinnedToCore(ledTask, "ledTask", 4096, NULL, 1, NULL, 0);
 
@@ -6249,16 +6247,17 @@ void SST_ChatGPT() {
 }
 
 // LED輝度レベルを delta 段階変える（第9.19弾、設定ダイアログの右下/左下）。
-// 変更は即時に FastLED へ反映され（ledTask が次フレームで表示）、NVS に保存される
+// LED タスクが次回の送信時に反映し、設定は NVS に保存する。
 static void change_led_level(int delta) {
-  int nl = (int)g_led_level + delta;
+  const int old = g_led_level.load();
+  int nl = old + delta;
   if (nl < 0) nl = 0;
   if (nl > 5) nl = 5;
-  if (nl == (int)g_led_level) return;
+  if (nl == old) return;
   g_led_level = (uint8_t)nl;
-  applyLedLevel(true);
+  saveLedLevel((uint8_t)nl);
   Serial.printf("[LED] brightness level=%u (FastLED=%u)\n",
-                (unsigned)g_led_level, (unsigned)LED_LEVEL_VALUES[g_led_level]);
+                (unsigned)nl, (unsigned)LED_LEVEL_VALUES[nl]);
   if (!audioRunning()) {
     sw_tone();
   } else {
@@ -6564,12 +6563,6 @@ static void change_volume(int delta) {
   }
 }
 
-// メニュー選択中を吹き出しに表示する（例「2/5 AIニュース」）
-static void menuShowBalloon() {
-  String s = String(g_menu_sel + 1) + "/6 " + NEWS_CATS[g_menu_sel].label;
-  avatar.setSpeechText(s.c_str());
-}
-
 // メニューのカテゴリ一覧描画は第9.26弾で KinakoFace.h の顔合成キャンバス
 // へ移設した（旧 drawMenuList は M5.Lcd への直接描画で、顔スプライトの
 // 毎フレーム転写に上書きされて点滅していた）。ここに残るのは選択状態と
@@ -6580,13 +6573,25 @@ static void menu_step(int delta) {
   // 発話中・ニュース表示中はメニューを開かない（吹き出しを奪わない）
   if (audioRunning() || speech_text != "" || speech_text_buffer != "" || g_cap_active) return;
   if (g_menu_open) {
-    g_menu_sel = (g_menu_sel + delta + 6) % 6;
+    g_menu_sel = (g_menu_sel + delta + NEWS_MENU_ITEM_COUNT) % NEWS_MENU_ITEM_COUNT;
   } else {
     g_menu_open = true;
+    // 選択位置は一覧内で示す。別の吹き出しを重ねない。
+    avatar.setSpeechText("");
   }
   g_menu_deadline = millis() + 2500;
   sw_tone();
-  menuShowBalloon();
+}
+
+static void confirm_menu_selection() {
+  g_menu_open = false;
+  if (g_menu_sel == MENU_SETTINGS_INDEX) {
+    open_settings_dialog();
+    return;
+  }
+  g_last_news_cat = g_menu_sel;
+  avatar.setSpeechText("ニュースです");
+  exec_news_category(g_last_news_cat);
 }
 
 // 定期通知モードの ON/OFF（物理 BtnC 短押し・タッチ box_BtnC 共用）
@@ -6835,9 +6840,7 @@ void loop()
       // 調整）。右下は第9.34弾でニューステキスト表示のトグルに割り当てた
       if (box_vol_up.contain(t.x, t.y))
       {
-        g_center_tap_pending = false;
-        g_settings_open = true;
-        g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
+        open_settings_dialog();
         sw_tone();
       }
       // 左上＝前のカテゴリ、左下＝次のカテゴリ（ニュース選択メニュー）
@@ -6920,13 +6923,11 @@ void loop()
 
   // ニュースカテゴリ選択メニュー：一覧の描画は顔合成側（KinakoFace.h）。
   // ここでは、最後のタップから約2.5秒操作がなければ選択中カテゴリを
-  // 読み上げて閉じる確定判定だけを行う
+  // 読み上げるか設定を開く確定判定だけを行う
   if (g_menu_open) {
     if ((int32_t)(millis() - g_menu_deadline) >= 0) {
       if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "" && !g_cap_active) {
-        g_menu_open = false;
-        avatar.setSpeechText("ニュースです");
-        exec_news_category(g_menu_sel);
+        confirm_menu_selection();
       } else {
         g_menu_deadline = millis() + 2500;  // 混んでいる間は確定を少し延ばす
       }

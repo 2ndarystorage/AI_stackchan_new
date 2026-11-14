@@ -74,7 +74,7 @@ const char *newsMenuLabel(int idx);
 // 描画側は front のバッファを読む（字幕と同じダブルバッファ公開方式）。
 // 表示するか否か（発話・ダイアログ等との優先）は main.cpp 側の
 // g_newsview_show が決め、描画側はそれに従うだけにする。
-#define NV_PAGE_LINES 11   // 1ページの本文行数（ヘッダ下に 19px 間隔で 11 行）
+#define NV_PAGE_LINES 9   // 1ページの本文行数（ヘッダ下に 19px 間隔で 11 行）
 #define NV_LINE_BYTES 128  // 1行のバイト容量（全角19文字相当＋見出し記号分）
 #define NV_HEAD_BYTES 64   // ページヘッダのバイト容量
 extern bool g_newsview_show;           // ニューステキストを表示するか
@@ -237,13 +237,13 @@ class KinakoImage : public Drawable {
       line1[sizeof(line1) - 1] = '\0';
       strncpy(line2, g_caption_buf[f][1], sizeof(line2) - 1);
       line2[sizeof(line2) - 1] = '\0';
-      spi->fillRoundRect(0, 196, 320, 44, 6, 0x000000);
+      spi->fillRoundRect(0, 164, 320, 44, 6, 0x000000);
       spi->setFont(&fonts::efontJA_16);
       spi->setTextSize(1);
       spi->setTextColor(0xFFFFFF);
-      spi->setCursor(8, 200);
+      spi->setCursor(8, 168);
       spi->print(line1);
-      spi->setCursor(8, 218);
+      spi->setCursor(8, 186);
       spi->print(line2);
     }
     // 設定ダイアログ（第9.19弾）：右上タップで開き、音量（上段）と

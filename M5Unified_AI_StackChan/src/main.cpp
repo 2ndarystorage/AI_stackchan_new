@@ -81,8 +81,10 @@ static uint32_t g_mode_restart_at = 0;
 // Called by the vendored Avatar while the shared graphics mutex is held.
 // 第9.23弾: バッジは Face::draw から合成キャンバスを受け取って描く（点滅対策で
 // パネル直接描画から移設。バッテリー/音量 HUD と同じキャンバス内描画になった）
+void stackchan_draw_footer(M5Canvas* spi);
 void stackchan_draw_version_badge(M5Canvas *spi) {
   if (spi) drawFirmwareVersionBadge(*spi);
+  if (spi) stackchan_draw_footer(spi);
 }
 static bool audioBeginMicrophone() {
   return handoverToMicrophone(M5.Speaker, M5.Mic,
@@ -6594,6 +6596,82 @@ static void confirm_menu_selection() {
   exec_news_category(g_last_news_cat);
 }
 
+
+// Single action map for physical keys and the three on-screen guides.
+static std::atomic<int> g_footer_state{0};
+static int g_settings_item = 0; // 0 volume, 1 LEDs, 2 close
+static bool g_settings_edit = false;
+static const char* footerLabel(int state, int key) {
+  static const char* const labels[][3] = {
+    {"メニュー", "話しかける", "設定"},
+    {"前へ", "決定", "次へ"},
+    {"前の項目", "決定", "次の項目"},
+    {"－", "戻る", "＋"},
+    {"文字表示", "停止", "—"},
+    {"—", "処理中", "—"}
+  };
+  return labels[state][key];
+}
+static int footerState() {
+  if (g_settings_open) return g_settings_edit ? 3 : 2;
+  if (g_menu_open) return 1;
+  if (g_news_playing || g_pending_news_speech) return 4;
+  if (g_led_listening || g_led_thinking || tts_processing() || audioRunning() ||
+      speech_text != "" || speech_text_buffer != "" || mode < 0) return 5;
+  return 0;
+}
+static void footerAction(int key) {
+  const int state = footerState();
+  note_activity();
+  if (state == 5) return;
+  if (state == 4) {
+    if (key == 0) newsview_toggle();
+    if (key == 1) stop_news_speech();
+    return;
+  }
+  if (state == 1) {
+    if (key == 1) confirm_menu_selection();
+    else menu_step(key == 0 ? -1 : 1);
+    return;
+  }
+  if (state == 2 || state == 3) {
+    g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
+    if (state == 3) {
+      if (key == 1) g_settings_edit = false;
+      else if (g_settings_item == 0) change_volume(key == 0 ? -1 : 1);
+      else change_led_level(key == 0 ? -1 : 1);
+    } else if (key == 1) {
+      if (g_settings_item == 2) g_settings_open = false;
+      else g_settings_edit = true;
+    } else g_settings_item = (g_settings_item + (key == 0 ? 2 : 1)) % 3;
+    return;
+  }
+  if (key == 0) menu_step(0);
+  else if (key == 1) { g_footer_state = 5; SST_ChatGPT(); }
+  else { g_settings_item = 0; g_settings_edit = false; open_settings_dialog(); }
+}
+void stackchan_draw_footer(M5Canvas* spi) {
+  const int state = g_footer_state.load();
+  spi->fillRect(0, 208, 320, 32, 0x000000);
+  spi->drawLine(0, 208, 319, 208, 0x808080);
+  spi->setFont(&fonts::efontJA_16);
+  spi->setTextSize(1);
+  spi->setTextDatum(TL_DATUM);
+  for (int key = 0; key < 3; ++key) {
+    const bool disabled = state == 5 || (state == 4 && key == 2);
+    spi->setTextColor(disabled ? 0x606060 : 0xFFFFFF);
+    spi->drawString(footerLabel(state, key), key * 107 + 7, 217);
+    if (key) spi->drawLine(key * 107, 212, key * 107, 237, 0x606060);
+  }
+  if (g_settings_open) {
+    spi->fillRect(16, 155, 288, 37, 0x000000);
+    spi->setTextColor(0xFFFFFF);
+    const char* item = g_settings_item == 0 ? "音量" : g_settings_item == 1 ? "LED" : "閉じる";
+    spi->drawString(item, 22, 160);
+    spi->drawString(g_settings_edit ? "調整中" : "選択中", 160, 160);
+  }
+}
+
 // 定期通知モードの ON/OFF（物理 BtnC 短押し・タッチ box_BtnC 共用）
 // 第9.34弾: トグルのたびに NVS "setting"/"sched_on" へ保存し、再起動後も保持する
 static void toggle_periodic() {
@@ -6698,6 +6776,7 @@ void loop()
   fc_timers_tick();       // 第9.25弾: Function Calling のタイマー判定（相対指定は NTP 未同期でも発火させる）
   memory_extract_tick();  // 第9.25弾: 長期記憶の自動抽出（アイドル時のみ・1会話1回）
 
+  g_footer_state = footerState();
   M5.update();
 
   // 画面消灯中は、最初のタッチ/物理ボタンを「復帰」専用として消費する（第9.19弾）。
@@ -6713,225 +6792,16 @@ void loop()
     input_swallow = true;
   }
 
-  if (!input_swallow && M5.BtnA.wasPressed())
-  {
-    note_activity();
-    if(mode >= 0){
-      sw_tone();
-      if(mode == 0){
-        avatar.setSpeechText("ウェイクワード有効");
-        mode = 1;
-        wakeword_set_enable(true);   // 第9.34弾: NVS へ保存
-      } else {
-        avatar.setSpeechText("ウェイクワード無効");
-        mode = 0;
-        wakeword_set_enable(false);  // 第9.34弾: NVS へ保存
-      }
-      delay(1000);
-      avatar.setSpeechText("");
+  if (!input_swallow) {
+    // One edge, one action; held keys cannot fall through to legacy shortcuts.
+    int key = M5.BtnA.wasPressed() ? 0 : M5.BtnB.wasPressed() ? 1 : M5.BtnC.wasPressed() ? 2 : -1;
+    if (key < 0 && M5.Touch.getCount()) {
+      const auto touch = M5.Touch.getDetail();
+      if (touch.wasPressed() && touch.y >= 208 && touch.x >= 0 && touch.x < 320)
+        key = touch.x < 107 ? 0 : touch.x < 214 ? 1 : 2;
     }
-  }
-
-  // BtnB短押し（ニュース読み上げ）検出用：押下時刻を記録する
-  static uint32_t btnB_press_start = 0;
-  static bool btnB_long_fired = false;
-  if (!input_swallow && M5.BtnB.wasPressed()) {
-    note_activity();
-    btnB_press_start = millis();
-    btnB_long_fired = false;
-  }
-
-  if (!tts_processing() && M5.BtnB.pressedFor(2000)) {
-     btnB_long_fired = true;  // 長押し（ウェイクワード登録）が発動したら短押し扱いしない
-     M5.Mic.end();
-     M5.Speaker.tone(1000, 100);
-     delay(500);
-     M5.Speaker.tone(600, 100);
-     delay(1000);
-    audioBeginMicrophone();
-    random_time = -1;           //独り言停止
-    random_speak = true;
-    wakeword_set_enable(false); //wakeword 無効（第9.34弾: NVS へ保存）
-    mode = -1;
-#ifdef USE_SERVO
-      servo_home = true;
-      delay(500);
-#endif
-    avatar.setSpeechText("ウェイクワード登録開始");
-    Serial.println("[WW] regist: start (BtnB long-press)");  // 第9.32弾: 登録診断ログ
-  }
-
-  // BtnBを短く押して離したらニュース読み上げ（長押し登録とは競合させない）
-  if (M5.BtnB.wasReleased()) {
-    if (!btnB_long_fired && btnB_press_start != 0 && (millis() - btnB_press_start) < 1500 && mode >= 0) {
-      if (!audioRunning() && speech_text == "" && speech_text_buffer == "") {
-        sw_tone();
-        avatar.setExpression(Expression::Happy);
-        avatar.setSpeechText("ニュースです");
-        exec_news();
-      }
-    }
-    btnB_press_start = 0;
-  }
-
-  // BtnC短押し＝定期通知モードのトグル、ダブルタップ＝画面キャプチャ、
-  // 長押し(2秒)＝バッテリー残量読み上げ（第9.19弾でダブルタップを追加）。
-  // ダブル判定のため、短押し（定期通知トグル）の発火は最大 BTNC_TAP_WINDOW_MS(300ms) 遅れる
-  static uint32_t btnC_press_start = 0;
-  static bool btnC_long_fired = false;
-  static uint32_t btnC_tap_deadline = 0;  // 保留中の短押し（定期通知トグル）の確定時刻（0=なし）
-  if (!input_swallow && M5.BtnC.wasPressed()) {
-    note_activity();
-    btnC_press_start = millis();
-    btnC_long_fired = false;
-  }
-  if (M5.BtnC.pressedFor(2000) && !btnC_long_fired) {
-    btnC_long_fired = true;  // 長押しが発動したら短押し扱いしない
-    btnC_tap_deadline = 0;   // 保留中の単押しも取り消す
-    sw_tone();
-    report_batt_level();
-  }
-  if (M5.BtnC.wasReleased()) {
-    if (!btnC_long_fired && btnC_press_start != 0 && (millis() - btnC_press_start) < 1500 && mode >= 0) {
-      if (btnC_tap_deadline != 0) {
-        // 判定窓内の2回目のタップ＝ダブルタップ → 画面キャプチャ
-        btnC_tap_deadline = 0;
-        do_screen_capture();
-      } else {
-        // 1回目のタップは保留し、窓内に2回目がなければ定期通知トグルとして確定する
-        btnC_tap_deadline = millis() + BTNC_TAP_WINDOW_MS;
-      }
-    }
-    btnC_press_start = 0;
-  }
-  // 保留中の BtnC 短押しの確定（ダブルタップにならなかった場合）
-  if (btnC_tap_deadline != 0 && (int32_t)(millis() - btnC_tap_deadline) >= 0) {
-    btnC_tap_deadline = 0;
-    if (mode >= 0) toggle_periodic();
-  }
-
-#if defined(ARDUINO_M5STACK_Core2) || defined( ARDUINO_M5STACK_CORES3 )
-  auto count = M5.Touch.getCount();
-  if (count && !input_swallow)
-  {
-    auto t = M5.Touch.getDetail();
-    if (t.wasPressed())
-    {          
-      note_activity();
-      if (g_settings_open)
-      {
-        // 設定ダイアログ表示中はモーダル（第9.19弾）：四隅＝音量/LED輝度調整、
-        // 中央＝閉じる。それ以外のタップと四隅の本来の機能（カテゴリ切替等）は無効
-        g_settings_deadline = millis() + SETTINGS_DIALOG_TIMEOUT_MS;
-        if (box_vol_up.contain(t.x, t.y)) change_volume(+1);            // 右上＝音量＋
-        else if (box_cat_prev.contain(t.x, t.y)) change_volume(-1);     // 左上＝音量－
-        else if (box_vol_down.contain(t.x, t.y)) change_led_level(+1);  // 右下＝LED輝度＋
-        else if (box_cat_next.contain(t.x, t.y)) change_led_level(-1);  // 左下＝LED輝度－
-        else if (box_stt.contain(t.x, t.y))
-        {
-          g_settings_open = false;
-          sw_tone();
-        }
-      }
-      else
-      {
-      // 右上＝設定ダイアログを開く（第9.19弾）。従来の右上＝音量アップ／
-      // 右下＝音量ダウンのタッチ割り当ては廃止（音量・LED輝度はダイアログ内で
-      // 調整）。右下は第9.34弾でニューステキスト表示のトグルに割り当てた
-      if (box_vol_up.contain(t.x, t.y))
-      {
-        open_settings_dialog();
-        sw_tone();
-      }
-      // 左上＝前のカテゴリ、左下＝次のカテゴリ（ニュース選択メニュー）
-      if (box_cat_prev.contain(t.x, t.y))
-      {
-        g_center_tap_pending = false;
-        menu_step(-1);
-      }
-      if (box_cat_next.contain(t.x, t.y))
-      {
-        g_center_tap_pending = false;
-        menu_step(+1);
-      }
-      // 右下＝ニューステキスト表示モードのトグル（第9.34弾）。設定ダイアログ
-      // 表示中は右下＝LED輝度＋のまま（上のダイアログ分岐が先に処理する）。
-      // カテゴリメニュー表示中は newsview_toggle 側で無効化する
-      if (box_vol_down.contain(t.x, t.y))
-      {
-        g_center_tap_pending = false;
-        newsview_toggle();
-      }
-      // 中央タップの優先順位：ニュース読み上げ中＝中断（追加D）／
-      // メニュー表示中＝キャンセル／それ以外＝会話開始
-      if (box_stt.contain(t.x, t.y))
-      {
-        if (g_news_playing || g_pending_news_speech)
-        {
-          g_center_tap_pending = false;
-          stop_news_speech();
-        }
-        else if (g_menu_open)
-        {
-          g_center_tap_pending = false;
-          g_menu_open = false;
-          sw_tone();
-          if (!audioRunning()) avatar.setSpeechText("");
-        }
-        else if (!audioRunning())
-        {
-          // 中央ダブルタップで即消灯（第9.19弾）。1回目のタップは保留し、
-          // 判定窓（300ms）内の2回目で消灯する。窓を過ぎたらシングルタップ
-          // として loop 側で会話開始する（発火は最大300ms遅れる）
-          if (g_center_tap_pending &&
-              (int32_t)(millis() - g_center_tap_ms) <= (int32_t)CENTER_TAP_WINDOW_MS)
-          {
-            g_center_tap_pending = false;
-            display_sleep();
-          }
-          else
-          {
-            g_center_tap_pending = true;
-            g_center_tap_ms = millis();
-          }
-        }
-      }
-#ifdef USE_SERVO
-      if (box_servo.contain(t.x, t.y))
-      {
-        g_center_tap_pending = false;
-        servo_home = !servo_home;
-        sw_tone();
-      }
-#endif
-      if (box_BtnA.contain(t.x, t.y))
-      {
-        g_center_tap_pending = false;
-        sw_tone();
-        switch_monologue_mode();
-      }
-      // 右の帯＝定期通知モードのトグル（物理 BtnC 短押しと同じ挙動）
-      if (box_BtnC.contain(t.x, t.y))
-      {
-        g_center_tap_pending = false;
-        toggle_periodic();
-      }
-      }  // 設定ダイアログでない場合の通常タッチ処理ここまで（第9.19弾）
-    }
-  }
-#endif
-
-  // ニュースカテゴリ選択メニュー：一覧の描画は顔合成側（KinakoFace.h）。
-  // ここでは、最後のタップから約2.5秒操作がなければ選択中カテゴリを
-  // 読み上げるか設定を開く確定判定だけを行う
-  if (g_menu_open) {
-    if ((int32_t)(millis() - g_menu_deadline) >= 0) {
-      if (mode >= 0 && !audioRunning() && speech_text == "" && speech_text_buffer == "" && !g_cap_active) {
-        confirm_menu_selection();
-      } else {
-        g_menu_deadline = millis() + 2500;  // 混んでいる間は確定を少し延ばす
-      }
-    }
+    if (key >= 0) footerAction(key);
+    g_footer_state = footerState();
   }
 
   // ==== 画面まわり（第9.19弾）: ダイアログ自動クローズ／中央タップ確定／自動消灯 ====

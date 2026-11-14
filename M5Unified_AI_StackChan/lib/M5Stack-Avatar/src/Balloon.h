@@ -35,7 +35,7 @@ class Balloon final : public Drawable {
     // Keep the anchor above the captions; shrink the text, body and tail to 80%.
     constexpr float textSize = 1.2f;  // 1.5 * 0.8
     constexpr int cx = 220;
-    constexpr int cy = 170;
+    constexpr int cy = 140;
     constexpr int ry = static_cast<int>(24 * 0.8f + 0.5f);
     const auto style = spi->getTextStyle();
     spi->setTextSize(textSize);

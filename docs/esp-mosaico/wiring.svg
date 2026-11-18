@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1160" height="610" viewBox="0 0 1160 610" role="img" aria-labelledby="title desc">
+  <title id="title">ESP-Mosaico V1.2 one-axis servo wiring</title>
+  <desc id="desc">The right H1 connector supplies 3.3 V logic, I2C and ground to a PCA9685 breakout. A separate supply feeds servo V+. Grounds are shared. The optional camera uses left H2.</desc>
+  <style>
+    text{font-family:system-ui,sans-serif;fill:#162539}.title{font-size:34px;font-weight:750}
+    .sub{font-size:18px;fill:#536479}.block{fill:#fff;stroke:#a8b7c7;stroke-width:2}
+    .head{font-size:22px;font-weight:700}.pin{font-size:17px;font-family:monospace}.note{font-size:17px}
+    .wire{fill:none;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
+    .sig{stroke:#08766a}.logic{stroke:#215daf}.power{stroke:#b23b23}.gnd{stroke:#28364a}.cam{stroke:#7553a3;stroke-dasharray:7 5}
+  </style>
+  <rect width="1160" height="610" fill="#f4f7fa"/>
+  <text class="title" x="34" y="49">ESP-Mosaico V1.2 · One-axis servo wiring</text>
+  <text class="sub" x="35" y="77">Module-level schematic · Rev A · Hardware validation pending</text>
+  <rect class="block" x="35" y="134" width="310" height="270" rx="10"/>
+  <rect class="block" x="463" y="134" width="290" height="270" rx="10"/>
+  <rect class="block" x="906" y="134" width="219" height="203" rx="10"/>
+  <rect class="block" x="35" y="463" width="310" height="76" rx="10"/>
+  <rect class="block" x="463" y="463" width="290" height="76" rx="10"/>
+  <text class="head" x="54" y="166">ESP-Mosaico V1.2</text>
+  <text class="sub" x="54" y="192">BaseBoard · right H1</text>
+  <text class="head" x="482" y="166">PCA9685 breakout</text>
+  <text class="sub" x="482" y="192">I²C 0x40 on Adafruit board</text>
+  <text class="head" x="924" y="166">Position servo</text>
+  <text class="sub" x="924" y="192">One axis · 3.3 V signal</text>
+  <path class="wire logic" d="M345 224H463 M210 134V111H36"/>
+  <path class="wire sig" d="M345 259H463 M345 294H463 M753 224H906"/>
+  <path class="wire gnd" d="M345 329H463 M753 294H906 M650 404V463"/>
+  <path class="wire power" d="M753 259H906 M550 404V463"/>
+  <path class="wire cam" d="M210 404V463"/>
+  <text class="note" x="35" y="103">USB-C · 5 V to Mosaico</text>
+  <text class="pin" x="327" y="230" text-anchor="end">19  VCC_3V3</text>
+  <text class="pin" x="327" y="265" text-anchor="end">16  GPIO0 / SDA</text>
+  <text class="pin" x="327" y="300" text-anchor="end">14  GPIO1 / SCL</text>
+  <text class="pin" x="327" y="335" text-anchor="end">20  GND</text>
+  <text class="note" x="54" y="369">Onboard microphone and speaker</text>
+  <text class="pin" x="54" y="391">H2 · left slot</text>
+  <text class="pin" x="482" y="230">VCC</text>
+  <text class="pin" x="482" y="265">SDA</text>
+  <text class="pin" x="482" y="300">SCL</text>
+  <text class="pin" x="482" y="335">GND</text>
+  <text class="pin" x="734" y="230" text-anchor="end">CH0 PWM</text>
+  <text class="pin" x="734" y="265" text-anchor="end">CH0 V+</text>
+  <text class="pin" x="734" y="300" text-anchor="end">CH0 GND</text>
+  <text class="note" x="482" y="360">Servo supply terminal</text>
+  <text class="pin" x="550" y="390" text-anchor="middle">V+</text>
+  <text class="pin" x="650" y="390" text-anchor="middle">GND</text>
+  <text class="pin" x="924" y="230">Signal</text>
+  <text class="pin" x="924" y="265">Servo V+</text>
+  <text class="pin" x="924" y="300">GND</text>
+  <text class="head" x="54" y="494">Official camera · optional</text>
+  <text class="sub" x="54" y="519">Plug into H2 only</text>
+  <text class="pin" x="550" y="488" text-anchor="middle">+</text>
+  <text class="pin" x="650" y="488" text-anchor="middle">−</text>
+  <text class="head" x="483" y="518">External servo supply</text>
+  <text class="note" x="795" y="380">V+ and GND each share a rail</text>
+  <text class="note" x="795" y="405">within the breakout.</text>
+  <text class="note" x="795" y="492">Size supply to servo voltage</text>
+  <text class="note" x="795" y="517">and stall current.</text>
+  <text class="note" x="35" y="578">Leave H1 pins 17 (5V_IN) and 18 (5V_OUT) open. H1 pin labels in the diagram are not a physical layout.</text>
+</svg>
